@@ -20,18 +20,26 @@ The [progress page](https://dark3581.github.io/AnyBox/progress.html) lists every
 
 | Library | Serves | State |
 |---|---|---|
-| [xgameruntime](core/libs/xdll/xgameruntime) | `xgameruntime.dll` | XGameRuntime init and options, XTaskQueue, XAsync, XThread and XGameSave implemented; XUser, XGameSaveFiles, most of XPackage and XSystem stubs |
-| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | uses two back ends: root signature serialization is forwarded to the host's `d3d12.dll`, and everything the device does goes to Vulkan, where the device, title layout, shader store, pipeline state, bindless descriptors and buffer window are built ([Shaders](#shaders)). Device creation still stops the title until its calls show the device's shape |
+| [xgameruntime](core/libs/xdll/xgameruntime) | `xgameruntime.dll` | XGameRuntime init and options, all of XTaskQueue (composite queues, monitors and waiters included), XAsync, XThread and XGameSave implemented; XUser, XGameSaveFiles, most of XPackage and XSystem stubs |
+| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | uses two back ends: root signature serialization is forwarded to the host's `d3d12.dll`, and everything the device does goes to Vulkan. Built on the Vulkan side: the device, shader store, compute and graphics pipeline state (render state, vertex input, cache first), resource barriers, texture images, bindless descriptors and the buffer window ([Graphics](#graphics-and-shaders)). Device creation still stops the title until its calls show the device's shape |
 | [xaudio2](core/libs/xdll/xaudio2) | `xaudio2_9.dll` | forwarded to the host's XAudio2 |
 | [gameinput](core/libs/xdll/gameinput) | `gameinput.dll` | forwarded to the host's GameInput |
 | [kernelx](core/libs/xdll/kernelx) | `kernelx.dll` | Win32 subset forwarded to `kernel32` |
-| [xmem](core/libs/xdll/xmem) | `xmem.dll` | entry points declared, all stubs: needs the `XALLOC_ATTRIBUTES` layout |
+| [xmem](core/libs/xdll/xmem) | `xmem.dll` | `XMemAlloc`, `XMemFree`, `XMemVirtualQuery` and `XMemGetWorkingSetStatistics` implemented; the allocation attribute word is not decoded yet, so every block is plain read-write memory |
 
 Unsupported or unexpected states stop the process with a [run report](docs/run-report.schema.json) (`anybox-report.json`) that names the library and function. Nothing returns a made-up success.
 
-## Shaders
+## Graphics and shaders
 
 Console shaders ship as native GPU code, not DXIL, so no desktop driver can take them as they are. AnyBox's graphics library ([d3d12_x](core/libs/xdll/d3d12_x)) therefore runs a title's D3D12.X device on Vulkan, with the title's shaders translated to SPIR-V ahead of time by an external translator. The parts of D3D12 that need no GPU, root signature serialization and deserialization, go to the host's own `d3d12.dll`. The [design is on #4](https://github.com/Dark3581/AnyBox/issues/4) and the pieces are in [Architecture](docs/dev/ARCHITECTURE.md#graphics-d3d12_x).
+
+Built and tested on a GPU without the title's executable (each with its own probe and tests):
+
+- **Pipeline state**: compute and graphics descriptions resolve their shaders through the store by the hash of each shader container. Blend, rasterizer, depth-stencil, samples, topology and formats become Vulkan state, and the input layout is matched to the vertex shader's inputs. Each pipeline is created once and taken from the pipeline cache first; one that would need too much memory to compile in the title is refused, not compiled.
+- **Resources**: D3D12 resource states become Vulkan barriers, and texture descriptions become Vulkan images (typeless, depth and block-compressed formats included).
+- **Shader resources**: the descriptor hash table and bindless set the translated shaders look their images and samplers up in, and the buffer window below 4 GB their buffer addresses point into.
+
+Still needing the executable: the device object and its methods, command lists that record into Vulkan, descriptor heaps and views, the root signature to shader register mapping, mesh pipelines and presentation.
 
 The shader set is built on your PC from your own copy, into the build folder, like the rest of the project. It is never committed or shared. With a checkout of the translator:
 
@@ -58,7 +66,8 @@ Measured on one title's package (26,503 shaders) with an RTX 3070 Ti and 32 GB o
 | Title layout | ✅ every module fits the one descriptor layout and the 144-byte push constants |
 | Compute sample through AnyBox's own pipeline code | ✅ 60 of 60, no validation errors |
 | Bindless descriptors and buffer access on the GPU | ✅ 3,701 of 3,701 descriptor lookups; buffer windows below 4 GB of up to 2 GiB |
-| Every pipeline created by the driver | 🔄 in progress: no failures so far. Two compute modules of 43 MiB each need about 75 GB of memory to compile, more than this PC can commit, so they are skipped by size here |
+| The title's shaders through AnyBox's pipeline state code | ✅ 12 compute shaders and 8 vertex shaders with vertex inputs become pipelines from their own containers; the largest compute shader is refused in 0.3 s instead of a 75 GB compile; with the offline cache, the pipelines come back without compiling |
+| Every pipeline created by the driver | 🔄 in progress, in chunks of 500: past 15,500 of 26,503 with no failure. Two compute modules of 43 MiB each need about 75 GB of memory to compile, more than this PC can commit, so they are skipped by size here |
 | Shaders running in a title | ❌ needs the title's executable: device creation, command lists, root signatures and presentation follow from its calls |
 
 What is not proven yet: that any translated shader computes the right values inside the title, and how the title binds its resources at run time. Both need the executable.
