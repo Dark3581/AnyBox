@@ -3,6 +3,7 @@
 #include "PipelineCompiler.hpp"
 #include "PipelineLibrary.hpp"
 #include "PipelineState.hpp"
+#include "ResourceState.hpp"
 #include "ShaderStore.hpp"
 #include "VertexInput.hpp"
 #include "VulkanDevice.hpp"
@@ -706,6 +707,193 @@ int GraphicsRequests(int argc, char** argv) {
     return 0;
 }
 
+int StatesSelfTest() {
+    std::string error;
+    const auto usage = [&error](UINT states, bool depth) { return UsageOfState(static_cast<D3D12_RESOURCE_STATES>(states), depth, error); };
+    const std::optional<ResourceUsage> common = usage(D3D12_RESOURCE_STATE_COMMON, false);
+    if (!common || common->layout != VK_IMAGE_LAYOUT_GENERAL || common->stages != VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) return Fail("common");
+    const std::pair<UINT, VkImageLayout> layouts[] = {
+        {D3D12_RESOURCE_STATE_RENDER_TARGET, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+        {D3D12_RESOURCE_STATE_UNORDERED_ACCESS, VK_IMAGE_LAYOUT_GENERAL},
+        {D3D12_RESOURCE_STATE_DEPTH_WRITE, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL},
+        {D3D12_RESOURCE_STATE_DEPTH_READ, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+        {D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {D3D12_RESOURCE_STATE_COPY_DEST, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL},
+        {D3D12_RESOURCE_STATE_COPY_SOURCE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+        {D3D12_RESOURCE_STATE_RESOLVE_DEST, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL},
+        {D3D12_RESOURCE_STATE_RESOLVE_SOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+        {D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, VK_IMAGE_LAYOUT_GENERAL},
+        {D3D12_RESOURCE_STATE_GENERIC_READ, VK_IMAGE_LAYOUT_GENERAL},
+        {D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, VK_IMAGE_LAYOUT_GENERAL},
+    };
+    for (const auto& [states, layout] : layouts) {
+        const std::optional<ResourceUsage> found = usage(states, false);
+        if (!found || found->layout != layout) return Fail("layout of state " + std::to_string(states) + ": " + error);
+    }
+    const std::optional<ResourceUsage> depthSampled = usage(D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, true);
+    if (!depthSampled || depthSampled->layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL ||
+        (depthSampled->stages & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) == 0 || (depthSampled->access & VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT) == 0) return Fail("sampled depth");
+    if (usage(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, true)->layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) return Fail("depth shader resource");
+    const std::optional<ResourceUsage> generic = usage(D3D12_RESOURCE_STATE_GENERIC_READ, false);
+    const VkAccessFlags2 genericAccess = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+    if ((generic->access & genericAccess) != genericAccess || (generic->access & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT)) != 0) return Fail("generic read access");
+    const std::pair<UINT, const char*> refusals[] = {
+        {D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, "combines a write state with other states"},
+        {D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "0x408 combines write states"},
+        {D3D12_RESOURCE_STATE_STREAM_OUT, "are not supported"},
+        {D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, "0x400000 (stream output, ray tracing, shading rate or video) are not supported"},
+        {0x4000, "bits 0x4000 are unknown"},
+        {0x80000000u, "bits 0x80000000 are unknown"},
+    };
+    for (const auto& [states, expected] : refusals) {
+        error.clear();
+        if (usage(states, false) || error.find(expected) == std::string::npos) return Fail(std::string("refusal '") + expected + "' gave '" + error + "'");
+    }
+    const std::optional<VkImageMemoryBarrier2> barrier = ImageTransition(D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, false, error);
+    if (!barrier || barrier->oldLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL || barrier->newLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
+        barrier->srcStageMask != VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT || barrier->dstStageMask != VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT ||
+        barrier->srcQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED) return Fail("render target to shader resource");
+    if (ImageTransition(D3D12_RESOURCE_STATE_COMMON, static_cast<D3D12_RESOURCE_STATES>(0x4000), false, error)) return Fail("transition to an unknown state");
+    const std::optional<VkMemoryBarrier2> buffer = BufferTransition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, error);
+    if (!buffer || buffer->srcAccessMask != VK_ACCESS_2_TRANSFER_WRITE_BIT || (buffer->dstAccessMask & VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT) == 0) return Fail("buffer transition");
+    if (UnorderedAccessBarrier().srcAccessMask != VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT || AliasingBarrier().srcStageMask != VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) return Fail("uav and aliasing");
+    std::puts("PASS states selftest");
+    return 0;
+}
+
+int StatesGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const DeviceFunctions& vk = device->Vk();
+    struct Image {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    const auto makeImage = [&](VkFormat format, VkImageUsageFlags usage, Image& out) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = format;
+        info.extent = {16, 16, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = usage;
+        if (vk.createImage(device->Handle(), &info, nullptr, &out.image) != VK_SUCCESS) return false;
+        VkMemoryRequirements needs{};
+        vk.getImageMemoryRequirements(device->Handle(), out.image, &needs);
+        const std::optional<std::uint32_t> type = device->MemoryType(needs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = needs.size;
+        allocate.memoryTypeIndex = type ? *type : 0;
+        return type && vk.allocateMemory(device->Handle(), &allocate, nullptr, &out.memory) == VK_SUCCESS && vk.bindImageMemory(device->Handle(), out.image, out.memory, 0) == VK_SUCCESS;
+    };
+    Image color;
+    Image depth;
+    const VkImageUsageFlags colorUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const VkImageUsageFlags depthUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!makeImage(VK_FORMAT_R8G8B8A8_UNORM, colorUsage, color) || !makeImage(VK_FORMAT_D32_SFLOAT, depthUsage, depth)) return Fail("test images");
+    const UINT colorStates[] = {
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COMMON,
+    };
+    const UINT depthStates[] = {
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON,
+    };
+    const UINT bufferStates[] = {
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDEX_BUFFER, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_COMMON,
+    };
+    std::size_t recorded = 0;
+    bool failed = false;
+    const bool submitted = device->Submit(
+        [&](VkCommandBuffer commands) {
+            const auto walk = [&](const Image& image, VkImageAspectFlags aspect, bool isDepth, const UINT* states, std::size_t count) {
+                VkImageMemoryBarrier2 start{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+                start.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+                start.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                start.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+                start.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                start.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                start.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                start.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                start.image = image.image;
+                start.subresourceRange = {aspect, 0, 1, 0, 1};
+                VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                dependency.imageMemoryBarrierCount = 1;
+                dependency.pImageMemoryBarriers = &start;
+                vk.cmdPipelineBarrier2(commands, &dependency);
+                UINT current = D3D12_RESOURCE_STATE_COMMON;
+                for (std::size_t index = 0; index < count; ++index) {
+                    std::optional<VkImageMemoryBarrier2> barrier = ImageTransition(static_cast<D3D12_RESOURCE_STATES>(current), static_cast<D3D12_RESOURCE_STATES>(states[index]), isDepth, error);
+                    if (!barrier) {
+                        failed = true;
+                        return;
+                    }
+                    barrier->image = image.image;
+                    barrier->subresourceRange = {aspect, 0, 1, 0, 1};
+                    dependency.pImageMemoryBarriers = &*barrier;
+                    vk.cmdPipelineBarrier2(commands, &dependency);
+                    if (states[index] == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+                        const VkMemoryBarrier2 uav = UnorderedAccessBarrier();
+                        VkDependencyInfo memory{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                        memory.memoryBarrierCount = 1;
+                        memory.pMemoryBarriers = &uav;
+                        vk.cmdPipelineBarrier2(commands, &memory);
+                        ++recorded;
+                    }
+                    current = states[index];
+                    ++recorded;
+                }
+            };
+            walk(color, VK_IMAGE_ASPECT_COLOR_BIT, false, colorStates, std::size(colorStates));
+            walk(depth, VK_IMAGE_ASPECT_DEPTH_BIT, true, depthStates, std::size(depthStates));
+            UINT current = D3D12_RESOURCE_STATE_COMMON;
+            for (const UINT state : bufferStates) {
+                const std::optional<VkMemoryBarrier2> barrier = BufferTransition(static_cast<D3D12_RESOURCE_STATES>(current), static_cast<D3D12_RESOURCE_STATES>(state), error);
+                if (!barrier) {
+                    failed = true;
+                    return;
+                }
+                VkDependencyInfo memory{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                memory.memoryBarrierCount = 1;
+                memory.pMemoryBarriers = &*barrier;
+                vk.cmdPipelineBarrier2(commands, &memory);
+                current = state;
+                ++recorded;
+            }
+            const VkMemoryBarrier2 aliasing = AliasingBarrier();
+            VkDependencyInfo memory{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            memory.memoryBarrierCount = 1;
+            memory.pMemoryBarriers = &aliasing;
+            vk.cmdPipelineBarrier2(commands, &memory);
+            ++recorded;
+        },
+        error);
+    for (const Image* image : {&color, &depth}) {
+        vk.destroyImage(device->Handle(), image->image, nullptr);
+        vk.freeMemory(device->Handle(), image->memory, nullptr);
+    }
+    if (!submitted || failed) return Fail("barriers: " + error);
+    std::printf("barriers recorded and executed: %zu\n", recorded);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) return 1;
+    }
+    std::puts("PASS states gpu");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -715,8 +903,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "input-selftest") == 0) return InputSelfTest();
     if (argc >= 4 && std::strcmp(argv[1], "graphics-title") == 0) return GraphicsTitle(argc, argv);
     if (argc == 3 && std::strcmp(argv[1], "dump-test-shaders") == 0) return DumpTestShaders(Utf8Path(argv[2]));
+    if (argc == 2 && std::strcmp(argv[1], "states-selftest") == 0) return StatesSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate]");
     return 2;
 }

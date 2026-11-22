@@ -151,6 +151,12 @@ def main():
 
     assert "PASS graphics selftest" in run([args.probe, "graphics-selftest"], env)
     assert "PASS input selftest" in run([args.probe, "input-selftest"], env)
+    assert "PASS states selftest" in run([args.probe, "states-selftest"], env)
+    states = subprocess.run([str(args.probe), "states-gpu", "--validate"], capture_output=True, text=True, env=env, timeout=600)
+    if states.returncode == 4:
+        states = subprocess.run([str(args.probe), "states-gpu"], capture_output=True, text=True, env=env, timeout=600)
+    print(states.stdout.strip())
+    assert states.returncode in (0, 3), (states.stdout[-3000:], states.stderr[-2000:])
     graphics = subprocess.run([str(args.probe), "graphics-gpu", "--validate"], capture_output=True, text=True, env=env, timeout=600)
     if graphics.returncode == 4:
         print("validation layer not installed: creating graphics pipelines without it")

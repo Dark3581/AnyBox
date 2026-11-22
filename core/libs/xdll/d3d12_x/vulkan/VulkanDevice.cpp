@@ -71,6 +71,7 @@ const FeatureEntry kLayoutFeatures[] = {
     {"descriptorBindingSampledImageUpdateAfterBind", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingSampledImageUpdateAfterBind; }},
     {"descriptorBindingStorageImageUpdateAfterBind", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingStorageImageUpdateAfterBind; }},
     {"dynamicRendering", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.dynamicRendering; }},
+    {"synchronization2", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.synchronization2; }},
 };
 
 const FeatureEntry kOptionalFeatures[] = {
@@ -483,6 +484,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.beginCommandBuffer = DeviceFunction<PFN_vkBeginCommandBuffer>(getDeviceProcAddr, device_, "vkBeginCommandBuffer");
     vk_.endCommandBuffer = DeviceFunction<PFN_vkEndCommandBuffer>(getDeviceProcAddr, device_, "vkEndCommandBuffer");
     vk_.cmdPipelineBarrier = DeviceFunction<PFN_vkCmdPipelineBarrier>(getDeviceProcAddr, device_, "vkCmdPipelineBarrier");
+    vk_.cmdPipelineBarrier2 = DeviceFunction<PFN_vkCmdPipelineBarrier2>(getDeviceProcAddr, device_, "vkCmdPipelineBarrier2");
     vk_.cmdBindPipeline = DeviceFunction<PFN_vkCmdBindPipeline>(getDeviceProcAddr, device_, "vkCmdBindPipeline");
     vk_.cmdBindDescriptorSets = DeviceFunction<PFN_vkCmdBindDescriptorSets>(getDeviceProcAddr, device_, "vkCmdBindDescriptorSets");
     vk_.cmdPushConstants = DeviceFunction<PFN_vkCmdPushConstants>(getDeviceProcAddr, device_, "vkCmdPushConstants");

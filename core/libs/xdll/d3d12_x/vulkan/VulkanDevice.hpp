@@ -62,6 +62,7 @@ struct DeviceFunctions {
     PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
     PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
+    PFN_vkCmdPipelineBarrier2 cmdPipelineBarrier2 = nullptr;
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
     PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
