@@ -78,7 +78,10 @@ flowchart LR
 
 ## Graphics (d3d12_x)
 
-Console shaders carry native GPU code and no DXIL, so `d3d12_x` cannot hand them to a desktop driver. The design is on [#4](https://github.com/Dark3581/AnyBox/issues/4): the title's D3D12.X calls go to Vulkan, and its shaders are SPIR-V modules translated ahead of time by a separate tool.
+Console shaders carry native GPU code and no DXIL, so `d3d12_x` cannot hand them to a desktop driver. The design is on [#4](https://github.com/Dark3581/AnyBox/issues/4): the title's D3D12.X device goes to Vulkan, and its shaders are SPIR-V modules translated ahead of time by a separate tool. `d3d12_x` uses two back ends:
+
+- **Host `d3d12.dll`** ([`RootSignature.cpp`](../../core/libs/xdll/d3d12_x/RootSignature.cpp)): `D3D12SerializeRootSignature` and `D3D12SerializeVersionedRootSignature` (with the console-only flag bits cleared) and the two deserializer creators are forwarded to it, since they need no GPU.
+- **Vulkan** (`vulkan/`, `pso/`, `store/`): everything the device does. `D3D12XboxCreateDevice`, `D3D12CreateDevice` and `D3D12GetDebugInterface` still stop the title until its calls show the device's shape, so nothing reaches the pieces below yet.
 
 - **Shader store** ([`store/ShaderStore.cpp`](../../core/libs/xdll/d3d12_x/store/ShaderStore.cpp)): modules keyed by the SHA-256 of each DXBC container, loaded from `ANYBOX_SHADER_STORE` or `shaders` beside the executable. [`tools/build_shaders.py`](../../tools/build_shaders.py) and the `shaders` target build it from a package ([GAME_TESTING](GAME_TESTING.md#building-shaders-with-the-project)).
 - **Device** ([`vulkan/VulkanDevice.cpp`](../../core/libs/xdll/d3d12_x/vulkan/VulkanDevice.cpp)): a Vulkan 1.3 device with exactly the features the store's modules name; [`VulkanBackend.cpp`](../../core/libs/xdll/d3d12_x/vulkan/VulkanBackend.cpp) reports what each GPU offers (`anybox-gpu-report`, `tools/gpu_report.py`).

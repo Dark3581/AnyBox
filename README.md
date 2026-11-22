@@ -21,7 +21,7 @@ The [progress page](https://dark3581.github.io/AnyBox/progress.html) lists every
 | Library | Serves | State |
 |---|---|---|
 | [xgameruntime](core/libs/xdll/xgameruntime) | `xgameruntime.dll` | XGameRuntime init and options, XTaskQueue, XAsync, XThread and XGameSave implemented; XUser, XGameSaveFiles, most of XPackage and XSystem stubs |
-| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | root signature serialization forwarded to the host; the Vulkan side is built (device, title layout, shader store, compute pipelines, bindless descriptors, buffer window, see [Shaders](#shaders)), but the device entry points are stubs until a title's calls show their shape |
+| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | uses two back ends: root signature serialization is forwarded to the host's `d3d12.dll`, and everything the device does goes to Vulkan, where the device, title layout, shader store, pipeline state, bindless descriptors and buffer window are built ([Shaders](#shaders)). Device creation still stops the title until its calls show the device's shape |
 | [xaudio2](core/libs/xdll/xaudio2) | `xaudio2_9.dll` | forwarded to the host's XAudio2 |
 | [gameinput](core/libs/xdll/gameinput) | `gameinput.dll` | forwarded to the host's GameInput |
 | [kernelx](core/libs/xdll/kernelx) | `kernelx.dll` | Win32 subset forwarded to `kernel32` |
@@ -31,7 +31,7 @@ Unsupported or unexpected states stop the process with a [run report](docs/run-r
 
 ## Shaders
 
-Console shaders ship as native GPU code, not DXIL, so no desktop driver can take them as they are. AnyBox's graphics library ([d3d12_x](core/libs/xdll/d3d12_x)) runs a title's D3D12.X calls on Vulkan, with the title's shaders translated to SPIR-V ahead of time by an external translator. The [design is on #4](https://github.com/Dark3581/AnyBox/issues/4) and the pieces are in [Architecture](docs/dev/ARCHITECTURE.md#graphics-d3d12_x).
+Console shaders ship as native GPU code, not DXIL, so no desktop driver can take them as they are. AnyBox's graphics library ([d3d12_x](core/libs/xdll/d3d12_x)) therefore runs a title's D3D12.X device on Vulkan, with the title's shaders translated to SPIR-V ahead of time by an external translator. The parts of D3D12 that need no GPU, root signature serialization and deserialization, go to the host's own `d3d12.dll`. The [design is on #4](https://github.com/Dark3581/AnyBox/issues/4) and the pieces are in [Architecture](docs/dev/ARCHITECTURE.md#graphics-d3d12_x).
 
 The shader set is built on your PC from your own copy, into the build folder, like the rest of the project. It is never committed or shared. With a checkout of the translator:
 
