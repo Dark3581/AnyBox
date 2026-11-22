@@ -1,6 +1,7 @@
 #include "BindlessSet.hpp"
 #include "DescriptorTable.hpp"
 #include "PipelineCompiler.hpp"
+#include "TitleBufferWindow.hpp"
 #include "TitleLayout.hpp"
 #include "VulkanDevice.hpp"
 
@@ -53,6 +54,10 @@ constexpr int kNoValidation = 4;
 
 const std::uint32_t kDescriptorLookup[] = {
 #include "shaders/descriptor_lookup.inc"
+};
+
+const std::uint32_t kWindowAccess[] = {
+#include "shaders/window_access.inc"
 };
 
 int Fail(const std::string& what) {
@@ -332,6 +337,95 @@ int Bindless(const std::filesystem::path& work, bool validate) {
     return 0;
 }
 
+int Window(const std::filesystem::path& work, std::uint64_t mebibytes, bool validate) {
+    if (FindFreeRange(kLowWindowEnd, 0x10000, kLowWindowStart, kLowWindowEnd) || FindFreeRange(0, 0x10000, kLowWindowStart, kLowWindowEnd)) {
+        return Fail("free range bounds");
+    }
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress", "shaderInt64"};
+    requirements.hostMemoryImport = true;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const std::unique_ptr<TitleBufferWindow> window = TitleBufferWindow::Create(*device, mebibytes << 20, error);
+    if (!window) return Fail("window: " + error);
+    const std::uint64_t start = window->Start();
+    std::printf("window %#llx-%#llx (%llu MiB), device address %#llx, heap base %#llx, import alignment %llu\n", static_cast<unsigned long long>(start),
+                static_cast<unsigned long long>(start + window->Size()), static_cast<unsigned long long>(window->Size() >> 20),
+                static_cast<unsigned long long>(window->DeviceAddress()), static_cast<unsigned long long>(window->HeapBase()),
+                static_cast<unsigned long long>(device->HostImportAlignment()));
+    if (start < kLowWindowStart || start + window->Size() > kLowWindowEnd) return Fail("the window is not below 4 GB");
+    if (!window->Contains(start, window->Size()) || window->Contains(start + window->Size() - 3, 4) || window->Contains(start - 4, 4)) return Fail("Contains");
+
+    const std::uint32_t count = 4096;
+    const std::uint64_t tableOffset = 0;
+    const std::uint64_t resultsOffset = window->Size() - count * 4ull;
+    const std::uint64_t dataSpan = resultsOffset - (count * 4ull + 4096);
+    std::uint32_t* table = reinterpret_cast<std::uint32_t*>(window->Base() + tableOffset);
+    std::uint32_t* results = reinterpret_cast<std::uint32_t*>(window->Base() + resultsOffset);
+    std::vector<std::uint32_t*> data(count);
+    KeySource source(777);
+    for (std::uint32_t item = 0; item < count; ++item) {
+        const std::uint64_t offset = count * 4ull + 4096 + (static_cast<std::uint64_t>(source.Next()) * 4) % dataSpan / 4 * 4;
+        data[item] = reinterpret_cast<std::uint32_t*>(window->Base() + offset);
+        table[item] = static_cast<std::uint32_t>(start + offset);
+    }
+    std::filesystem::create_directories(work);
+    const std::filesystem::path shader = work / "window_access.spv";
+    std::ofstream(shader, std::ios::binary).write(reinterpret_cast<const char*>(kWindowAccess), sizeof(kWindowAccess));
+    PipelineCache cache(*device, {});
+    ComputePipeline pipeline;
+    const CompileOutcome outcome = CompileCompute(*device, cache.Handle(), {"window_access", shader, 0}, &pipeline);
+    if (!outcome.ok) return Fail("window shader: " + outcome.error);
+    struct {
+        std::uint64_t heapBase;
+        std::uint32_t table;
+        std::uint32_t results;
+        std::uint32_t count;
+    } constants{window->HeapBase(), static_cast<std::uint32_t>(start + tableOffset), static_cast<std::uint32_t>(start + resultsOffset), count};
+    const DeviceFunctions& vk = device->Vk();
+    std::size_t wrong = 0;
+    for (std::uint32_t round = 0; round < 2; ++round) {
+        for (std::uint32_t item = 0; item < count; ++item) {
+            *data[item] = source.Next();
+            results[item] = 0xDEADBEEFu;
+        }
+        const bool submitted = device->Submit(
+            [&](VkCommandBuffer commands) {
+                VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                host.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+                host.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vk.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &host, 0, nullptr, 0, nullptr);
+                vk.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle());
+                vk.cmdPushConstants(commands, device->TitlePipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(constants), &constants);
+                vk.cmdDispatch(commands, (count + 63) / 64, 1, 1);
+                VkMemoryBarrier back{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                back.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                back.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                vk.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &back, 0, nullptr, 0, nullptr);
+            },
+            error);
+        if (!submitted) return Fail("dispatch: " + error);
+        for (std::uint32_t item = 0; item < count; ++item) {
+            const std::uint32_t want = *data[item] * 3u + 1u;
+            if (results[item] != want && wrong++ < 5) std::printf("round %u item %u: GPU %#x, expected %#x\n", round, item, results[item], want);
+        }
+    }
+    std::printf("GPU reads through heap base + 32-bit addresses: %u per round, 2 rounds, wrong: %zu\n", count, wrong);
+    if (wrong != 0) return Fail("GPU access through the window");
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.400s\n", message.c_str());
+        if (device->ValidationErrors() != 0) return 1;
+    }
+    std::puts("PASS window");
+    return 0;
+}
+
 int Compile(int argc, char** argv) {
     const std::string jobsFile = FindOption(argc, argv, "--jobs-file", "");
     if (jobsFile.empty()) return Fail("--jobs-file is required");
@@ -391,7 +485,7 @@ int Compile(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) return Fail("usage: anybox-pipeline-probe layout | selftest <work folder> | validation <work folder> | bindless <work folder> [--validate] | compile --jobs-file <file> [--features a,b] [--maintenance8] [--validate] [--cache <file>] [--workers N] [--exclusive-bytes N]");
+    if (argc < 2) return Fail("usage: anybox-pipeline-probe layout | selftest <work folder> | validation <work folder> | bindless <work folder> [--validate] | window <work folder> [--mib N] [--validate] | compile --jobs-file <file> [--features a,b] [--maintenance8] [--validate] [--cache <file>] [--workers N] [--exclusive-bytes N]");
     const std::string command = argv[1];
     if (command == "layout") {
         std::fputs(TitleLayoutJson().c_str(), stdout);
@@ -401,5 +495,8 @@ int main(int argc, char** argv) {
     if (command == "validation" && argc == 3) return ValidationSelfTest(Utf8Path(argv[2]));
     if (command == "compile") return Compile(argc, argv);
     if (command == "bindless" && argc >= 3) return Bindless(Utf8Path(argv[2]), HasFlag(argc, argv, "--validate"));
+    if (command == "window" && argc >= 3) {
+        return Window(Utf8Path(argv[2]), std::strtoull(FindOption(argc, argv, "--mib", "64").c_str(), nullptr, 10), HasFlag(argc, argv, "--validate"));
+    }
     return Fail("unknown command");
 }

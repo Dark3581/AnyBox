@@ -3,7 +3,7 @@ target_include_directories(d3d12_x_store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/stor
 target_compile_definitions(d3d12_x_store PRIVATE ABX_LIBRARY_NAME="d3d12_x")
 target_link_libraries(d3d12_x_store PUBLIC abx_runtime bcrypt)
 
-add_library(d3d12_x_vulkan STATIC vulkan/VulkanBackend.cpp vulkan/VulkanDevice.cpp vulkan/TitleLayout.cpp vulkan/PipelineCompiler.cpp vulkan/DescriptorTable.cpp vulkan/BindlessSet.cpp)
+add_library(d3d12_x_vulkan STATIC vulkan/VulkanBackend.cpp vulkan/VulkanDevice.cpp vulkan/TitleLayout.cpp vulkan/PipelineCompiler.cpp vulkan/DescriptorTable.cpp vulkan/BindlessSet.cpp vulkan/TitleBufferWindow.cpp)
 target_include_directories(d3d12_x_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vulkan)
 target_link_libraries(d3d12_x_vulkan PUBLIC Vulkan::Headers)
 

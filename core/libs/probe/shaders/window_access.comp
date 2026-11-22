@@ -1,0 +1,28 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint value[];
+};
+
+layout(push_constant) uniform Window {
+    uint64_t heapBase;
+    uint table;
+    uint results;
+    uint count;
+} window;
+
+void main() {
+    uint item = gl_GlobalInvocationID.x;
+    if (item >= window.count) {
+        return;
+    }
+    Words table = Words(window.heapBase + uint64_t(window.table));
+    uint address = table.value[item];
+    Words data = Words(window.heapBase + uint64_t(address));
+    Words results = Words(window.heapBase + uint64_t(window.results));
+    results.value[item] = data.value[0] * 3u + 1u;
+}

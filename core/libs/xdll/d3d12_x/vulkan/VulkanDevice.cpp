@@ -323,6 +323,9 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
                 missing += (missing.empty() ? "" : ", ") + std::string(entry.name);
             }
         }
+        if (requirements.hostMemoryImport && extensions.count(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0) {
+            missing += (missing.empty() ? "" : ", ") + std::string(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        }
         if (requirements.maintenance8 && (extensions.count(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) == 0 || !supported.maintenance8.maintenance8)) {
             missing += (missing.empty() ? "" : ", ") + std::string("maintenance8");
         }
@@ -395,6 +398,13 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         }
     }
     subgroupSizeControl_ = supported.v13.subgroupSizeControl == VK_TRUE;
+    if (requirements.hostMemoryImport) {
+        useExtensions.insert(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 hostProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host};
+        getProperties2(physical_, &hostProperties);
+        hostImportAlignment_ = host.minImportedHostPointerAlignment;
+    }
     if (requirements.maintenance8) {
         enabled.maintenance8.maintenance8 = VK_TRUE;
         enabled_.emplace_back("maintenance8");
@@ -491,6 +501,13 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         return false;
     }
     getMemoryProperties(physical_, &memory_);
+    if (requirements.hostMemoryImport) {
+        hostPointerProperties_ = DeviceFunction<PFN_vkGetMemoryHostPointerPropertiesEXT>(getDeviceProcAddr, device_, "vkGetMemoryHostPointerPropertiesEXT");
+        if (hostPointerProperties_ == nullptr || hostImportAlignment_ == 0) {
+            error = "vkGetMemoryHostPointerPropertiesEXT is not available";
+            return false;
+        }
+    }
     return true;
 }
 

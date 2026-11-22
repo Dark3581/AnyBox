@@ -23,7 +23,7 @@ Outputs:
 - `build/anybox-relinker.exe`
 - `build/anybox-module-probe.exe`, used by `tools/module_check.py`
 - `build/anybox-gpu-report.exe`, used by `tools/gpu_report.py`
-- `build/anybox-pipeline-probe.exe`, which creates `d3d12_x`'s Vulkan device and compiles compute pipelines (`layout`, `selftest`, `validation`, `compile`, `bindless`)
+- `build/anybox-pipeline-probe.exe`, which creates `d3d12_x`'s Vulkan device and compiles compute pipelines (`layout`, `selftest`, `validation`, `compile`, `bindless`, `window`)
 - `build/libs/ab_*.dll`, including `ab_runtime.dll`
 - `build/libs/anybox-libs.map`, the DLL routing table
 

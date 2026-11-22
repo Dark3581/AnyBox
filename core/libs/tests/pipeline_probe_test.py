@@ -51,6 +51,14 @@ def main():
     if bindless.returncode == 4:
         bindless = run([args.probe, "bindless", args.work / "bindless"])
     assert bindless.returncode == 0 and "PASS bindless" in bindless.stdout and "wrong: 0" in bindless.stdout, (bindless.returncode, bindless.stdout)
+
+    window = run([args.probe, "window", args.work / "window", "--validate"])
+    if window.returncode == 4:
+        window = run([args.probe, "window", args.work / "window"])
+    if window.returncode == 3:
+        print("SKIP window check: the device cannot import host memory")
+    else:
+        assert window.returncode == 0 and "PASS window" in window.stdout and "wrong: 0" in window.stdout, (window.returncode, window.stdout)
     print("PASS pipeline_probe")
 
 

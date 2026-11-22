@@ -18,6 +18,7 @@ struct DeviceRequirements {
     std::set<std::string> features;
     bool maintenance8 = false;
     bool validation = false;
+    bool hostMemoryImport = false;
 };
 
 struct DeviceFunctions {
@@ -90,6 +91,8 @@ public:
     VkDescriptorSetLayout TitleSetLayout() const { return setLayout_; }
     VkQueue Queue() const { return queue_; }
     bool BufferDeviceAddress() const { return bufferDeviceAddress_; }
+    VkDeviceSize HostImportAlignment() const { return hostImportAlignment_; }
+    PFN_vkGetMemoryHostPointerPropertiesEXT HostPointerProperties() const { return hostPointerProperties_; }
     std::optional<std::uint32_t> MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
     bool Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
@@ -122,6 +125,8 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory_{};
     bool bufferDeviceAddress_ = false;
+    VkDeviceSize hostImportAlignment_ = 0;
+    PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties_ = nullptr;
     bool subgroupSizeControl_ = false;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
