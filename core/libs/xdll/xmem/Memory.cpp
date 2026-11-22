@@ -32,12 +32,7 @@ void Release(void* address, Block block) {
     }
 }
 
-}
-
-ABX_API void* XMemAlloc(std::size_t size, [[maybe_unused]] std::uint64_t attributes) {
-    if (size == 0) {
-        AbxUnsupported(__func__, "size is 0");
-    }
+void* Allocate(std::size_t size) {
     void* address = nullptr;
     Block block = Block::Heap;
     if (size >= PageThreshold) {
@@ -62,7 +57,19 @@ ABX_API void* XMemAlloc(std::size_t size, [[maybe_unused]] std::uint64_t attribu
     return address;
 }
 
-ABX_API void XMemFree(void* address, [[maybe_unused]] std::uint64_t attributes) {
+}
+
+ABX_API void* XMemAlloc(std::size_t size, std::uint64_t attributes) {
+    if (size == 0) {
+        AbxUnsupported(__func__, "size is 0");
+    }
+    void* const address = Allocate(size);
+    AbxTrace("XMemAlloc(%zu, 0x%llx) -> %p", size, static_cast<unsigned long long>(attributes), address);
+    return address;
+}
+
+ABX_API void XMemFree(void* address, std::uint64_t attributes) {
+    AbxTrace("XMemFree(%p, 0x%llx)", address, static_cast<unsigned long long>(attributes));
     if (address == nullptr) {
         AbxUnsupported(__func__, "address is null");
     }
@@ -89,9 +96,13 @@ ABX_API BOOL XMemVirtualQuery(HANDLE process, const void* address, XMemVirtualQu
     }
     std::memset(info, 0, sizeof(*info));
     const SIZE_T written = VirtualQueryEx(process, address, &info->basic, sizeof(info->basic));
-    return written == sizeof(info->basic) ? TRUE : FALSE;
+    const BOOL result = written == sizeof(info->basic) ? TRUE : FALSE;
+    AbxTrace("XMemVirtualQuery(%p, %p, %p) -> %d, base %p, size 0x%zx, state 0x%lx, protect 0x%lx", process, address, static_cast<void*>(info), result,
+             info->basic.BaseAddress, static_cast<std::size_t>(info->basic.RegionSize), info->basic.State, info->basic.Protect);
+    return result;
 }
 
-ABX_API BOOL XMemGetWorkingSetStatistics([[maybe_unused]] std::uint32_t request, [[maybe_unused]] void* statistics) {
+ABX_API BOOL XMemGetWorkingSetStatistics(std::uint32_t request, void* statistics) {
+    AbxTrace("XMemGetWorkingSetStatistics(0x%x, %p) -> 0", request, statistics);
     return FALSE;
 }

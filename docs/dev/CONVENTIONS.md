@@ -18,6 +18,7 @@
 - ✔ Every `ABX_API` definition has exactly one declaration, in a header; none in source files. Every declaration has a definition.
 - ✔ A function is either defined or forwarded, not both.
 - Stubs call `AbxNotImplemented(__func__)`. Unknown behaviour inside an implemented function calls `AbxUnsupported(__func__, "<what is unknown>")`.
+- Implemented functions trace each call with `AbxTrace("<Function>(<arguments>) -> <result>", ...)`: arguments in call order, pointers with `%p`, flags and codes in hex.
 - Signatures not taken from a public header are declared without parameters and listed under **Unknown function info** in the library's debt file.
 - Implementation files are named after the API area (`TaskQueue.cpp`, `GameSave.cpp`); unimplemented stubs live in `Inventory.cpp`.
 

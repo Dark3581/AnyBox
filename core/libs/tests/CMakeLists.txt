@@ -45,3 +45,9 @@ if(Python3_FOUND)
             --work ${CMAKE_CURRENT_BINARY_DIR}/module_check
             $<TARGET_FILE:fake_module_ok> $<TARGET_FILE:fake_module_fail> $<TARGET_FILE:fake_module_stop> $<TARGET_FILE:fake_module_crash>)
 endif()
+
+if(Python3_FOUND)
+    add_test(NAME runtime_trace
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/trace_test.py
+            --probe $<TARGET_FILE:lib_probe> --libs ${ANYBOX_LIBS_DIR} --work ${CMAKE_CURRENT_BINARY_DIR}/runtime_trace)
+endif()

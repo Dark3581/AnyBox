@@ -72,6 +72,7 @@ flowchart LR
   - An unhandled exception filter writes the report for crashes (code, address, module and offset).
   - At normal process exit the report is written with `stop.kind = "none"`.
   - `AbxTitleId()`, `AbxTitleName()` and `AbxTitleDeviceFamily()` read `MicrosoftGame.config` beside the executable.
+  - `AbxTrace(format, ...)` logs through `AbxLog` on the library's channel when `ANYBOX_TRACE` lists that library (or `all`); each call site asks `AbxTraceEnabled` once, so a trace that is off costs one branch.
   - Each library registers itself at load ([`Registration.cpp`](../../core/libs/runtime/src/Registration.cpp)), so the report lists the libraries the title loaded.
 - Libraries link their C++ runtime statically, so the output folder needs no MinGW DLLs.
 

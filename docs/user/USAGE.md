@@ -56,3 +56,4 @@ Start `<out>\game.exe`. When the title stops, `anybox-report.json` beside it say
 | `ANYBOX_REPORT=<path>` | write the run report there instead of beside the executable |
 | `ANYBOX_NO_REPORT=1` | write no run report |
 | `ANYBOX_LOG_FILE=<path>` | append AnyBox's log lines to this file as well as stderr |
+| `ANYBOX_TRACE=<library>[,<library>...]` | log every call into the listed AnyBox libraries (`xmem`, `d3d12_x`, ...; `all` for every library) with its arguments and result; case and spaces are ignored. Libraries that trace so far: `xmem`, `d3d12_x` |

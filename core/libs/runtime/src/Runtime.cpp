@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -70,6 +71,22 @@ std::string Environment(const char* name) {
         return {};
     }
     return std::string(buffer, length);
+}
+
+std::vector<std::string> TraceNames() {
+    std::vector<std::string> names;
+    std::string name;
+    for (const char c : Environment("ANYBOX_TRACE") + ",") {
+        if (c == ',') {
+            if (!name.empty()) {
+                names.push_back(name);
+            }
+            name.clear();
+        } else if (c != ' ' && c != '\t') {
+            name.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+    }
+    return names;
 }
 
 const abx::TitleConfig& Title() {
@@ -354,6 +371,23 @@ ABX_RUNTIME_API bool AbxWriteReport(const AbxStop* stop) {
     const BOOL ok = WriteFile(file, report.data(), static_cast<DWORD>(report.size()), &written, nullptr);
     CloseHandle(file);
     return ok && written == report.size();
+}
+
+ABX_RUNTIME_API bool AbxTraceEnabled(const char* library) {
+    static const std::vector<std::string> names = TraceNames();
+    if (library == nullptr) {
+        return false;
+    }
+    std::string wanted(library);
+    for (char& c : wanted) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    for (const std::string& name : names) {
+        if (name == "all" || name == wanted) {
+            return true;
+        }
+    }
+    return false;
 }
 
 ABX_RUNTIME_API void AbxLog(const char* channel, const char* format, ...) {
