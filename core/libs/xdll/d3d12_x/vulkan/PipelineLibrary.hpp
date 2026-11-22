@@ -1,11 +1,13 @@
 #pragma once
 
+#include "GraphicsPipeline.hpp"
 #include "VulkanDevice.hpp"
 
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -17,6 +19,20 @@ struct PipelineSource {
     std::string key;
     std::filesystem::path module;
     std::uint32_t subgroupSize = 0;
+};
+
+struct GraphicsShaderSource {
+    VkShaderStageFlagBits stage = VK_SHADER_STAGE_VERTEX_BIT;
+    std::string key;
+    std::filesystem::path module;
+    std::uint32_t subgroupSize = 0;
+};
+
+struct GraphicsRequest {
+    std::string key;
+    std::vector<GraphicsShaderSource> shaders;
+    GraphicsPipelineState state;
+    VertexInput input;
 };
 
 enum class PipelineOrigin { Ready, Compiled, Refused, Failed };
@@ -48,6 +64,7 @@ public:
     PipelineLibrary& operator=(const PipelineLibrary&) = delete;
 
     PipelineEntry Compute(const PipelineSource& source);
+    PipelineEntry Graphics(const GraphicsRequest& request);
     PipelineLibraryStats Stats() const;
     std::uintmax_t CompileLimitBytes() const { return compileLimitBytes_; }
 
@@ -57,7 +74,9 @@ private:
         PipelineEntry entry;
     };
 
+    PipelineEntry Obtain(const std::string& key, const std::function<PipelineEntry()>& create);
     PipelineEntry Create(const PipelineSource& source) const;
+    PipelineEntry CreateGraphics(const GraphicsRequest& request) const;
 
     const VulkanDevice& device_;
     VkPipelineCache cache_;

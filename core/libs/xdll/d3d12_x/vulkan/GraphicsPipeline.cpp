@@ -1,5 +1,7 @@
 #include "GraphicsPipeline.hpp"
 
+#include <cstring>
+
 namespace abx::d3d12x {
 
 const std::vector<VkDynamicState>& GraphicsDynamicStates() {
@@ -13,6 +15,79 @@ const std::vector<VkDynamicState>& GraphicsDynamicStates() {
         VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
     };
     return states;
+}
+
+std::string GraphicsStateKey(const GraphicsPipelineState& state, const VertexInput& input) {
+    std::string key;
+    const auto add = [&key](std::uint64_t value) {
+        key += std::to_string(value);
+        key += ',';
+    };
+    const auto addFloat = [&add](float value) {
+        std::uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        add(bits);
+    };
+    const auto addStencil = [&add](const VkStencilOpState& face) {
+        add(face.failOp);
+        add(face.passOp);
+        add(face.depthFailOp);
+        add(face.compareOp);
+        add(face.compareMask);
+        add(face.writeMask);
+    };
+    add(state.topology);
+    add(state.stripCut);
+    add(state.polygonMode);
+    add(state.cullMode);
+    add(state.frontFace);
+    add(state.depthClamp);
+    add(state.depthBias);
+    addFloat(state.depthBiasConstant);
+    addFloat(state.depthBiasClamp);
+    addFloat(state.depthBiasSlope);
+    add(state.samples);
+    add(state.sampleMask);
+    add(state.alphaToCoverage);
+    add(state.depthTest);
+    add(state.depthWrite);
+    add(state.depthCompare);
+    add(state.stencilTest);
+    addStencil(state.stencilFront);
+    addStencil(state.stencilBack);
+    add(state.logicOpEnable);
+    add(state.logicOp);
+    key += "b";
+    for (const VkPipelineColorBlendAttachmentState& blend : state.blend) {
+        add(blend.blendEnable);
+        add(blend.srcColorBlendFactor);
+        add(blend.dstColorBlendFactor);
+        add(blend.colorBlendOp);
+        add(blend.srcAlphaBlendFactor);
+        add(blend.dstAlphaBlendFactor);
+        add(blend.alphaBlendOp);
+        add(blend.colorWriteMask);
+    }
+    key += "f";
+    for (const VkFormat format : state.colorFormats) {
+        add(format);
+    }
+    add(state.depthFormat);
+    add(state.stencilFormat);
+    key += "v";
+    for (const VkVertexInputBindingDescription& binding : input.bindings) {
+        add(binding.binding);
+        add(binding.inputRate);
+    }
+    key += "a";
+    for (const VkVertexInputAttributeDescription& attribute : input.attributes) {
+        add(attribute.location);
+        add(attribute.binding);
+        add(attribute.format);
+        add(attribute.offset);
+    }
+    return key;
 }
 
 VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cache, const GraphicsPipelineState& state, const std::vector<GraphicsStage>& stages,

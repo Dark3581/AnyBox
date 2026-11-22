@@ -53,6 +53,8 @@ struct VertexInput {
     std::vector<VkVertexInputAttributeDescription> attributes;
 };
 
+std::string GraphicsStateKey(const GraphicsPipelineState& state, const VertexInput& input);
+
 VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cache, const GraphicsPipelineState& state, const std::vector<GraphicsStage>& stages,
                                 const VertexInput& input, VkPipelineCreateFlags flags, VkPipeline* pipeline, std::string& error);
 

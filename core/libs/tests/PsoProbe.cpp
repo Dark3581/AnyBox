@@ -631,6 +631,81 @@ int GraphicsTitle(int argc, char** argv) {
     return 0;
 }
 
+int DumpTestShaders(const std::filesystem::path& folder) {
+    std::filesystem::create_directories(folder);
+    const std::pair<const char*, std::pair<const std::uint32_t*, std::size_t>> shaders[] = {
+        {"test_vertex.spv", {kGraphicsVertex, sizeof(kGraphicsVertex)}},
+        {"test_inputs.spv", {kGraphicsInputs, sizeof(kGraphicsInputs)}},
+        {"test_float.spv", {kGraphicsFloat, sizeof(kGraphicsFloat)}},
+        {"test_uint.spv", {kGraphicsUint, sizeof(kGraphicsUint)}},
+    };
+    for (const auto& [name, code] : shaders) {
+        std::ofstream(folder / name, std::ios::binary).write(reinterpret_cast<const char*>(code.first), static_cast<std::streamsize>(code.second));
+    }
+    std::puts("dumped");
+    return 0;
+}
+
+int GraphicsRequests(int argc, char** argv) {
+    ShaderStore store;
+    if (!LoadStore(argv[2], store)) return 1;
+    const std::vector<unsigned char> vertex = ReadBytes(Utf8Path(argv[3]));
+    const std::vector<unsigned char> pixel = ReadBytes(Utf8Path(argv[4]));
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = DefaultGraphics();
+    desc.VS = {vertex.data(), vertex.size()};
+    desc.PS = {pixel.data(), pixel.size()};
+    if (HasFlag(argc, argv, "--layout")) desc.InputLayout = {kTestLayout, 4};
+    std::string error;
+    const std::optional<GraphicsRequest> request = GraphicsPipelineRequest(desc, store, error);
+    if (!request) {
+        std::printf("error\t%s\n", error.c_str());
+        return 0;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC blended = desc;
+    blended.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    blended.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    blended.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    const std::optional<GraphicsRequest> other = GraphicsPipelineRequest(blended, store, error);
+    if (!other || other->key == request->key) return Fail("a different blend state must give another key");
+    std::printf("request %zu shaders, %zu attributes, key %zu chars\n", request->shaders.size(), request->input.attributes.size(), request->key.size());
+    DeviceRequirements requirements;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return kNoDevice;
+    }
+    std::printf("pipeline cache control %s\n", device->PipelineCacheControl() ? "yes" : "no");
+    PipelineCache cache(*device, Utf8Path(FindOption(argc, argv, "--cache", "")));
+    std::vector<PipelineEntry> entries(7);
+    {
+        PipelineLibrary library(*device, cache.Handle(), std::strtoull(FindOption(argc, argv, "--limit", "0").c_str(), nullptr, 10));
+        std::atomic<std::size_t> next{0};
+        std::vector<std::thread> pool;
+        for (unsigned worker = 0; worker < 4; ++worker) {
+            pool.emplace_back([&] {
+                for (std::size_t index = next++; index < entries.size(); index = next++) {
+                    entries[index] = library.Graphics(index % 3 == 2 ? *other : *request);
+                }
+            });
+        }
+        for (std::thread& thread : pool) thread.join();
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            std::printf("%zu\t%s\t%llu\t%.3f\t%s\n", index, PipelineOriginName(entries[index].origin), static_cast<unsigned long long>(entries[index].bytes), entries[index].seconds,
+                        entries[index].error.c_str());
+        }
+        if (entries[0].pipeline != entries[1].pipeline || entries[2].pipeline != entries[5].pipeline || (entries[0].pipeline != VK_NULL_HANDLE && entries[0].pipeline == entries[2].pipeline)) {
+            return Fail("requests with one key must share one pipeline, and two keys two pipelines");
+        }
+        const PipelineLibraryStats stats = library.Stats();
+        std::printf("stats ready=%zu compiled=%zu refused=%zu failed=%zu\n", stats.ready, stats.compiled, stats.refused, stats.failed);
+    }
+    if (HasFlag(argc, argv, "--save")) {
+        std::size_t written = 0;
+        if (!cache.Save(written, error)) return Fail("cache save: " + error);
+    }
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -639,7 +714,9 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "graphics-selftest") == 0) return GraphicsSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "input-selftest") == 0) return InputSelfTest();
     if (argc >= 4 && std::strcmp(argv[1], "graphics-title") == 0) return GraphicsTitle(argc, argv);
+    if (argc == 3 && std::strcmp(argv[1], "dump-test-shaders") == 0) return DumpTestShaders(Utf8Path(argv[2]));
+    if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save]");
     return 2;
 }

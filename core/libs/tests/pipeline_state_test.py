@@ -52,6 +52,59 @@ def stats(output):
     return {key: int(value) for key, value in (field.split("=") for field in line.split()[1:])}
 
 
+def check_graphics(args, env):
+    shaders = args.work / "test_shaders"
+    run([args.probe, "dump-test-shaders", shaders], env)
+    carved, translated, store = args.work / "gcarved", args.work / "gtranslated", args.work / "gstore"
+    carved.mkdir(parents=True)
+    translated.mkdir(parents=True)
+    inputs_signature = [{"register": 0, "semantic": "POSITION", "semantic_index": 0, "mask": 7, "system_value": 0},
+                        {"register": 1, "semantic": "COLOR", "semantic_index": 0, "mask": 15, "system_value": 0},
+                        {"register": 3, "semantic": "BLENDINDICES", "semantic_index": 0, "mask": 15, "system_value": 0}]
+    modules = {
+        "vs_plain": (container(11), {"stage": "vs"}, "test_vertex.spv"),
+        "vs_inputs": (container(12), {"stage": "vs", "input_signature": inputs_signature,
+                                      "vertex_inputs": [{"location": 0, "type": "float"}, {"location": 1, "type": "float"}, {"location": 3, "type": "uint"}]}, "test_inputs.spv"),
+        "ps_float": (container(13), {"stage": "ps"}, "test_float.spv"),
+    }
+    for name, (data, details, spirv) in modules.items():
+        (carved / f"{name}.dxbc").write_bytes(data)
+        shutil.copyfile(shaders / spirv, translated / f"{name}.spv")
+    (carved / "index.json").write_text(json.dumps([{"name": n, "file": f"{n}.dxbc"} for n in modules]), encoding="utf-8")
+    (translated / "index.json").write_text(json.dumps({n: d for n, (_, d, _) in modules.items()}), encoding="utf-8")
+    run([sys.executable, args.tool, "build", carved, translated, store], env)
+
+    def graphics(vertex, pixel, *extra):
+        result = subprocess.run([str(part) for part in [args.probe, "graphics", store, carved / f"{vertex}.dxbc", carved / f"{pixel}.dxbc", *extra]],
+                                capture_output=True, text=True, env=env, timeout=600)
+        print(result.stdout.strip())
+        assert result.returncode in (0, 3), (result.stdout[-2000:], result.stderr[-2000:])
+        return result
+
+    assert graphics("vs_inputs", "ps_float").stdout.startswith("error\tthe input layout has no element for POSITION0")
+    assert graphics("ps_float", "ps_float").stdout.startswith("error\tthe shader store has stage ps for the vertex shader ")
+    assert graphics("vs_plain", "vs_plain").stdout.startswith("error\tthe shader store has stage vs for the pixel shader ")
+    cache = args.work / "graphics_cache.bin"
+    first = graphics("vs_plain", "ps_float", "--cache", cache, "--save")
+    if first.returncode == 3:
+        print("SKIP graphics pipelines through the library: no usable Vulkan device")
+        return
+    assert "request 2 shaders, 0 attributes" in first.stdout, first.stdout
+    counted = stats(first.stdout)
+    assert counted["ready"] + counted["compiled"] == 2 and counted["refused"] == 0 and counted["failed"] == 0, counted
+    cache_control = "pipeline cache control yes" in first.stdout
+    again = graphics("vs_plain", "ps_float", "--cache", cache)
+    if cache_control:
+        assert stats(again.stdout) == {"ready": 2, "compiled": 0, "refused": 0, "failed": 0}, again.stdout
+    with_inputs = graphics("vs_inputs", "ps_float", "--layout", "--cache", cache)
+    assert "request 2 shaders, 3 attributes" in with_inputs.stdout, with_inputs.stdout
+    counted = stats(with_inputs.stdout)
+    assert counted["failed"] == 0 and counted["refused"] == 0 and counted["ready"] + counted["compiled"] == 2, counted
+    limited = graphics("vs_inputs", "ps_float", "--layout", "--cache", args.work / "graphics_fresh.bin", "--limit", "16")
+    counted = stats(limited.stdout)
+    assert counted["compiled"] == 0 and counted["failed"] == 0 and counted["refused"] + counted["ready"] == 2, counted
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe", type=Path, required=True)
@@ -146,6 +199,7 @@ def main():
 
     output = run([args.probe, "compute", store, limited, "--cache", fresh, "--limit", "100000"], env)
     assert stats(output)["failed"] == 0 and stats(output)["refused"] == 0, output
+    check_graphics(args, env)
     print("PASS pipeline_state")
 
 

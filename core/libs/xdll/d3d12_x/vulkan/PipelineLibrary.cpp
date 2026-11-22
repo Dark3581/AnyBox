@@ -39,8 +39,21 @@ PipelineEntry PipelineLibrary::Compute(const PipelineSource& source) {
         entry.error = "the pipeline has no key";
         return entry;
     }
+    return Obtain("cs:" + source.key, [this, &source] { return Create(source); });
+}
+
+PipelineEntry PipelineLibrary::Graphics(const GraphicsRequest& request) {
+    if (request.key.empty()) {
+        PipelineEntry entry;
+        entry.error = "the pipeline has no key";
+        return entry;
+    }
+    return Obtain("gfx:" + request.key, [this, &request] { return CreateGraphics(request); });
+}
+
+PipelineEntry PipelineLibrary::Obtain(const std::string& key, const std::function<PipelineEntry()>& create) {
     std::unique_lock<std::mutex> guard(lock_);
-    const auto [found, inserted] = slots_.try_emplace(source.key);
+    const auto [found, inserted] = slots_.try_emplace(key);
     if (!inserted) {
         Slot& slot = *found->second;
         finished_.wait(guard, [&slot] { return slot.done; });
@@ -51,7 +64,7 @@ PipelineEntry PipelineLibrary::Compute(const PipelineSource& source) {
     guard.unlock();
     PipelineEntry entry;
     try {
-        entry = Create(source);
+        entry = create();
     } catch (const std::exception& error) {
         entry = PipelineEntry{};
         entry.error = std::string("pipeline creation threw: ") + error.what();
@@ -80,6 +93,79 @@ PipelineEntry PipelineLibrary::Compute(const PipelineSource& source) {
 PipelineLibraryStats PipelineLibrary::Stats() const {
     std::lock_guard<std::mutex> guard(lock_);
     return stats_;
+}
+
+PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) const {
+    PipelineEntry entry;
+    const auto start = std::chrono::steady_clock::now();
+    const auto finish = [&entry, start] {
+        entry.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return entry;
+    };
+    const DeviceFunctions& vk = device_.Vk();
+    std::vector<GraphicsStage> stages;
+    const auto release = [&vk, this, &stages] {
+        for (const GraphicsStage& stage : stages) {
+            vk.destroyShaderModule(device_.Handle(), stage.module, nullptr);
+        }
+    };
+    for (const GraphicsShaderSource& shader : request.shaders) {
+        const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(shader.module, entry.error);
+        if (!words) {
+            release();
+            return finish();
+        }
+        entry.bytes += words->size() * sizeof(std::uint32_t);
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = words->size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = words->data();
+        VkShaderModule module = VK_NULL_HANDLE;
+        const VkResult moduleResult = vk.createShaderModule(device_.Handle(), &moduleInfo, nullptr, &module);
+        if (moduleResult != VK_SUCCESS) {
+            release();
+            entry.error = "vkCreateShaderModule failed with " + std::to_string(static_cast<int>(moduleResult));
+            return finish();
+        }
+        stages.push_back({shader.stage, module, shader.subgroupSize});
+    }
+    const bool overLimit = compileLimitBytes_ != 0 && entry.bytes > compileLimitBytes_;
+    const std::string limitText = std::to_string(entry.bytes) + " bytes of modules, limit " + std::to_string(compileLimitBytes_);
+    if (overLimit && !device_.PipelineCacheControl()) {
+        release();
+        entry.origin = PipelineOrigin::Refused;
+        entry.error = "the modules are larger than the run-time compile limit (" + limitText + ") and this device cannot tell whether the pipeline cache holds the pipeline";
+        return finish();
+    }
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkResult result = VK_PIPELINE_COMPILE_REQUIRED;
+    if (device_.PipelineCacheControl()) {
+        result = CreateGraphicsPipeline(device_, cache_, request.state, stages, request.input, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, &pipeline, entry.error);
+        if (result == VK_SUCCESS) {
+            entry.origin = PipelineOrigin::Ready;
+        }
+    }
+    if (result == VK_PIPELINE_COMPILE_REQUIRED) {
+        if (overLimit) {
+            entry.origin = PipelineOrigin::Refused;
+            entry.error = "the pipeline is not in the pipeline cache and its modules are larger than the run-time compile limit (" + limitText +
+                          "); build the cache offline with the shader_pipelines target";
+        } else {
+            result = CreateGraphicsPipeline(device_, cache_, request.state, stages, request.input, 0, &pipeline, entry.error);
+            if (result == VK_SUCCESS) {
+                entry.origin = PipelineOrigin::Compiled;
+            }
+        }
+    }
+    release();
+    if (entry.origin == PipelineOrigin::Refused) {
+        return finish();
+    }
+    if (result != VK_SUCCESS) {
+        entry.origin = PipelineOrigin::Failed;
+        return finish();
+    }
+    entry.pipeline = pipeline;
+    return finish();
 }
 
 PipelineEntry PipelineLibrary::Create(const PipelineSource& source) const {
