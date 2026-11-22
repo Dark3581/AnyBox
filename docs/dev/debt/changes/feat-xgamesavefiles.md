@@ -1,0 +1,25 @@
+# xgameruntime
+
+## change [the quota counts blob bytes only]
+
+- [XGameSave](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - signatures, structures, error codes, the container name rules (`E_GS_INVALID_CONTAINER_NAME`), the 16 MiB update limit (`E_GS_UPDATE_TOO_BIG`), the 256 MiB per-user quota (`E_GS_QUOTA_EXCEEDED`) and `E_GS_HANDLE_EXPIRED` for an update used after it was submitted follow the public GDK documentation, not a console; the quota counts blob bytes plus the size of every XGameSaveFiles file inside a subfolder of the save folder, and container and blob names match case-insensitively
+  Closes when: measured on a console title
+
+## change [a file in the save folder that AnyBox did not write]
+
+- [XGameSave](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - a container name over 251 characters (the documented limit is 256), a blob over 4 GiB, or a `.xgs` file in the save folder that AnyBox did not write stops with `AbxUnsupported`
+
+## add Functional
+
+- [XGameSaveFiles](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - the title gets the XGameSave folder itself, `%LOCALAPPDATA%\AnyBox\<TitleId>\XGameSave\` (ending in a backslash, without the `\\?\` prefix so the title may use forward slashes); its containers are the subfolders, beside XGameSave's own `.xgs` files at the top level; there is no cloud sync, so no UI is ever shown, and the requesting user (a null one included) and `configurationId` (only checked for null, although the documentation says a SCID that is not a GUID returns `E_INVALIDARG` on PC) are ignored, as in XGameSave, so every user of a title shares one folder; a missing `<TitleId>` or `LOCALAPPDATA` stops with `AbxUnsupported`
+  Closes when: XUser is implemented and saves are kept per user
+- [XGameSaveFiles](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - signatures, the 256 MiB per-user quota and `E_GS_PROVIDER_MISMATCH` (`0x8083000F`) for a title that mixes XGameSave and XGameSaveFiles follow the public GDK documentation, not a console; XGameSave and XGameSaveFiles share one 256 MiB pool counted as XGameSave blob bytes plus the size of every file inside a subfolder, and files at the top level are not counted, as the documentation says they are ignored
+  Closes when: measured on a console title
+- [XGameSaveFiles](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - the first successful `XGameSaveInitializeProvider`, `XGameSaveInitializeProviderAsync` or `XGameSaveFilesGetFolderWithUiAsync` in a process picks the save system for the life of the process, and the other API then returns `E_GS_PROVIDER_MISMATCH` from its result, also after `XGameSaveCloseProvider`; the documentation's error table says "Only one type of Game Saves API can be initialized at a time within a title", which could mean that closing the provider lifts the restriction
+  Closes when: measured on a console title
+- [XGameSaveFiles](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - behaviour the documentation does not state: `XGameSaveFilesGetRemainingQuota` is not checked for a mismatch and works without a prior folder call; a null `configurationId`, async block, `folderResult` or `remainingQuota` returns `E_INVALIDARG`, a null `folderResult` without consuming the result; a buffer smaller than the path and its terminating null returns `E_GS_PROVIDED_BUFFER_TOO_SMALL` and consumes the result, as XAsync does for any failed `XAsyncGetResult`, so a `char[MAX_PATH]` buffer with a long `LOCALAPPDATA` gets that error
+  Closes when: measured on a console title
+- [XGameSaveFiles](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - the folder path is UTF-8, which no documentation states; a title that passes it to ANSI Win32 calls breaks when `LOCALAPPDATA` holds non-ASCII characters and the code page is not UTF-8; the path is not limited, so the root plus what the title appends can exceed `MAX_PATH`
+- [XGameSaveFiles](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - the title writes with Win32 file calls AnyBox does not see, so the quota, the 64 MB file limit and the folder and file name rules are not enforced; the remaining quota is 0 once the folder holds more than the quota; every quota query and XGameSave submit walks every subfolder under the storage lock, and a subfolder removed during the walk counts as empty
+- [XGameSaveFiles](../../../core/libs/xdll/xgameruntime/GameSave.cpp) (xgameruntime) - the documented mapping between XGameSave containers and XGameSaveFiles folders is not implemented: `XGameSaveFilesGetFolderWithUiAsync` on a folder holding `.xgs` containers, and `XGameSaveInitializeProvider` or `XGameSaveInitializeProviderAsync` on a folder whose subfolders hold at least one file, stop with `AbxUnsupported`, as does a folder link (a directory reparse point) inside the save folder when either API lists it; empty subfolders and files carrying a reparse tag are accepted
+  Closes when: containers and blobs are mapped to folders and files both ways

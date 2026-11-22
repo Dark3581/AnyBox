@@ -44,6 +44,8 @@ constexpr HRESULT QuotaExceeded = static_cast<HRESULT>(0x80830006u);
 constexpr HRESULT ProvidedBufferTooSmall = static_cast<HRESULT>(0x80830007u);
 constexpr HRESULT BlobNotFound = static_cast<HRESULT>(0x80830008u);
 constexpr HRESULT HandleExpired = static_cast<HRESULT>(0x8083000Du);
+constexpr HRESULT ProviderMismatch = static_cast<HRESULT>(0x8083000Fu);
+constexpr HRESULT NotSufficientBuffer = static_cast<HRESULT>(0x8007007Au);
 
 constexpr std::size_t MaxContainerName = 256;
 constexpr std::uint64_t MaxUpdateSize = 16ull * 1024 * 1024;
@@ -67,6 +69,20 @@ struct Stored {
 std::mutex& StorageMutex() {
     static std::mutex* mutex = new std::mutex();
     return *mutex;
+}
+
+enum class SaveSystem { None, GameSave, GameSaveFiles };
+
+std::atomic<SaveSystem> g_saveSystem{SaveSystem::None};
+
+bool Available(SaveSystem system) {
+    const SaveSystem current = g_saveSystem.load();
+    return current == SaveSystem::None || current == system;
+}
+
+bool Claim(SaveSystem system) {
+    SaveSystem expected = SaveSystem::None;
+    return g_saveSystem.compare_exchange_strong(expected, system) || expected == system;
 }
 
 bool IsAlnum(char c) {
@@ -369,9 +385,64 @@ std::uint64_t BlobBytes(const Stored& stored) {
     return total;
 }
 
+HRESULT ForEachEntry(const std::wstring& folder, const std::function<HRESULT(const std::wstring&, const WIN32_FIND_DATAW&)>& visit, const char* function) {
+    WIN32_FIND_DATAW found;
+    HANDLE search = FindFirstFileW((folder + L"\\*").c_str(), &found);
+    if (search == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? S_OK : FromWin32(error);
+    }
+    HRESULT result = S_OK;
+    do {
+        const std::wstring name = found.cFileName;
+        if (name == L"." || name == L"..") {
+            continue;
+        }
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 && (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            AbxUnsupported(function, "a folder link (reparse point) inside the save folder");
+        }
+        result = visit(folder + L"\\" + name, found);
+    } while (SUCCEEDED(result) && FindNextFileW(search, &found));
+    FindClose(search);
+    return result;
+}
+
+bool IsFolder(const WIN32_FIND_DATAW& found) {
+    return (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+HRESULT FolderContents(const std::wstring& folder, std::uint64_t& bytes, std::uint64_t& files, const char* function) {
+    return ForEachEntry(folder, [&](const std::wstring& path, const WIN32_FIND_DATAW& found) {
+        if (IsFolder(found)) {
+            return FolderContents(path, bytes, files, function);
+        }
+        bytes += (static_cast<std::uint64_t>(found.nFileSizeHigh) << 32) | found.nFileSizeLow;
+        ++files;
+        return S_OK;
+    }, function);
+}
+
+HRESULT SubfolderContents(const std::wstring& root, std::uint64_t& bytes, std::uint64_t& files, const char* function) {
+    return ForEachEntry(root, [&](const std::wstring& path, const WIN32_FIND_DATAW& found) {
+        return IsFolder(found) ? FolderContents(path, bytes, files, function) : S_OK;
+    }, function);
+}
+
+HRESULT HasContainers(const std::wstring& root, bool& any) {
+    any = false;
+    return ForEachContainer(root, [&](const std::wstring&) {
+        any = true;
+        return S_OK;
+    });
+}
+
 HRESULT Used(const std::wstring& root, std::int64_t& used, const char* function) {
     std::uint64_t total = 0;
-    const HRESULT result = ForEachContainer(root, [&](const std::wstring& path) { return StoredBlobBytes(path, total, function); });
+    HRESULT result = ForEachContainer(root, [&](const std::wstring& path) { return StoredBlobBytes(path, total, function); });
+    std::uint64_t files = 0;
+    if (SUCCEEDED(result)) {
+        result = SubfolderContents(root, total, files, function);
+    }
     used = static_cast<std::int64_t>(total);
     return result;
 }
@@ -405,21 +476,76 @@ HRESULT InitializeProvider(const char* configurationId, std::unique_ptr<XGameSav
     if (configurationId == nullptr) {
         return E_INVALIDARG;
     }
+    if (!Available(SaveSystem::GameSave)) {
+        return ProviderMismatch;
+    }
     std::wstring root;
     const HRESULT opened = OpenRoot(root, function);
     if (FAILED(opened)) {
         return opened;
     }
+    std::uint64_t bytes = 0;
+    std::uint64_t files = 0;
+    {
+        std::lock_guard lock(StorageMutex());
+        const HRESULT listed = SubfolderContents(root, bytes, files, function);
+        if (FAILED(listed)) {
+            return listed;
+        }
+    }
+    if (files != 0) {
+        AbxUnsupported(function, "the save folder holds XGameSaveFiles files, and presenting them as XGameSave containers is not implemented");
+    }
     provider.reset(new (std::nothrow) XGameSaveProvider{std::move(root)});
-    return provider == nullptr ? E_OUTOFMEMORY : S_OK;
+    if (provider == nullptr) {
+        return E_OUTOFMEMORY;
+    }
+    if (!Claim(SaveSystem::GameSave)) {
+        provider.reset();
+        return ProviderMismatch;
+    }
+    return S_OK;
 }
 
-HRESULT RemainingQuota(XGameSaveProviderHandle provider, std::int64_t& remaining, const char* function) {
+HRESULT RemainingQuota(const std::wstring& root, std::int64_t& remaining, const char* function) {
     std::lock_guard lock(StorageMutex());
     std::int64_t used = 0;
-    const HRESULT result = Used(provider->root, used, function);
+    const HRESULT result = Used(root, used, function);
     remaining = used >= Quota ? 0 : Quota - used;
     return result;
+}
+
+HRESULT SaveFilesFolder(std::string& folder, const char* function) {
+    if (!Available(SaveSystem::GameSaveFiles)) {
+        return ProviderMismatch;
+    }
+    std::wstring root;
+    const HRESULT opened = OpenRoot(root, function);
+    if (FAILED(opened)) {
+        return opened;
+    }
+    bool containers = false;
+    {
+        std::lock_guard lock(StorageMutex());
+        const HRESULT listed = HasContainers(root, containers);
+        if (FAILED(listed)) {
+            return listed;
+        }
+    }
+    if (containers) {
+        AbxUnsupported(function, "the save folder holds XGameSave containers, and presenting them as XGameSaveFiles folders and files is not implemented");
+    }
+    const std::wstring path = root.substr(std::wcslen(L"\\\\?\\")) + L"\\";
+    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size == 0) {
+        return FromWin32(GetLastError());
+    }
+    folder.resize(static_cast<std::size_t>(size));
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path.c_str(), -1, folder.data(), size, nullptr, nullptr) != size) {
+        return FromWin32(GetLastError());
+    }
+    folder.pop_back();
+    return Claim(SaveSystem::GameSaveFiles) ? S_OK : ProviderMismatch;
 }
 
 HRESULT DeleteContainer(const std::wstring& root, const std::string& name, const char* function) {
@@ -700,7 +826,7 @@ ABX_API HRESULT XGameSaveGetRemainingQuota(XGameSaveProviderHandle provider, std
     if (provider == nullptr || remainingQuota == nullptr) {
         return E_INVALIDARG;
     }
-    return RemainingQuota(provider, *remainingQuota, __func__);
+    return RemainingQuota(provider->root, *remainingQuota, __func__);
 }
 
 ABX_API HRESULT XGameSaveGetRemainingQuotaAsync(XGameSaveProviderHandle provider, XAsyncBlock* async) {
@@ -709,7 +835,7 @@ ABX_API HRESULT XGameSaveGetRemainingQuotaAsync(XGameSaveProviderHandle provider
     }
     return Start(async, reinterpret_cast<const void*>(&XGameSaveGetRemainingQuotaAsync), __func__, [provider](Operation& operation) {
         auto remaining = std::make_shared<std::int64_t>(0);
-        const HRESULT result = RemainingQuota(provider, *remaining, "XGameSaveGetRemainingQuotaAsync");
+        const HRESULT result = RemainingQuota(provider->root, *remaining, "XGameSaveGetRemainingQuotaAsync");
         operation.size = sizeof(std::int64_t);
         operation.deliver = [remaining](void* buffer) { std::memcpy(buffer, remaining.get(), sizeof(std::int64_t)); };
         return result;
@@ -922,4 +1048,37 @@ ABX_API HRESULT XGameSaveSubmitUpdateAsync(XGameSaveUpdateHandle updateContext, 
 
 ABX_API HRESULT XGameSaveSubmitUpdateResult(XAsyncBlock* async) {
     return XAsyncGetResult(async, reinterpret_cast<const void*>(&XGameSaveSubmitUpdateAsync), 0, nullptr, nullptr);
+}
+
+ABX_API HRESULT XGameSaveFilesGetFolderWithUiAsync(XUserHandle, const char* configurationId, XAsyncBlock* async) {
+    if (configurationId == nullptr) {
+        return E_INVALIDARG;
+    }
+    return Start(async, reinterpret_cast<const void*>(&XGameSaveFilesGetFolderWithUiAsync), __func__, [](Operation& operation) {
+        auto folder = std::make_shared<std::string>();
+        const HRESULT result = SaveFilesFolder(*folder, "XGameSaveFilesGetFolderWithUiAsync");
+        operation.size = folder->size() + 1;
+        operation.deliver = [folder](void* buffer) { std::memcpy(buffer, folder->c_str(), folder->size() + 1); };
+        return result;
+    });
+}
+
+ABX_API HRESULT XGameSaveFilesGetFolderWithUiResult(XAsyncBlock* async, std::size_t folderSize, char* folderResult) {
+    if (folderResult == nullptr) {
+        return E_INVALIDARG;
+    }
+    const HRESULT result = XAsyncGetResult(async, reinterpret_cast<const void*>(&XGameSaveFilesGetFolderWithUiAsync), folderSize, folderResult, nullptr);
+    return result == NotSufficientBuffer ? ProvidedBufferTooSmall : result;
+}
+
+ABX_API HRESULT XGameSaveFilesGetRemainingQuota(XUserHandle, const char* configurationId, std::int64_t* remainingQuota) {
+    if (configurationId == nullptr || remainingQuota == nullptr) {
+        return E_INVALIDARG;
+    }
+    std::wstring root;
+    const HRESULT opened = OpenRoot(root, __func__);
+    if (FAILED(opened)) {
+        return opened;
+    }
+    return RemainingQuota(root, *remainingQuota, __func__);
 }

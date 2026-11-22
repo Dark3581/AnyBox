@@ -63,6 +63,10 @@ ABX_API HRESULT XGameSaveSubmitUpdate(XGameSaveUpdateHandle updateContext);
 ABX_API HRESULT XGameSaveSubmitUpdateAsync(XGameSaveUpdateHandle updateContext, XAsyncBlock* async);
 ABX_API HRESULT XGameSaveSubmitUpdateResult(XAsyncBlock* async);
 
+ABX_API HRESULT XGameSaveFilesGetFolderWithUiAsync(XUserHandle requestingUser, const char* configurationId, XAsyncBlock* async);
+ABX_API HRESULT XGameSaveFilesGetFolderWithUiResult(XAsyncBlock* async, std::size_t folderSize, char* folderResult);
+ABX_API HRESULT XGameSaveFilesGetRemainingQuota(XUserHandle userContext, const char* configurationId, std::int64_t* remainingQuota);
+
 ABX_API XSystemDeviceType XSystemGetDeviceType();
 ABX_API HRESULT XSystemGetConsoleId(std::size_t consoleIdSize, char* consoleId, std::size_t* consoleIdUsed);
 ABX_API HRESULT XSystemGetXboxLiveSandboxId(std::size_t sandboxIdSize, char* sandboxId, std::size_t* sandboxIdUsed);
@@ -131,9 +135,6 @@ ABX_API HRESULT XGameInviteRegisterForEvent();
 ABX_API HRESULT XGameInviteUnregisterForEvent();
 ABX_API HRESULT XGameProtocolRegisterForActivation();
 ABX_API HRESULT XGameProtocolUnregisterForActivation();
-ABX_API HRESULT XGameSaveFilesGetFolderWithUiAsync();
-ABX_API HRESULT XGameSaveFilesGetFolderWithUiResult();
-ABX_API HRESULT XGameSaveFilesGetRemainingQuota();
 ABX_API HRESULT XGameStreamingGetClientCount();
 ABX_API HRESULT XGameStreamingGetClientIPAddress();
 ABX_API HRESULT XGameStreamingGetClients();

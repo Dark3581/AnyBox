@@ -58,9 +58,6 @@ ABX_API HRESULT XGameInviteRegisterForEvent() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XGameInviteUnregisterForEvent() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XGameProtocolRegisterForActivation() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XGameProtocolUnregisterForActivation() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XGameSaveFilesGetFolderWithUiAsync() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XGameSaveFilesGetFolderWithUiResult() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XGameSaveFilesGetRemainingQuota() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XGameStreamingGetClientCount() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XGameStreamingGetClientIPAddress() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XGameStreamingGetClients() { AbxNotImplemented(__func__); }

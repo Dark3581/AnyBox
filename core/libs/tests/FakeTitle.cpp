@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -110,6 +111,9 @@ __declspec(dllimport) HRESULT XGameSaveSubmitBlobDelete(void* update, const char
 __declspec(dllimport) HRESULT XGameSaveSubmitUpdate(void* update);
 __declspec(dllimport) HRESULT XGameSaveSubmitUpdateAsync(void* update, AsyncBlock* async);
 __declspec(dllimport) HRESULT XGameSaveSubmitUpdateResult(AsyncBlock* async);
+__declspec(dllimport) HRESULT XGameSaveFilesGetFolderWithUiAsync(void* user, const char* configurationId, AsyncBlock* async);
+__declspec(dllimport) HRESULT XGameSaveFilesGetFolderWithUiResult(AsyncBlock* async, std::size_t folderSize, char* folder);
+__declspec(dllimport) HRESULT XGameSaveFilesGetRemainingQuota(void* user, const char* configurationId, std::int64_t* remaining);
 __declspec(dllimport) HRESULT XSystemGetConsoleId(std::size_t consoleIdSize, char* consoleId, std::size_t* consoleIdUsed);
 __declspec(dllimport) HRESULT XSystemGetXboxLiveSandboxId(std::size_t sandboxIdSize, char* sandboxId, std::size_t* sandboxIdUsed);
 }
@@ -1407,6 +1411,140 @@ int WaiterScenario() {
     return 0;
 }
 
+constexpr HRESULT ProviderMismatch = static_cast<HRESULT>(0x8083000Fu);
+
+HRESULT SaveFilesFolder(void* user, char* folder, std::size_t size) {
+    AsyncBlock block{};
+    const HRESULT begun = XGameSaveFilesGetFolderWithUiAsync(user, Scid, &block);
+    if (FAILED(begun)) return begun;
+    XAsyncGetStatus(&block, true);
+    return XGameSaveFilesGetFolderWithUiResult(&block, size, folder);
+}
+
+bool WriteBytes(const std::string& path, DWORD size) {
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const std::vector<char> bytes(size, 'x');
+    DWORD done = 0;
+    const bool written = WriteFile(file, bytes.data(), size, &done, nullptr) && done == size;
+    CloseHandle(file);
+    return written;
+}
+
+HRESULT UnderAFile(bool files);
+
+int GameSaveFiles() {
+    void* user = reinterpret_cast<void*>(1);
+    const HRESULT failed = UnderAFile(false);
+    if (SUCCEEDED(failed) || failed == ProviderMismatch) return Fail("provider under a file");
+    std::int64_t quota = 0;
+    if (XGameSaveFilesGetRemainingQuota(user, nullptr, &quota) != E_INVALIDARG || XGameSaveFilesGetRemainingQuota(user, Scid, nullptr) != E_INVALIDARG) return Fail("files quota with a null argument");
+    if (XGameSaveFilesGetRemainingQuota(user, Scid, &quota) != S_OK || quota != SaveQuota) return Fail("initial files quota");
+    AsyncBlock block{};
+    if (XGameSaveFilesGetFolderWithUiAsync(user, nullptr, &block) != E_INVALIDARG || XGameSaveFilesGetFolderWithUiAsync(user, Scid, nullptr) != E_INVALIDARG) return Fail("folder with a null argument");
+
+    wchar_t local[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return Fail("LOCALAPPDATA");
+    char utf8[MAX_PATH * 3] = {};
+    if (WideCharToMultiByte(CP_UTF8, 0, local, -1, utf8, sizeof(utf8), nullptr, nullptr) == 0) return Fail("LOCALAPPDATA as UTF-8");
+    char expected[MAX_PATH * 3 + 64] = {};
+    std::snprintf(expected, sizeof(expected), "%s\\AnyBox\\1234ABCD\\XGameSave\\", utf8);
+
+    if (XGameSaveFilesGetFolderWithUiAsync(user, Scid, &block) != S_OK || XAsyncGetStatus(&block, true) != S_OK) return Fail("folder async");
+    std::size_t size = 0;
+    if (XAsyncGetResultSize(&block, &size) != S_OK || size != std::strlen(expected) + 1) return Fail("folder size");
+    char folder[MAX_PATH * 3 + 64] = {};
+    if (XGameSaveFilesGetFolderWithUiResult(&block, size, nullptr) != E_INVALIDARG) return Fail("folder into a null buffer");
+    if (XGameSaveFilesGetFolderWithUiResult(&block, size - 1, folder) != BufferTooSmall) return Fail("folder into a small buffer");
+    if (SaveFilesFolder(user, folder, sizeof(folder)) != S_OK || std::strcmp(folder, expected) != 0) return Fail("folder path");
+
+    const std::string root = folder;
+    if (!CreateDirectoryA((root + "slot1").c_str(), nullptr) || !CreateDirectoryA((root + "slot1/deep").c_str(), nullptr)) return Fail("create save folders");
+    if (!WriteBytes(root + "slot1/state.dat", 100) || !WriteBytes(root + "slot1/deep/more.dat", 20) || !WriteBytes(root + "loose.dat", 7)) return Fail("write save files");
+    if (XGameSaveFilesGetRemainingQuota(user, Scid, &quota) != S_OK || quota != SaveQuota - 120) return Fail("files quota after writes");
+
+    void* provider = nullptr;
+    if (XGameSaveInitializeProvider(user, Scid, false, &provider) != ProviderMismatch || provider != nullptr) return Fail("XGameSave after XGameSaveFiles");
+    block = AsyncBlock{};
+    if (XGameSaveInitializeProviderAsync(user, Scid, false, &block) != S_OK || XAsyncGetStatus(&block, true) != ProviderMismatch) return Fail("XGameSave async after XGameSaveFiles");
+    if (XGameSaveInitializeProviderResult(&block, &provider) != ProviderMismatch || provider != nullptr) return Fail("XGameSave async result after XGameSaveFiles");
+    char again[MAX_PATH * 3 + 64] = {};
+    if (SaveFilesFolder(nullptr, again, sizeof(again)) != S_OK || std::strcmp(again, expected) != 0) return Fail("folder on resume");
+
+    if (!CreateDirectoryA((root + "slot2").c_str(), nullptr)) return Fail("create sparse folder");
+    HANDLE huge = CreateFileA((root + "slot2/huge.dat").c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (huge == INVALID_HANDLE_VALUE) return Fail("create sparse file");
+    DWORD returned = 0;
+    LARGE_INTEGER end{};
+    end.QuadPart = SaveQuota;
+    const bool sparse = DeviceIoControl(huge, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr) && SetFilePointerEx(huge, end, nullptr, FILE_BEGIN) && SetEndOfFile(huge);
+    CloseHandle(huge);
+    if (!sparse) return Fail("sparse file");
+    if (XGameSaveFilesGetRemainingQuota(user, Scid, &quota) != S_OK || quota != 0) return Fail("files quota over the limit");
+    std::printf("gamesavefiles ok\n");
+    return 0;
+}
+
+int GameSaveFilesMismatch() {
+    void* user = reinterpret_cast<void*>(1);
+    void* provider = nullptr;
+    void* container = nullptr;
+    if (XGameSaveInitializeProvider(user, Scid, false, &provider) != S_OK) return Fail("initialize provider");
+    if (XGameSaveCreateContainer(provider, "keep", &container) != S_OK || Write(container, "Kept", "data", "kept") != S_OK) return Fail("write kept container");
+    XGameSaveCloseContainer(container);
+    XGameSaveCloseProvider(provider);
+    char folder[MAX_PATH * 3 + 64] = {};
+    if (SaveFilesFolder(user, folder, sizeof(folder)) != ProviderMismatch) return Fail("XGameSaveFiles after XGameSave");
+    std::int64_t quota = 0;
+    if (XGameSaveFilesGetRemainingQuota(user, Scid, &quota) != S_OK || quota != SaveQuota - 4) return Fail("files quota counts XGameSave blobs");
+    std::printf("gamesavefiles mismatch ok\n");
+    return 0;
+}
+
+int GameSaveFilesStop() {
+    char folder[MAX_PATH * 3 + 64] = {};
+    SaveFilesFolder(reinterpret_cast<void*>(1), folder, sizeof(folder));
+    return Fail("folder over XGameSave containers returned");
+}
+
+int GameSaveFolderStop(bool async) {
+    void* provider = nullptr;
+    AsyncBlock block{};
+    if (async) {
+        if (XGameSaveInitializeProviderAsync(reinterpret_cast<void*>(1), Scid, false, &block) == S_OK) XAsyncGetStatus(&block, true);
+    } else {
+        XGameSaveInitializeProvider(reinterpret_cast<void*>(1), Scid, false, &provider);
+    }
+    return Fail("provider over XGameSaveFiles files returned");
+}
+
+HRESULT UnderAFile(bool files) {
+    wchar_t local[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return S_FALSE;
+    const std::wstring blocker = std::wstring(local) + L"\\blocker";
+    HANDLE file = CreateFileW(blocker.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return S_FALSE;
+    CloseHandle(file);
+    if (!SetEnvironmentVariableW(L"LOCALAPPDATA", blocker.c_str())) return S_FALSE;
+    char folder[MAX_PATH * 3 + 64] = {};
+    void* provider = nullptr;
+    const HRESULT result = files ? SaveFilesFolder(reinterpret_cast<void*>(1), folder, sizeof(folder)) : XGameSaveInitializeProvider(reinterpret_cast<void*>(1), Scid, false, &provider);
+    if (!SetEnvironmentVariableW(L"LOCALAPPDATA", local)) return S_FALSE;
+    return result;
+}
+
+int GameSaveEmptyFolder() {
+    const HRESULT failed = UnderAFile(true);
+    if (SUCCEEDED(failed) || failed == ProviderMismatch) return Fail("folder under a file");
+    void* provider = nullptr;
+    if (XGameSaveInitializeProvider(reinterpret_cast<void*>(1), Scid, false, &provider) != S_OK || provider == nullptr) return Fail("provider over an empty folder");
+    XGameSaveCloseProvider(provider);
+    std::printf("gamesave empty folder ok\n");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1459,6 +1597,24 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(scenario, "taskqueue_waiter") == 0) {
         return Guarded("waiter", WaiterScenario);
+    }
+    if (std::strcmp(scenario, "gamesavefiles") == 0) {
+        return GameSaveFiles();
+    }
+    if (std::strcmp(scenario, "gamesavefiles_mismatch") == 0) {
+        return GameSaveFilesMismatch();
+    }
+    if (std::strcmp(scenario, "gamesavefiles_containers") == 0) {
+        return GameSaveFilesStop();
+    }
+    if (std::strcmp(scenario, "gamesave_folders") == 0) {
+        return GameSaveFolderStop(false);
+    }
+    if (std::strcmp(scenario, "gamesave_folders_async") == 0) {
+        return GameSaveFolderStop(true);
+    }
+    if (std::strcmp(scenario, "gamesave_empty_folder") == 0) {
+        return GameSaveEmptyFolder();
     }
     if (std::strcmp(scenario, "async_null") == 0) {
         XAsyncGetStatus(nullptr, false);

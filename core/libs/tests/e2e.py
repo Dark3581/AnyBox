@@ -52,6 +52,12 @@ EXPECTED = {
     "sandbox_id": (0, "none"),
     "async": (0, "none"),
     "gamesave": (0, "none"),
+    "gamesavefiles": (0, "none"),
+    "gamesavefiles_mismatch": (0, "none"),
+    "gamesavefiles_containers": (0xAB02, "unsupported"),
+    "gamesave_folders": (0xAB02, "unsupported"),
+    "gamesave_folders_async": (0xAB02, "unsupported"),
+    "gamesave_empty_folder": (0, "none"),
     "async_null": (0xAB02, "unsupported"),
     "async_terminated": (0xAB02, "unsupported"),
     "async_begin_terminated": (0xAB02, "unsupported"),
@@ -72,6 +78,22 @@ STOPPED_IN = {
     "async_begin_terminated": "XAsyncBegin",
     "startup_options": "XGameRuntimeInitializeWithOptions",
     "thread_assert": "XThreadAssertNotTimeSensitive",
+    "gamesavefiles_containers": "XGameSaveFilesGetFolderWithUiAsync",
+    "gamesave_folders": "XGameSaveInitializeProvider",
+    "gamesave_folders_async": "XGameSaveInitializeProviderAsync",
+}
+
+STOP_MESSAGES = {
+    "gamesavefiles_containers": "holds XGameSave containers",
+    "gamesave_folders": "holds XGameSaveFiles files",
+    "gamesave_folders_async": "holds XGameSaveFiles files",
+}
+
+SEEDS = {
+    "gamesavefiles_containers": "keep.xgs",
+    "gamesave_folders": "slot1/state.dat",
+    "gamesave_folders_async": "slot1/deep/state.dat",
+    "gamesave_empty_folder": "slot1/deep/",
 }
 
 
@@ -125,6 +147,14 @@ def main():
     argument = "device" if args.scenario in DEVICES else args.scenario
     local = args.work / "localappdata"
     local.mkdir()
+    saves = local / "AnyBox" / "1234ABCD" / "XGameSave"
+    if args.scenario in SEEDS:
+        seed = saves / SEEDS[args.scenario]
+        if SEEDS[args.scenario].endswith("/"):
+            seed.mkdir(parents=True)
+        else:
+            seed.parent.mkdir(parents=True)
+            seed.write_bytes(b"seed")
     env = dict(os.environ, LOCALAPPDATA=str(local))
     run = subprocess.run([str(converted), argument], cwd=out, env=env, capture_output=True, text=True, timeout=60)
     print(run.stdout)
@@ -153,7 +183,16 @@ def main():
         assert "recovered ok" in run.stdout, run.stdout
     if args.scenario == "gamesave":
         assert "gamesave ok" in run.stdout
-        saves = local / "AnyBox" / "1234ABCD" / "XGameSave"
+        assert sorted(path.name for path in saves.iterdir()) == ["keep.xgs"], list(saves.iterdir())
+    if args.scenario == "gamesavefiles":
+        assert "gamesavefiles ok" in run.stdout
+        assert sorted(path.name for path in saves.iterdir()) == ["loose.dat", "slot1", "slot2"], list(saves.iterdir())
+        assert (saves / "slot1" / "state.dat").stat().st_size == 100
+        assert (saves / "slot1" / "deep" / "more.dat").stat().st_size == 20
+    if args.scenario == "gamesave_empty_folder":
+        assert "gamesave empty folder ok" in run.stdout
+    if args.scenario == "gamesavefiles_mismatch":
+        assert "gamesavefiles mismatch ok" in run.stdout
         assert sorted(path.name for path in saves.iterdir()) == ["keep.xgs"], list(saves.iterdir())
     if device is not None:
         assert f"device type {device} packaged 0" in run.stdout, run.stdout
@@ -170,6 +209,8 @@ def main():
     assert "xgameruntime" in report["libraries"], report["libraries"]
     if kind in ("not-implemented", "unsupported"):
         assert report["stop"]["library"] == "xgameruntime" and report["stop"]["function"] == STOPPED_IN[args.scenario], report["stop"]
+    if args.scenario in STOP_MESSAGES:
+        assert STOP_MESSAGES[args.scenario] in report["stop"]["message"], report["stop"]
     if kind == "crash":
         assert report["stop"]["exception"]["code"] == "0xc0000005", report["stop"]
         assert report["stop"]["exception"]["module"] == "title.exe", report["stop"]
