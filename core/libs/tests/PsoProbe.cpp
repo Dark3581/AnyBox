@@ -1,4 +1,5 @@
 #include "BindlessSet.hpp"
+#include "BufferDescriptor.hpp"
 #include "CommandRecorder.hpp"
 #include "CopyLayout.hpp"
 #include "GraphicsPipeline.hpp"
@@ -2290,6 +2291,131 @@ int PlanesGpu(bool validate) {
     return status;
 }
 
+int BuffersSelfTest() {
+    std::string error;
+    BufferDescriptorFields fields;
+    fields.base = 0x123456789ABCull;
+    fields.stride = 48;
+    fields.records = 1000;
+    fields.format = 77;
+    fields.bounds = BufferBounds::Raw;
+    const std::optional<BufferDescriptorWords> words = EncodeBufferDescriptor(fields, error);
+    if (!words || (*words)[0] != 0x56789ABCu || (*words)[1] != 0x00301234u || (*words)[2] != 1000u || (*words)[3] != 0x3104DFACu) return Fail("encoded words");
+    const BufferDescriptorFields decoded = DecodeBufferDescriptor(*words);
+    if (decoded.base != fields.base || decoded.stride != 48 || decoded.records != 1000 || decoded.format != 77 || decoded.bounds != BufferBounds::Raw || decoded.select != fields.select) return Fail("decode");
+    const BufferDescriptorWords translatorTest{0, 0, 0, 0x31016FACu};
+    const BufferDescriptorFields reference = DecodeBufferDescriptor(translatorTest);
+    BufferDescriptorFields same;
+    same.format = 22;
+    const std::optional<BufferDescriptorWords> sameWords = EncodeBufferDescriptor(same, error);
+    if (reference.bounds != BufferBounds::Raw || reference.format != 22 || !sameWords || (*sameWords)[3] != 0x31016FACu) return Fail("the translator's reference word 3");
+    fields.base = kDescriptorAddressLimit;
+    if (EncodeBufferDescriptor(fields, error) || error.find("48 bits") == std::string::npos) return Fail("address limit");
+    fields.base = 0;
+    fields.stride = kDescriptorStrideLimit + 1;
+    if (EncodeBufferDescriptor(fields, error)) return Fail("stride limit");
+    if (TypedBufferFormatOf(DXGI_FORMAT_R11G11B10_FLOAT)->code != 36 || TypedBufferFormatOf(DXGI_FORMAT_R10G10B10A2_UNORM)->code != 50 ||
+        TypedBufferFormatOf(DXGI_FORMAT_R32G32B32_FLOAT)->bytes != 12 || TypedBufferFormatOf(DXGI_FORMAT_BC1_UNORM) || TypedBufferFormatOf(DXGI_FORMAT_R32_TYPELESS)) return Fail("typed formats");
+
+    const auto view = [](const BufferDescriptorWords& w) { return DecodeBufferDescriptor(w); };
+    const std::optional<BufferDescriptorWords> cbv = ConstantBufferDescriptor({0x10000, 256}, error);
+    if (!cbv || view(*cbv).base != 0x10000 || view(*cbv).records != 256 || view(*cbv).bounds != BufferBounds::Raw || view(*cbv).stride != 0) return Fail("constant buffer: " + error);
+    if (ConstantBufferDescriptor({0x10000, 100}, error) || ConstantBufferDescriptor({0, 256}, error)) return Fail("constant buffer refusals");
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.Buffer = {16, 64, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    std::optional<BufferDescriptorWords> raw = ShaderResourceBufferDescriptor(0x20000, 1024, srv, error);
+    if (!raw || view(*raw).base != 0x20040 || view(*raw).records != 256 || view(*raw).bounds != BufferBounds::Raw || view(*raw).stride != 0) return Fail("raw view: " + error);
+    srv.Format = DXGI_FORMAT_UNKNOWN;
+    srv.Buffer = {2, 10, 32, D3D12_BUFFER_SRV_FLAG_NONE};
+    std::optional<BufferDescriptorWords> structured = ShaderResourceBufferDescriptor(0x20000, 1024, srv, error);
+    if (!structured || view(*structured).base != 0x20040 || view(*structured).records != 10 || view(*structured).stride != 32 ||
+        view(*structured).bounds != BufferBounds::StructuredWithOffset) return Fail("structured view: " + error);
+    srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+    srv.Buffer = {4, 8, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+    std::optional<BufferDescriptorWords> typed = ShaderResourceBufferDescriptor(0x20000, 1024, srv, error);
+    const std::array<std::uint32_t, 4> twoComponents{SelectX, SelectY, SelectZero, SelectOne};
+    if (!typed || view(*typed).base != 0x20010 || view(*typed).records != 8 || view(*typed).stride != 4 || view(*typed).format != 29 ||
+        view(*typed).bounds != BufferBounds::Structured || view(*typed).select != twoComponents || (*typed)[3] != 0x1101D22Cu) return Fail("typed view: " + error);
+    srv.Format = DXGI_FORMAT_R32_FLOAT;
+    srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(1, 0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+    typed = ShaderResourceBufferDescriptor(0x20000, 1024, srv, error);
+    const std::array<std::uint32_t, 4> mapped{SelectZero, SelectX, SelectOne, SelectZero};
+    if (!typed || view(*typed).select != mapped) return Fail("mapped typed view");
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Format = DXGI_FORMAT_R32_UINT;
+    uav.Buffer = {0, 256, 0, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    std::optional<BufferDescriptorWords> storage = UnorderedAccessBufferDescriptor(0x30000, 1024, uav, false, error);
+    if (!storage || view(*storage).records != 256 || view(*storage).format != 20 || view(*storage).bounds != BufferBounds::Structured) return Fail("typed uav: " + error);
+
+    struct Refusal {
+        std::optional<BufferDescriptorWords> (*make)(std::string&);
+        const char* expected;
+    };
+    const Refusal refusals[] = {
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 300, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "elements 0+300 run past the buffer's 256"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 4, 16, D3D12_BUFFER_SRV_FLAG_NONE};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "must have format UNKNOWN"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 4, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "needs R32_TYPELESS"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_UNKNOWN, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 4, 18, D3D12_BUFFER_SRV_FLAG_NONE};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "structure stride 18"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_BC1_UNORM, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 4, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "has no typed buffer encoding"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "dimension 4 is not a buffer"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 0, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "has no elements"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 4, 0, static_cast<D3D12_BUFFER_SRV_FLAGS>(2)};
+             return ShaderResourceBufferDescriptor(0x1000, 1024, d, e);
+         }, "flags 2 are unknown"},
+        {[](std::string& e) {
+             D3D12_UNORDERED_ACCESS_VIEW_DESC d{DXGI_FORMAT_R32_UINT, D3D12_UAV_DIMENSION_BUFFER, {}};
+             d.Buffer = {0, 4, 0, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+             return UnorderedAccessBufferDescriptor(0x1000, 1024, d, true, e);
+         }, "with a counter are not supported"},
+        {[](std::string& e) {
+             D3D12_SHADER_RESOURCE_VIEW_DESC d{DXGI_FORMAT_R32_FLOAT, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+             d.Buffer = {0, 4, 0, D3D12_BUFFER_SRV_FLAG_NONE};
+             return ShaderResourceBufferDescriptor(kDescriptorAddressLimit, 1024, d, e);
+         }, "does not fit the descriptor's 48 bits"},
+    };
+    for (const Refusal& refusal : refusals) {
+        error.clear();
+        if (refusal.make(error) || error.find(refusal.expected) == std::string::npos) return Fail(std::string("refusal '") + refusal.expected + "' gave '" + error + "'");
+    }
+    std::puts("PASS buffers selftest");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -2305,6 +2431,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "commands-selftest") == 0) return CommandsSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "draw-selftest") == 0) return DrawSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "indirect-selftest") == 0) return IndirectSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "buffers-selftest") == 0) return BuffersSelfTest();
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
@@ -2314,6 +2441,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest");
     return 2;
 }
