@@ -1565,6 +1565,13 @@ int CommandsGpu(bool validate) {
             check(recorder.CopyTextureToBuffer(readbackRef, colorPrints->layouts[0], color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read mip 0");
             check(recorder.CopyTextureToBuffer(readbackRef, mip1Back, color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 1, nullptr, error), "read mip 1");
             check(recorder.CopyTextureToBuffer(readbackRef, targetPrints->layouts[0], target->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read target");
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT offsetPrint{};
+            offsetPrint.Offset = 0xB0000;
+            offsetPrint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 32, 32, 1, 256};
+            const D3D12_BOX greenSquare{8, 8, 0, 24, 24, 1};
+            check(recorder.CopyTextureToFootprint(readbackRef, offsetPrint, 4, 2, 0, color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, &greenSquare, error), "read into a footprint at (4,2)");
+            check(!recorder.CopyTextureToFootprint(readbackRef, offsetPrint, 20, 0, 0, color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, &greenSquare, error), "past the footprint refused");
+            check(!recorder.CopyTextureToFootprint(readbackRef, offsetPrint, 0, 0, 0, color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "a whole 64x64 mip into a 32x32 footprint refused");
             check(recorder.Transition(depth->ref, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE, error), "depth to write");
             check(recorder.ClearDepthStencil(*depthView, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, {}, error), "clear depth");
             check(recorder.ClearDepthStencil(*depthView, D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0, {{0, 0, 8, 8}}, error), "clear depth rect");
@@ -1620,6 +1627,11 @@ int CommandsGpu(bool validate) {
             same = std::memcmp(down + mip1Back.Offset + row * mip1Back.Footprint.RowPitch, up + mip1.Offset + row * mip1.Footprint.RowPitch, 32 * 4) == 0;
         }
         expect(same, "mip 1 read back as uploaded");
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT offsetPrint{};
+        offsetPrint.Offset = 0xB0000;
+        offsetPrint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 32, 32, 1, 256};
+        expect(pixel(offsetPrint, 4, 2) == 0x00FF00FFu && pixel(offsetPrint, 19, 17) == 0x00FF00FFu, "the green square lands at (4,2) in the footprint");
+        expect(pixel(offsetPrint, 3, 2) == 0xCDCDCDCDu && pixel(offsetPrint, 20, 17) == 0xCDCDCDCDu && pixel(offsetPrint, 4, 18) == 0xCDCDCDCDu, "the footprint is untouched around the square");
         expect(pixel(targetPrints->layouts[0], 0, 0) == 0x0000FFFFu, "blue target at (0,0)");
         expect(pixel(targetPrints->layouts[0], 4, 4) == 0x00FF00FFu, "copied square at (4,4)");
         expect(pixel(targetPrints->layouts[0], 19, 19) == 0x00FF00FFu, "copied square at (19,19)");

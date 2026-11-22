@@ -464,22 +464,45 @@ bool CommandRecorder::CopyBufferToTexture(const TextureRef& destination, D3D12_R
 
 bool CommandRecorder::CopyTextureToBuffer(const BufferRef& destination, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, const TextureRef& source, D3D12_RESOURCE_STATES state,
                                           UINT subresource, const D3D12_BOX* box, std::string& error) {
+    return CopyTextureToFootprint(destination, footprint, 0, 0, 0, source, state, subresource, box, error);
+}
+
+bool CommandRecorder::CopyTextureToFootprint(const BufferRef& destination, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, UINT footprintX, UINT footprintY, UINT footprintZ,
+                                             const TextureRef& source, D3D12_RESOURCE_STATES state, UINT subresource, const D3D12_BOX* box, std::string& error) {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!LayoutFor(source, state, D3D12_RESOURCE_STATE_COPY_SOURCE, layout, error)) {
         return false;
     }
-    D3D12_BOX sourceBox{};
+    const std::optional<Subresource> sub = SplitSubresource(source.desc, subresource, source.layout.info.mipLevels);
+    if (!sub) {
+        error = "subresource " + std::to_string(subresource) + " is outside the texture";
+        return false;
+    }
     UINT x = 0;
     UINT y = 0;
     UINT z = 0;
+    UINT width = MipExtent(source.desc.Width, sub->mip);
+    UINT height = source.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1u : MipExtent(source.desc.Height, sub->mip);
+    UINT depth = source.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? MipExtent(source.desc.DepthOrArraySize, sub->mip) : 1u;
     if (box != nullptr) {
+        if (box->left >= box->right || box->top >= box->bottom || box->front >= box->back) {
+            error = "the source box is empty";
+            return false;
+        }
         x = box->left;
         y = box->top;
         z = box->front;
-        sourceBox = {0, 0, 0, box->right - box->left, box->bottom - box->top, box->back - box->front};
+        width = box->right - box->left;
+        height = box->bottom - box->top;
+        depth = box->back - box->front;
     }
+    if (footprintX > 0xFFFFFFFFu - width || footprintY > 0xFFFFFFFFu - height || footprintZ > 0xFFFFFFFFu - depth) {
+        error = "the footprint position overflows";
+        return false;
+    }
+    const D3D12_BOX footprintBox{footprintX, footprintY, footprintZ, footprintX + width, footprintY + height, footprintZ + depth};
     std::optional<VkBufferImageCopy> region = FootprintRegion(source.desc, source.layout.info.mipLevels, source.layout.format.aspects, subresource, footprint, x, y, z,
-                                                              box != nullptr ? &sourceBox : nullptr, error);
+                                                              &footprintBox, error);
     if (!region) {
         return false;
     }
