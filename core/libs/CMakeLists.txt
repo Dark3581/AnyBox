@@ -88,6 +88,11 @@ set_target_properties(gpu_report PROPERTIES OUTPUT_NAME anybox-gpu-report RUNTIM
 target_link_libraries(gpu_report PRIVATE d3d12_x_vulkan)
 anybox_static_runtime(gpu_report)
 
+add_executable(pipeline_probe probe/PipelineProbe.cpp)
+set_target_properties(pipeline_probe PROPERTIES OUTPUT_NAME anybox-pipeline-probe RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_link_libraries(pipeline_probe PRIVATE d3d12_x_vulkan)
+anybox_static_runtime(pipeline_probe)
+
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

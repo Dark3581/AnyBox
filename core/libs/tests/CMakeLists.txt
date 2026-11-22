@@ -63,12 +63,19 @@ if(Python3_FOUND)
             --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR} --tool ${CMAKE_SOURCE_DIR}/tools/shader_store.py --work ${CMAKE_CURRENT_BINARY_DIR}/shader_store)
 endif()
 
+if(Python3_FOUND)
+    add_test(NAME pipeline_probe
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_probe_test.py
+            --probe $<TARGET_FILE:pipeline_probe> --work ${CMAKE_CURRENT_BINARY_DIR}/pipeline_probe)
+    set_tests_properties(pipeline_probe PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP ")
+endif()
+
 if(ANYBOX_SHADERS_ENABLED)
-    foreach(check IN ITEMS store gpu pipelines)
+    foreach(check IN ITEMS store gpu layout compute pipelines)
         add_test(NAME shaders_${check}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/shader_build_test.py
                 --shaders ${ANYBOX_SHADER_DIR} --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR}
-                --build-dir ${CMAKE_BINARY_DIR} --check ${check})
+                --pipeline-probe $<TARGET_FILE:pipeline_probe> --build-dir ${CMAKE_BINARY_DIR} --check ${check})
         set_tests_properties(shaders_${check} PROPERTIES LABELS shaders TIMEOUT 1800 SKIP_REGULAR_EXPRESSION "SKIP ")
     endforeach()
 endif()

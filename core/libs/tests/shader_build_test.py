@@ -9,8 +9,11 @@ TOOLS = Path(__file__).resolve().parents[3] / "tools"
 sys.path.insert(0, str(TOOLS))
 
 import build_shaders
+import spirv_layout
 
 COMMAND_LINE = 30000
+COMPUTE_SAMPLE = 60
+COMPUTE_SAMPLE_BYTES = 1 << 20
 
 
 def batches(paths, fixed):
@@ -59,13 +62,71 @@ def check_gpu(args, layout):
     assert run.returncode == 0, ("no Vulkan device supports every stored module", run.stdout, run.stderr)
 
 
+def store_modules(layout):
+    details = json.loads((layout["store"] / "modules.json").read_text(encoding="utf-8"))["modules"]
+    return [(layout["store"] / module["file"], module) for module in details.values()]
+
+
+def check_layout(args, layout):
+    run = subprocess.run([str(args.pipeline_probe), "layout"], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run
+    title = json.loads(run.stdout)
+    misfits, push = [], 0
+    modules = store_modules(layout)
+    for path, module in modules:
+        try:
+            problems = spirv_layout.mismatches(spirv_layout.descriptor_bindings(path.read_bytes()), title)
+        except (OSError, spirv_layout.LayoutError) as error:
+            problems = [str(error)]
+        bytes_used = module["translation"].get("push_constant_bytes") or 0
+        push = max(push, bytes_used)
+        if bytes_used > title["pushConstantBytes"]:
+            problems.append(f"{bytes_used} push constant bytes, the layout has {title['pushConstantBytes']}")
+        misfits += [f"{module['name']}: {problem}" for problem in problems]
+    for misfit in misfits[:20]:
+        print(misfit)
+    assert not misfits, f"{len(misfits)} problems"
+    print(f"layout: {len(modules)} of {len(modules)} modules fit the title layout; largest push constant use {push} bytes")
+
+
+def check_compute(args, layout):
+    compute = sorted(((path.stat().st_size, path, module) for path, module in store_modules(layout) if module["stage"] == "cs" and path.stat().st_size <= COMPUTE_SAMPLE_BYTES),
+                     key=lambda item: (item[0], item[2]["name"]))
+    assert compute, "the store has no compute module"
+    step = max(1, len(compute) // COMPUTE_SAMPLE)
+    sample = compute[::step][:COMPUTE_SAMPLE]
+    jobs = layout["summary"].parent / "compute_sample.txt"
+    rows = [f"{m['name']}\t{m['translation'].get('subgroup_size') or 0}\t{path}\n" for _, path, m in sample]
+    jobs.write_text("".join(rows), encoding="utf-8", newline="\n")
+    features = sorted({feature for _, _, m in sample for feature in m["translation"].get("features", [])})
+    command = [str(args.pipeline_probe), "compile", "--jobs-file", str(jobs), "--workers", "4", "--cache", str(layout["summary"].parent / "compute_sample_cache.bin")]
+    if features:
+        command += ["--features", ",".join(features)]
+    if any(m["translation"].get("needs_maintenance8") for _, _, m in sample):
+        command.append("--maintenance8")
+    run = subprocess.run(command + ["--validate"], capture_output=True, text=True, timeout=1500)
+    if run.returncode == 4:
+        print("validation layer not installed: compiling without it")
+        run = subprocess.run(command, capture_output=True, text=True, timeout=1500)
+    if run.returncode == 3:
+        print(f"SKIP compute check: {run.stdout.strip()}")
+        return
+    lines = run.stdout.splitlines()
+    for line in lines:
+        if not line.startswith("OK\t"):
+            print(line)
+    assert run.returncode == 0, ("compute pipelines failed", run.stderr[-2000:])
+    print(f"compute: {sum(line.startswith('OK') for line in lines)} of {len(sample)} sampled compute modules (of {len(compute)} up to {COMPUTE_SAMPLE_BYTES >> 20} MiB) compiled")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shaders", type=Path, required=True)
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--libs", type=Path, required=True)
     parser.add_argument("--build-dir", type=Path, required=True)
-    parser.add_argument("--check", choices=("store", "gpu", "pipelines"), required=True)
+    parser.add_argument("--pipeline-probe", type=Path, required=True)
+    parser.add_argument("--check", choices=("store", "gpu", "layout", "compute", "pipelines"), required=True)
     args = parser.parse_args()
     layout = build_shaders.layout(args.shaders)
     summary_path = layout["summary"]
@@ -86,6 +147,10 @@ def main():
         check_lookups(args, layout, index, store)
     elif args.check == "gpu":
         check_gpu(args, layout)
+    elif args.check == "layout":
+        check_layout(args, layout)
+    elif args.check == "compute":
+        check_compute(args, layout)
     else:
         pipelines = summary.get("pipelines")
         if pipelines is None:

@@ -1,9 +1,5 @@
 #include "VulkanBackend.hpp"
-
-#include <windows.h>
-
-#define VK_NO_PROTOTYPES
-#include <vulkan/vulkan.h>
+#include "VulkanLoader.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -13,44 +9,6 @@ namespace abx::d3d12x {
 
 namespace {
 
-class Library {
-public:
-    Library() : module_(LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {}
-    ~Library() {
-        if (module_ != nullptr) {
-            FreeLibrary(module_);
-        }
-    }
-    Library(const Library&) = delete;
-    Library& operator=(const Library&) = delete;
-
-    PFN_vkGetInstanceProcAddr Loader() const {
-        return module_ == nullptr ? nullptr
-                                  : reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(GetProcAddress(module_, "vkGetInstanceProcAddr")));
-    }
-
-private:
-    HMODULE module_;
-};
-
-class Instance {
-public:
-    Instance(VkInstance instance, PFN_vkDestroyInstance destroy) : instance_(instance), destroy_(destroy) {}
-    ~Instance() {
-        if (instance_ != VK_NULL_HANDLE && destroy_ != nullptr) {
-            destroy_(instance_, nullptr);
-        }
-    }
-    Instance(const Instance&) = delete;
-    Instance& operator=(const Instance&) = delete;
-
-    VkInstance Get() const { return instance_; }
-
-private:
-    VkInstance instance_;
-    PFN_vkDestroyInstance destroy_;
-};
-
 struct InstanceFunctions {
     PFN_vkEnumeratePhysicalDevices enumerateDevices = nullptr;
     PFN_vkGetPhysicalDeviceProperties properties = nullptr;
@@ -58,6 +16,18 @@ struct InstanceFunctions {
     PFN_vkGetPhysicalDeviceFeatures2 features2 = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties extensions = nullptr;
 };
+
+InstanceFunctions LoadFunctions(PFN_vkGetInstanceProcAddr loader, VkInstance instance, bool version11) {
+    InstanceFunctions vk;
+    vk.enumerateDevices = LoadInstanceFunction<PFN_vkEnumeratePhysicalDevices>(loader, instance, "vkEnumeratePhysicalDevices");
+    vk.properties = LoadInstanceFunction<PFN_vkGetPhysicalDeviceProperties>(loader, instance, "vkGetPhysicalDeviceProperties");
+    vk.extensions = LoadInstanceFunction<PFN_vkEnumerateDeviceExtensionProperties>(loader, instance, "vkEnumerateDeviceExtensionProperties");
+    if (version11) {
+        vk.properties2 = LoadInstanceFunction<PFN_vkGetPhysicalDeviceProperties2>(loader, instance, "vkGetPhysicalDeviceProperties2");
+        vk.features2 = LoadInstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>(loader, instance, "vkGetPhysicalDeviceFeatures2");
+    }
+    return vk;
+}
 
 const char* TypeName(VkPhysicalDeviceType type) {
     switch (type) {
@@ -206,7 +176,7 @@ std::string Hex(std::uint32_t value) {
 
 VulkanReport QueryVulkan() {
     VulkanReport report;
-    const Library library;
+    const VulkanLibrary library;
     const PFN_vkGetInstanceProcAddr loader = library.Loader();
     if (loader == nullptr) {
         report.error = "vulkan-1.dll is not installed";
@@ -234,15 +204,8 @@ VulkanReport QueryVulkan() {
         report.error = "vkCreateInstance failed with " + std::to_string(static_cast<int>(created));
         return report;
     }
-    const Instance instance(raw, reinterpret_cast<PFN_vkDestroyInstance>(loader(raw, "vkDestroyInstance")));
-    InstanceFunctions vk;
-    vk.enumerateDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(loader(raw, "vkEnumeratePhysicalDevices"));
-    vk.properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(loader(raw, "vkGetPhysicalDeviceProperties"));
-    vk.extensions = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(loader(raw, "vkEnumerateDeviceExtensionProperties"));
-    if (application.apiVersion >= VK_API_VERSION_1_1) {
-        vk.properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(loader(raw, "vkGetPhysicalDeviceProperties2"));
-        vk.features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(loader(raw, "vkGetPhysicalDeviceFeatures2"));
-    }
+    const VulkanInstance instance(raw, LoadInstanceFunction<PFN_vkDestroyInstance>(loader, raw, "vkDestroyInstance"));
+    const InstanceFunctions vk = LoadFunctions(loader, raw, application.apiVersion >= VK_API_VERSION_1_1);
     if (vk.enumerateDevices == nullptr || vk.properties == nullptr || vk.extensions == nullptr) {
         report.error = "the Vulkan loader lacks core instance functions";
         return report;
@@ -267,6 +230,10 @@ VulkanReport QueryVulkan() {
     }
     report.available = true;
     return report;
+}
+
+GpuCapabilities DescribePhysicalDevice(PFN_vkGetInstanceProcAddr loader, VkInstance instance, VkPhysicalDevice device) {
+    return Describe(LoadFunctions(loader, instance, true), device);
 }
 
 std::string VersionText(std::uint32_t version) {

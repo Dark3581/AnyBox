@@ -114,6 +114,8 @@ Each step writes `build/shaders/build.json`: the translator's revision and wheth
 |---|---|
 | `shaders_store` | Every carved shader has a translation, the store has no missing, invalid or conflicting entries, and the C++ store (`d3d12_x`) finds every carved container with the stage the translation gives. |
 | `shaders_gpu` | At least one Vulkan device supports what every stored module needs (`tools/gpu_report.py`). Skipped without Vulkan. |
+| `shaders_layout` | Every stored module's descriptor bindings (read from its SPIR-V by `tools/spirv_layout.py`) and push constant size fit the title layout `d3d12_x` creates pipelines with (`anybox-pipeline-probe layout`). |
+| `shaders_compute` | An evenly spaced sample of 60 compute modules up to 1 MiB compiles through `d3d12_x`'s own device and pipeline code, under the Khronos validation layer when it is installed (any validation error fails the test). Skipped without a usable Vulkan device. |
 | `shaders_pipelines` | The last `shader_pipelines` run completed with no failed module or pipeline. Skipped until it has run. |
 
 `build.json` and the logs name shaders: like the store, they stay on your machine.

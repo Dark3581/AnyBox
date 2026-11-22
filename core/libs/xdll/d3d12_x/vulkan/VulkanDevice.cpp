@@ -1,0 +1,521 @@
+#include "VulkanDevice.hpp"
+#include "TitleLayout.hpp"
+
+#include <algorithm>
+#include <cstring>
+
+namespace abx::d3d12x {
+
+namespace {
+
+struct FeatureChain {
+    VkPhysicalDeviceFeatures2 core{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+    VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+
+    FeatureChain() = default;
+    FeatureChain(const FeatureChain&) = delete;
+    FeatureChain& operator=(const FeatureChain&) = delete;
+
+    void Link(const std::set<std::string>& extensions) {
+        void** next = &core.pNext;
+        const auto chain = [&next](auto& structure) {
+            *next = &structure;
+            next = &structure.pNext;
+        };
+        chain(v12);
+        chain(v13);
+        if (extensions.count(VK_EXT_MESH_SHADER_EXTENSION_NAME) != 0) chain(mesh);
+        if (extensions.count(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) != 0) chain(barycentric);
+        if (extensions.count(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) != 0) chain(interlock);
+        if (extensions.count(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) != 0) chain(maintenance8);
+        *next = nullptr;
+    }
+};
+
+using FeatureField = VkBool32& (*)(FeatureChain&);
+
+struct FeatureEntry {
+    const char* name;
+    const char* extension;
+    FeatureField field;
+};
+
+const FeatureEntry kFeatures[] = {
+    {"geometryShader", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.geometryShader; }},
+    {"shaderClipDistance", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderClipDistance; }},
+    {"shaderCullDistance", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderCullDistance; }},
+    {"shaderFloat64", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderFloat64; }},
+    {"shaderInt64", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderInt64; }},
+    {"shaderInt16", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderInt16; }},
+    {"shaderImageGatherExtended", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderImageGatherExtended; }},
+    {"shaderResourceMinLod", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderResourceMinLod; }},
+    {"shaderStorageImageReadWithoutFormat", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderStorageImageReadWithoutFormat; }},
+    {"shaderStorageImageWriteWithoutFormat", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.shaderStorageImageWriteWithoutFormat; }},
+    {"bufferDeviceAddress", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.bufferDeviceAddress; }},
+    {"runtimeDescriptorArray", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.runtimeDescriptorArray; }},
+    {"shaderFloat16", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.shaderFloat16; }},
+    {"scalarBlockLayout", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.scalarBlockLayout; }},
+    {"vulkanMemoryModel", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.vulkanMemoryModel; }},
+    {"meshShader", VK_EXT_MESH_SHADER_EXTENSION_NAME, [](FeatureChain& c) -> VkBool32& { return c.mesh.meshShader; }},
+    {"fragmentShaderBarycentric", VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, [](FeatureChain& c) -> VkBool32& { return c.barycentric.fragmentShaderBarycentric; }},
+    {"fragmentShaderPixelInterlock", VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, [](FeatureChain& c) -> VkBool32& { return c.interlock.fragmentShaderPixelInterlock; }},
+};
+
+const FeatureEntry kLayoutFeatures[] = {
+    {"descriptorBindingPartiallyBound", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingPartiallyBound; }},
+    {"descriptorBindingSampledImageUpdateAfterBind", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingSampledImageUpdateAfterBind; }},
+    {"descriptorBindingStorageImageUpdateAfterBind", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingStorageImageUpdateAfterBind; }},
+};
+
+const FeatureEntry kOptionalFeatures[] = {
+    {"subgroupSizeControl", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.subgroupSizeControl; }},
+    {"computeFullSubgroups", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.computeFullSubgroups; }},
+};
+
+const FeatureEntry* FindFeature(const std::string& name) {
+    for (const FeatureEntry& entry : kFeatures) {
+        if (name == entry.name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+struct LayoutDemand {
+    std::uint64_t sampledImages = 0;
+    std::uint64_t samplers = 0;
+    std::uint64_t storageImages = 0;
+    std::uint64_t storageBuffers = 0;
+};
+
+LayoutDemand Demand() {
+    LayoutDemand demand;
+    for (const BindingSpec& spec : TitleBindings()) {
+        switch (spec.kind) {
+        case DescriptorKind::SampledImage: demand.sampledImages += spec.count; break;
+        case DescriptorKind::Sampler: demand.samplers += spec.count; break;
+        case DescriptorKind::StorageImage: demand.storageImages += spec.count; break;
+        case DescriptorKind::StorageBuffer: demand.storageBuffers += spec.count; break;
+        }
+    }
+    return demand;
+}
+
+std::string LimitProblem(const VkPhysicalDeviceProperties& properties, const VkPhysicalDeviceVulkan12Properties& limits) {
+    const LayoutDemand demand = Demand();
+    const std::uint64_t total = demand.sampledImages + demand.samplers + demand.storageImages + demand.storageBuffers;
+    const struct {
+        const char* what;
+        std::uint64_t need;
+        std::uint64_t have;
+    } checks[] = {
+        {"push constant bytes", kTitlePushConstantBytes, properties.limits.maxPushConstantsSize},
+        {"update-after-bind sampled images per stage", demand.sampledImages, limits.maxPerStageDescriptorUpdateAfterBindSampledImages},
+        {"update-after-bind sampled images per set", demand.sampledImages, limits.maxDescriptorSetUpdateAfterBindSampledImages},
+        {"update-after-bind samplers per stage", demand.samplers, limits.maxPerStageDescriptorUpdateAfterBindSamplers},
+        {"update-after-bind samplers per set", demand.samplers, limits.maxDescriptorSetUpdateAfterBindSamplers},
+        {"update-after-bind storage images per stage", demand.storageImages, limits.maxPerStageDescriptorUpdateAfterBindStorageImages},
+        {"update-after-bind storage images per set", demand.storageImages, limits.maxDescriptorSetUpdateAfterBindStorageImages},
+        {"update-after-bind storage buffers per stage", demand.storageBuffers, limits.maxPerStageDescriptorUpdateAfterBindStorageBuffers},
+        {"update-after-bind resources per stage", total, limits.maxPerStageUpdateAfterBindResources},
+    };
+    for (const auto& check : checks) {
+        if (check.need > check.have) {
+            return std::string(check.what) + ": the title layout needs " + std::to_string(check.need) + ", the device allows " + std::to_string(check.have);
+        }
+    }
+    return {};
+}
+
+std::set<std::string> ExtensionNames(PFN_vkEnumerateDeviceExtensionProperties enumerate, VkPhysicalDevice device) {
+    std::uint32_t count = 0;
+    if (enumerate(device, nullptr, &count, nullptr) != VK_SUCCESS) {
+        return {};
+    }
+    std::vector<VkExtensionProperties> properties(count);
+    if (enumerate(device, nullptr, &count, properties.data()) != VK_SUCCESS) {
+        return {};
+    }
+    std::set<std::string> names;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        names.insert(properties[index].extensionName);
+    }
+    return names;
+}
+
+VkDescriptorType DescriptorType(DescriptorKind kind) {
+    switch (kind) {
+    case DescriptorKind::SampledImage: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    case DescriptorKind::Sampler: return VK_DESCRIPTOR_TYPE_SAMPLER;
+    case DescriptorKind::StorageBuffer: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    case DescriptorKind::StorageImage: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    return VK_DESCRIPTOR_TYPE_MAX_ENUM;
+}
+
+template <typename Function>
+Function DeviceFunction(PFN_vkGetDeviceProcAddr loader, VkDevice device, const char* name) {
+    return reinterpret_cast<Function>(loader(device, name));
+}
+
+}
+
+const std::vector<std::string>& KnownShaderFeatures() {
+    static const std::vector<std::string> names = [] {
+        std::vector<std::string> list;
+        for (const FeatureEntry& entry : kFeatures) {
+            list.emplace_back(entry.name);
+        }
+        return list;
+    }();
+    return names;
+}
+
+std::unique_ptr<VulkanDevice> VulkanDevice::Create(const DeviceRequirements& requirements, std::string& error) {
+    std::unique_ptr<VulkanDevice> device(new VulkanDevice());
+    if (!device->Open(requirements, error) || !device->CreateLayout(error)) {
+        return nullptr;
+    }
+    return device;
+}
+
+VulkanDevice::~VulkanDevice() {
+    if (pipelineLayout_ != VK_NULL_HANDLE) {
+        vk_.destroyPipelineLayout(device_, pipelineLayout_, nullptr);
+    }
+    if (setLayout_ != VK_NULL_HANDLE) {
+        vk_.destroyDescriptorSetLayout(device_, setLayout_, nullptr);
+    }
+    if (device_ != VK_NULL_HANDLE) {
+        vk_.destroyDevice(device_, nullptr);
+    }
+    if (messenger_ != VK_NULL_HANDLE && destroyMessenger_ != nullptr) {
+        destroyMessenger_(instance_.Get(), messenger_, nullptr);
+    }
+    instance_.Reset();
+}
+
+bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& error) {
+    for (const std::string& name : requirements.features) {
+        if (FindFeature(name) == nullptr) {
+            error = "unknown shader feature " + name;
+            return false;
+        }
+    }
+    const PFN_vkGetInstanceProcAddr loader = library_.Loader();
+    if (loader == nullptr) {
+        error = "vulkan-1.dll is not installed";
+        return false;
+    }
+    const auto enumerateVersion = LoadInstanceFunction<PFN_vkEnumerateInstanceVersion>(loader, VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+    std::uint32_t instanceVersion = VK_API_VERSION_1_0;
+    if (enumerateVersion == nullptr || enumerateVersion(&instanceVersion) != VK_SUCCESS || instanceVersion < VK_API_VERSION_1_3) {
+        error = "the Vulkan loader does not offer Vulkan 1.3";
+        return false;
+    }
+    const auto createInstance = LoadInstanceFunction<PFN_vkCreateInstance>(loader, VK_NULL_HANDLE, "vkCreateInstance");
+    VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    application.pApplicationName = "AnyBox";
+    application.pEngineName = "AnyBox";
+    application.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    instanceInfo.pApplicationInfo = &application;
+    const char* validationLayer = "VK_LAYER_KHRONOS_validation";
+    const char* debugExtension = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    VkDebugUtilsMessengerCreateInfoEXT messengerInfo{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    messengerInfo.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    messengerInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
+    messengerInfo.pfnUserCallback = &VulkanDevice::OnMessage;
+    messengerInfo.pUserData = this;
+    if (requirements.validation) {
+        const auto enumerateLayers = LoadInstanceFunction<PFN_vkEnumerateInstanceLayerProperties>(loader, VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties");
+        std::uint32_t layerCount = 0;
+        bool found = false;
+        if (enumerateLayers != nullptr && enumerateLayers(&layerCount, nullptr) == VK_SUCCESS) {
+            std::vector<VkLayerProperties> layers(layerCount);
+            if (enumerateLayers(&layerCount, layers.data()) >= VK_SUCCESS) {
+                for (std::uint32_t index = 0; index < layerCount; ++index) {
+                    found = found || std::strcmp(layers[index].layerName, validationLayer) == 0;
+                }
+            }
+        }
+        if (!found) {
+            error = "the Khronos validation layer is not installed";
+            return false;
+        }
+        instanceInfo.enabledLayerCount = 1;
+        instanceInfo.ppEnabledLayerNames = &validationLayer;
+        instanceInfo.enabledExtensionCount = 1;
+        instanceInfo.ppEnabledExtensionNames = &debugExtension;
+        instanceInfo.pNext = &messengerInfo;
+    }
+    VkInstance rawInstance = VK_NULL_HANDLE;
+    const VkResult instanceResult = createInstance == nullptr ? VK_ERROR_INITIALIZATION_FAILED : createInstance(&instanceInfo, nullptr, &rawInstance);
+    if (instanceResult != VK_SUCCESS) {
+        error = "vkCreateInstance failed with " + std::to_string(static_cast<int>(instanceResult));
+        return false;
+    }
+    instance_.Assign(rawInstance, LoadInstanceFunction<PFN_vkDestroyInstance>(loader, rawInstance, "vkDestroyInstance"));
+    if (requirements.validation) {
+        const auto createMessenger = LoadInstanceFunction<PFN_vkCreateDebugUtilsMessengerEXT>(loader, rawInstance, "vkCreateDebugUtilsMessengerEXT");
+        destroyMessenger_ = LoadInstanceFunction<PFN_vkDestroyDebugUtilsMessengerEXT>(loader, rawInstance, "vkDestroyDebugUtilsMessengerEXT");
+        if (createMessenger == nullptr || destroyMessenger_ == nullptr || createMessenger(rawInstance, &messengerInfo, nullptr, &messenger_) != VK_SUCCESS) {
+            messenger_ = VK_NULL_HANDLE;
+            error = "vkCreateDebugUtilsMessengerEXT failed";
+            return false;
+        }
+    }
+    const auto enumerateDevices = LoadInstanceFunction<PFN_vkEnumeratePhysicalDevices>(loader, rawInstance, "vkEnumeratePhysicalDevices");
+    const auto getProperties2 = LoadInstanceFunction<PFN_vkGetPhysicalDeviceProperties2>(loader, rawInstance, "vkGetPhysicalDeviceProperties2");
+    const auto getFeatures2 = LoadInstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>(loader, rawInstance, "vkGetPhysicalDeviceFeatures2");
+    const auto getQueueFamilies = LoadInstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(loader, rawInstance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    const auto enumerateExtensions = LoadInstanceFunction<PFN_vkEnumerateDeviceExtensionProperties>(loader, rawInstance, "vkEnumerateDeviceExtensionProperties");
+    const auto createDevice = LoadInstanceFunction<PFN_vkCreateDevice>(loader, rawInstance, "vkCreateDevice");
+    const auto getDeviceProcAddr = LoadInstanceFunction<PFN_vkGetDeviceProcAddr>(loader, rawInstance, "vkGetDeviceProcAddr");
+    if (enumerateDevices == nullptr || getProperties2 == nullptr || getFeatures2 == nullptr || getQueueFamilies == nullptr || enumerateExtensions == nullptr ||
+        createDevice == nullptr || getDeviceProcAddr == nullptr) {
+        error = "the Vulkan loader lacks core instance functions";
+        return false;
+    }
+    std::uint32_t count = 0;
+    if (enumerateDevices(rawInstance, &count, nullptr) != VK_SUCCESS || count == 0) {
+        error = "no Vulkan device";
+        return false;
+    }
+    std::vector<VkPhysicalDevice> candidates(count);
+    if (enumerateDevices(rawInstance, &count, candidates.data()) < VK_SUCCESS) {
+        error = "vkEnumeratePhysicalDevices failed";
+        return false;
+    }
+    candidates.resize(count);
+
+    int bestScore = -1;
+    std::set<std::string> bestExtensions;
+    std::string reasons;
+    for (const VkPhysicalDevice candidate : candidates) {
+        VkPhysicalDeviceVulkan12Properties limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &limits};
+        getProperties2(candidate, &properties);
+        const std::string name = properties.properties.deviceName;
+        const auto reject = [&reasons, &name](const std::string& why) { reasons += (reasons.empty() ? "" : "; ") + name + ": " + why; };
+        if (properties.properties.apiVersion < VK_API_VERSION_1_3) {
+            reject("no Vulkan 1.3");
+            continue;
+        }
+        const std::set<std::string> extensions = ExtensionNames(enumerateExtensions, candidate);
+        FeatureChain supported;
+        supported.Link(extensions);
+        getFeatures2(candidate, &supported.core);
+        std::string missing;
+        for (const std::string& feature : requirements.features) {
+            const FeatureEntry* entry = FindFeature(feature);
+            if ((entry->extension != nullptr && extensions.count(entry->extension) == 0) || !entry->field(supported)) {
+                missing += (missing.empty() ? "" : ", ") + feature;
+            }
+        }
+        for (const FeatureEntry& entry : kLayoutFeatures) {
+            if (!entry.field(supported)) {
+                missing += (missing.empty() ? "" : ", ") + std::string(entry.name);
+            }
+        }
+        if (requirements.maintenance8 && (extensions.count(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) == 0 || !supported.maintenance8.maintenance8)) {
+            missing += (missing.empty() ? "" : ", ") + std::string("maintenance8");
+        }
+        if (!missing.empty()) {
+            reject("lacks " + missing);
+            continue;
+        }
+        const std::string limitProblem = LimitProblem(properties.properties, limits);
+        if (!limitProblem.empty()) {
+            reject(limitProblem);
+            continue;
+        }
+        std::uint32_t familyCount = 0;
+        getQueueFamilies(candidate, &familyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> families(familyCount);
+        getQueueFamilies(candidate, &familyCount, families.data());
+        std::uint32_t family = familyCount;
+        for (std::uint32_t index = 0; index < familyCount; ++index) {
+            const VkQueueFlags flags = families[index].queueFlags;
+            if ((flags & VK_QUEUE_GRAPHICS_BIT) != 0 && (flags & VK_QUEUE_COMPUTE_BIT) != 0 && families[index].queueCount > 0) {
+                family = index;
+                break;
+            }
+        }
+        if (family == familyCount) {
+            reject("no queue family with graphics and compute");
+            continue;
+        }
+        const int score = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2
+                          : properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1
+                                                                                                         : 0;
+        if (score > bestScore) {
+            bestScore = score;
+            physical_ = candidate;
+            properties_ = properties.properties;
+            limits12_ = limits;
+            limits12_.pNext = nullptr;
+            queueFamily_ = family;
+            bestExtensions = extensions;
+        }
+    }
+    if (physical_ == VK_NULL_HANDLE) {
+        error = "no Vulkan device can run the title's shaders: " + reasons;
+        return false;
+    }
+
+    gpu_ = DescribePhysicalDevice(loader, rawInstance, physical_);
+    FeatureChain supported;
+    supported.Link(bestExtensions);
+    getFeatures2(physical_, &supported.core);
+    FeatureChain enabled;
+    std::set<std::string> useExtensions;
+    for (const std::string& feature : requirements.features) {
+        const FeatureEntry* entry = FindFeature(feature);
+        entry->field(enabled) = VK_TRUE;
+        enabled_.push_back(feature);
+        if (entry->extension != nullptr) {
+            useExtensions.insert(entry->extension);
+        }
+    }
+    for (const FeatureEntry& entry : kLayoutFeatures) {
+        entry.field(enabled) = VK_TRUE;
+        enabled_.emplace_back(entry.name);
+    }
+    for (const FeatureEntry& entry : kOptionalFeatures) {
+        if (entry.field(supported)) {
+            entry.field(enabled) = VK_TRUE;
+            enabled_.emplace_back(entry.name);
+        }
+    }
+    subgroupSizeControl_ = supported.v13.subgroupSizeControl == VK_TRUE;
+    if (requirements.maintenance8) {
+        enabled.maintenance8.maintenance8 = VK_TRUE;
+        enabled_.emplace_back("maintenance8");
+        useExtensions.insert(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    }
+    enabled.Link(useExtensions);
+    std::sort(enabled_.begin(), enabled_.end());
+    extensions_.assign(useExtensions.begin(), useExtensions.end());
+    std::vector<const char*> extensionNames;
+    for (const std::string& extension : extensions_) {
+        extensionNames.push_back(extension.c_str());
+    }
+
+    const float priority = 1.0f;
+    VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    queue.queueFamilyIndex = queueFamily_;
+    queue.queueCount = 1;
+    queue.pQueuePriorities = &priority;
+    VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enabled.core};
+    deviceInfo.queueCreateInfoCount = 1;
+    deviceInfo.pQueueCreateInfos = &queue;
+    deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(extensionNames.size());
+    deviceInfo.ppEnabledExtensionNames = extensionNames.empty() ? nullptr : extensionNames.data();
+    const VkResult deviceResult = createDevice(physical_, &deviceInfo, nullptr, &device_);
+    if (deviceResult != VK_SUCCESS) {
+        device_ = VK_NULL_HANDLE;
+        error = "vkCreateDevice failed with " + std::to_string(static_cast<int>(deviceResult));
+        return false;
+    }
+    vk_.destroyDevice = DeviceFunction<PFN_vkDestroyDevice>(getDeviceProcAddr, device_, "vkDestroyDevice");
+    vk_.getDeviceQueue = DeviceFunction<PFN_vkGetDeviceQueue>(getDeviceProcAddr, device_, "vkGetDeviceQueue");
+    vk_.createShaderModule = DeviceFunction<PFN_vkCreateShaderModule>(getDeviceProcAddr, device_, "vkCreateShaderModule");
+    vk_.destroyShaderModule = DeviceFunction<PFN_vkDestroyShaderModule>(getDeviceProcAddr, device_, "vkDestroyShaderModule");
+    vk_.createComputePipelines = DeviceFunction<PFN_vkCreateComputePipelines>(getDeviceProcAddr, device_, "vkCreateComputePipelines");
+    vk_.destroyPipeline = DeviceFunction<PFN_vkDestroyPipeline>(getDeviceProcAddr, device_, "vkDestroyPipeline");
+    vk_.createPipelineCache = DeviceFunction<PFN_vkCreatePipelineCache>(getDeviceProcAddr, device_, "vkCreatePipelineCache");
+    vk_.destroyPipelineCache = DeviceFunction<PFN_vkDestroyPipelineCache>(getDeviceProcAddr, device_, "vkDestroyPipelineCache");
+    vk_.getPipelineCacheData = DeviceFunction<PFN_vkGetPipelineCacheData>(getDeviceProcAddr, device_, "vkGetPipelineCacheData");
+    vk_.createDescriptorSetLayout = DeviceFunction<PFN_vkCreateDescriptorSetLayout>(getDeviceProcAddr, device_, "vkCreateDescriptorSetLayout");
+    vk_.destroyDescriptorSetLayout = DeviceFunction<PFN_vkDestroyDescriptorSetLayout>(getDeviceProcAddr, device_, "vkDestroyDescriptorSetLayout");
+    vk_.createPipelineLayout = DeviceFunction<PFN_vkCreatePipelineLayout>(getDeviceProcAddr, device_, "vkCreatePipelineLayout");
+    vk_.destroyPipelineLayout = DeviceFunction<PFN_vkDestroyPipelineLayout>(getDeviceProcAddr, device_, "vkDestroyPipelineLayout");
+    if (vk_.destroyDevice == nullptr) {
+        error = "vkDestroyDevice is not available";
+        return false;
+    }
+    const void* const* functions = reinterpret_cast<const void* const*>(&vk_);
+    for (std::size_t index = 0; index < sizeof(vk_) / sizeof(void*); ++index) {
+        if (functions[index] == nullptr) {
+            error = "a device function is not available";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool VulkanDevice::CreateLayout(std::string& error) {
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    std::vector<VkDescriptorBindingFlags> flags;
+    for (const BindingSpec& spec : TitleBindings()) {
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = spec.binding;
+        binding.descriptorType = DescriptorType(spec.kind);
+        binding.descriptorCount = spec.count;
+        binding.stageFlags = VK_SHADER_STAGE_ALL;
+        bindings.push_back(binding);
+        flags.push_back(spec.kind == DescriptorKind::StorageBuffer ? 0
+                                                                   : VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
+    }
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    bindingFlags.bindingCount = static_cast<std::uint32_t>(flags.size());
+    bindingFlags.pBindingFlags = flags.data();
+    VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &bindingFlags};
+    setInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    setInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    setInfo.pBindings = bindings.data();
+    VkResult result = vk_.createDescriptorSetLayout(device_, &setInfo, nullptr, &setLayout_);
+    if (result != VK_SUCCESS) {
+        setLayout_ = VK_NULL_HANDLE;
+        error = "vkCreateDescriptorSetLayout failed with " + std::to_string(static_cast<int>(result));
+        return false;
+    }
+    const VkPushConstantRange range{VK_SHADER_STAGE_ALL, 0, kTitlePushConstantBytes};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &setLayout_;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &range;
+    result = vk_.createPipelineLayout(device_, &layoutInfo, nullptr, &pipelineLayout_);
+    if (result != VK_SUCCESS) {
+        pipelineLayout_ = VK_NULL_HANDLE;
+        error = "vkCreatePipelineLayout failed with " + std::to_string(static_cast<int>(result));
+        return false;
+    }
+    return true;
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL VulkanDevice::OnMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
+                                                      const VkDebugUtilsMessengerCallbackDataEXT* data, void* user) {
+    VulkanDevice* device = static_cast<VulkanDevice*>(user);
+    if (device != nullptr && (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+        std::lock_guard<std::mutex> guard(device->messagesLock_);
+        ++device->validationErrors_;
+        if (device->validationMessages_.size() < 20) {
+            device->validationMessages_.emplace_back(data != nullptr && data->pMessage != nullptr ? data->pMessage : "(no message)");
+        }
+    }
+    return VK_FALSE;
+}
+
+std::size_t VulkanDevice::ValidationErrors() const {
+    std::lock_guard<std::mutex> guard(messagesLock_);
+    return validationErrors_;
+}
+
+std::vector<std::string> VulkanDevice::ValidationMessages() const {
+    std::lock_guard<std::mutex> guard(messagesLock_);
+    return validationMessages_;
+}
+
+bool VulkanDevice::CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const {
+    return subgroupSizeControl_ && size >= gpu_.subgroup.minSize && size <= gpu_.subgroup.maxSize && (gpu_.subgroup.requiredSizeStages & stage) != 0;
+}
+
+}
