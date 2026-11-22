@@ -29,7 +29,7 @@ std::optional<std::vector<char>> ReadWholeFile(const std::filesystem::path& path
     std::vector<char> data(static_cast<std::size_t>(size));
     file.seekg(0);
     for (std::size_t done = 0; done < data.size();) {
-        const std::size_t piece = std::min(pieceBytes, data.size() - done);
+        const std::size_t piece = (std::min)(pieceBytes, data.size() - done);
         if (!file.read(data.data() + done, static_cast<std::streamsize>(piece)) || file.gcount() != static_cast<std::streamsize>(piece)) {
             return std::nullopt;
         }
@@ -44,7 +44,7 @@ bool WriteWholeFile(const std::filesystem::path& path, const std::vector<char>& 
         return false;
     }
     for (std::size_t done = 0; done < data.size();) {
-        const std::size_t piece = std::min(pieceBytes, data.size() - done);
+        const std::size_t piece = (std::min)(pieceBytes, data.size() - done);
         if (!out.write(data.data() + done, static_cast<std::streamsize>(piece))) {
             return false;
         }

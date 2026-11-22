@@ -50,7 +50,7 @@ std::uint32_t DescriptorHash(const DescriptorKey& key) {
 }
 
 DescriptorHashTable::DescriptorHashTable(std::uint32_t slots) {
-    const std::uint32_t count = RoundUpPowerOfTwo(std::max(slots, kDescriptorProbes));
+    const std::uint32_t count = RoundUpPowerOfTwo((std::max)(slots, kDescriptorProbes));
     mask_ = count - 1;
     words_.assign(1 + static_cast<std::size_t>(count) * kDescriptorEntryWords, 0);
     words_[0] = mask_;

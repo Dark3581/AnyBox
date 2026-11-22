@@ -430,7 +430,7 @@ int Compute(int argc, char** argv) {
     {
         PipelineLibrary library(*device, cache.Handle(), std::strtoull(FindOption(argc, argv, "--limit", "0").c_str(), nullptr, 10));
         std::atomic<std::size_t> next{0};
-        const unsigned threads = static_cast<unsigned>(std::max(1ul, std::strtoul(FindOption(argc, argv, "--threads", "1").c_str(), nullptr, 10)));
+        const unsigned threads = static_cast<unsigned>((std::max)(1ul, std::strtoul(FindOption(argc, argv, "--threads", "1").c_str(), nullptr, 10)));
         std::vector<std::thread> pool;
         for (unsigned worker = 0; worker < threads; ++worker) {
             pool.emplace_back([&] {
