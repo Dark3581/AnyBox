@@ -21,12 +21,12 @@ def shader_set(root, shaders):
     carved.mkdir()
     translated.mkdir()
     carve, translation = [], {}
-    for name, data, stage, spirv in shaders:
+    for name, data, stage, spirv, *subgroup in shaders:
         (carved / f"{name}.dxbc").write_bytes(data)
         carve.append({"name": name, "file": f"{name}.dxbc"})
         if spirv is not None:
             (translated / f"{name}.spv").write_bytes(spirv)
-            translation[name] = {"stage": stage}
+            translation[name] = {"stage": stage, **({"subgroup_size": subgroup[0]} if subgroup else {})}
     (carved / "index.json").write_text(json.dumps(carve), encoding="utf-8")
     (translated / "index.json").write_text(json.dumps(translation), encoding="utf-8")
     return carved, translated
@@ -64,23 +64,36 @@ class ShaderStoreTest(unittest.TestCase):
     def test_index_round_trip(self):
         with helpers.temp_root() as root:
             root = Path(root)
-            carved, translated = shader_set(root, [("a", container(1), "ps", b"A"), ("b c", container(2), "ms", b"B")])
+            carved, translated = shader_set(root, [("a", container(1), "ps", b"A", 64), ("b c", container(2), "ms", b"B")])
             modules, _, _ = shader_store.collect(carved, translated)
             store = root / "store"
             shader_store.write(store, modules, translated)
             entries = shader_store.read_index(store)
-            self.assertEqual({e["stage"] for e in entries.values()}, {"ps", "ms"})
+            self.assertEqual({(e["stage"], e["subgroup"]) for e in entries.values()}, {("ps", 64), ("ms", 0)})
             for key, entry in entries.items():
                 self.assertTrue((store / entry["file"]).is_file())
                 self.assertEqual(entry["file"].split("/")[0], "..")
             details = json.loads((store / "modules.json").read_text(encoding="utf-8"))
-            self.assertEqual((details["format"], details["version"]), ("anybox-shader-store", 1))
+            self.assertEqual((details["format"], details["version"]), ("anybox-shader-store", 2))
             self.assertEqual(sorted(d["name"] for d in details["modules"].values()), ["a", "b c"])
+
+    def test_subgroup_sizes(self):
+        with helpers.temp_root() as root:
+            root = Path(root)
+            carved, translated = shader_set(root, [("w32", container(1), "cs", b"A", 32), ("w64", container(2), "ps", b"B", 64),
+                                                   ("any", container(3), "cs", b"C", None), ("odd", container(4), "cs", b"D", 16),
+                                                   ("flag", container(5), "cs", b"E", True), ("w32_copy", container(1), "cs", b"A", 64)])
+            modules, duplicates, problems = shader_store.collect(carved, translated)
+            self.assertEqual(sorted((m["name"], m["subgroup"]) for m in modules.values()), [("any", 0), ("w64", 64)])
+            self.assertEqual(sorted(problems["invalid"]), ["flag", "odd"])
+            self.assertEqual(problems["conflicts"], [hashlib.sha256(container(1)).hexdigest()])
+            self.assertEqual(duplicates, 1)
 
     def test_read_index_rejects_bad_lines(self):
         with helpers.temp_root() as root:
             store = Path(root)
-            for text in ("abc\tps\tx.spv\n", "0" * 64 + "\tzz\tx.spv\n", "0" * 64 + "\tps\n"):
+            for text in ("abc\tps\t0\tx.spv\n", "0" * 64 + "\tzz\t0\tx.spv\n", "0" * 64 + "\tps\t0\n", "0" * 64 + "\tps\tx.spv\n",
+                         "0" * 64 + "\tps\t16\tx.spv\n", "0" * 64 + "\tps\t32\t\n"):
                 (store / "modules.txt").write_text(text, encoding="utf-8")
                 with self.assertRaises(shader_store.StoreError):
                     shader_store.read_index(store)

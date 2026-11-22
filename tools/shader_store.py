@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 
 FORMAT = "anybox-shader-store"
-VERSION = 1
+VERSION = 2
 INDEX = "modules.txt"
 DETAILS = "modules.json"
 STAGES = {"vs", "ps", "gs", "hs", "ds", "cs", "ms", "as", "lib"}
+SUBGROUP_SIZES = {None: 0, 32: 32, 64: 64}
 
 
 class StoreError(Exception):
@@ -61,7 +62,8 @@ def collect(carved, translated):
             problems["missing"].append(stem)
             continue
         stage = details.get("stage")
-        if stage not in STAGES:
+        subgroup = details.get("subgroup_size")
+        if stage not in STAGES or isinstance(subgroup, bool) or subgroup not in SUBGROUP_SIZES:
             problems["invalid"].append(stem)
             continue
         try:
@@ -69,14 +71,14 @@ def collect(carved, translated):
         except (OSError, StoreError):
             problems["invalid"].append(stem)
             continue
-        record = {"name": stem, "stage": stage, "file": module, "sha256": None, "details": details}
+        record = {"name": stem, "stage": stage, "subgroup": SUBGROUP_SIZES[subgroup], "file": module, "sha256": None, "details": details}
         if key in modules:
             duplicates += 1
             first = modules[key]
             if first.get("conflict"):
                 continue
             first["sha256"] = first["sha256"] or digest(first["file"])
-            if first["stage"] != stage or first["sha256"] != digest(module):
+            if first["stage"] != stage or first["subgroup"] != record["subgroup"] or first["sha256"] != digest(module):
                 first["conflict"] = True
                 problems["conflicts"].append(key)
             continue
@@ -95,7 +97,7 @@ def write(store, modules, translated):
         path = Path(root) / module["file"].name
         if "\t" in str(path) or "\n" in str(path):
             raise StoreError(f"{module['name']}: path holds a tab or newline")
-        lines.append(f"{key}\t{module['stage']}\t{path.as_posix()}\n")
+        lines.append(f"{key}\t{module['stage']}\t{module['subgroup']}\t{path.as_posix()}\n")
         details[key] = {"name": module["name"], "stage": module["stage"], "file": path.as_posix(), "translation": module["details"]}
     (store / INDEX).write_text("".join(lines), encoding="utf-8", newline="\n")
     (store / DETAILS).write_text(json.dumps({"format": FORMAT, "version": VERSION, "modules": details}, indent=1) + "\n", encoding="utf-8")
@@ -105,9 +107,9 @@ def read_index(store):
     entries = {}
     for number, line in enumerate((store / INDEX).read_text(encoding="utf-8").splitlines(), 1):
         fields = line.split("\t")
-        if len(fields) != 3 or len(fields[0]) != 64 or fields[1] not in STAGES:
-            raise StoreError(f"{store / INDEX}:{number}: not <sha256> <stage> <path>")
-        entries[fields[0]] = {"stage": fields[1], "file": fields[2]}
+        if len(fields) != 4 or len(fields[0]) != 64 or fields[1] not in STAGES or fields[2] not in ("0", "32", "64") or not fields[3]:
+            raise StoreError(f"{store / INDEX}:{number}: not <sha256> <stage> <subgroup> <path>")
+        entries[fields[0]] = {"stage": fields[1], "subgroup": int(fields[2]), "file": fields[3]}
     return entries
 
 
@@ -129,7 +131,7 @@ def lookup(args):
     if entry is None:
         print(f"{key}: not in the store")
         return 1
-    print(f"{key}: {entry['stage']} {(args.store / entry['file']).resolve()}")
+    print(f"{key}: {entry['stage']} subgroup {entry['subgroup'] or 'any'} {(args.store / entry['file']).resolve()}")
     return 0
 
 

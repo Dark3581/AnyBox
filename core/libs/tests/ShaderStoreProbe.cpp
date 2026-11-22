@@ -94,7 +94,7 @@ int Find(const char* folder, int count, char** containers) {
         }
         std::string path;
         for (const wchar_t c : module->path) path += static_cast<char>(c);
-        std::printf("%s\t%s\t%s\n", containers[index], module->stage.c_str(), path.c_str());
+        std::printf("%s\t%s\t%u\t%s\t%s\n", containers[index], module->stage.c_str(), module->subgroupSize, path.c_str(), module->key.c_str());
     }
     return 0;
 }

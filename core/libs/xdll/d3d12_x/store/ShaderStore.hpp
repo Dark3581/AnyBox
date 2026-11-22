@@ -16,7 +16,9 @@ std::string Hex(const Sha256& digest);
 std::optional<std::size_t> ContainerSize(const void* data, std::size_t length);
 
 struct ShaderModule {
+    std::string key;
     std::string stage;
+    std::uint32_t subgroupSize = 0;
     std::wstring path;
 };
 

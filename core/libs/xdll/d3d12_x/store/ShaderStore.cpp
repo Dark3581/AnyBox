@@ -33,6 +33,19 @@ std::wstring Widen(const std::string& text) {
     return wide;
 }
 
+std::optional<std::uint32_t> SubgroupSize(const std::string& text) {
+    if (text == "0") {
+        return 0u;
+    }
+    if (text == "32") {
+        return 32u;
+    }
+    if (text == "64") {
+        return 64u;
+    }
+    return std::nullopt;
+}
+
 bool IsDigest(const std::string& text) {
     if (text.size() != 64) {
         return false;
@@ -129,16 +142,18 @@ bool ShaderStore::Load(const std::wstring& folder, std::string& error) {
         }
         const std::size_t first = line.find('\t');
         const std::size_t second = first == std::string::npos ? std::string::npos : line.find('\t', first + 1);
-        if (second == std::string::npos || line.find('\t', second + 1) != std::string::npos) {
-            error = "line " + std::to_string(number) + " is not <sha256> <stage> <path>";
+        const std::size_t third = second == std::string::npos ? std::string::npos : line.find('\t', second + 1);
+        if (third == std::string::npos || line.find('\t', third + 1) != std::string::npos) {
+            error = "line " + std::to_string(number) + " is not <sha256> <stage> <subgroup> <path>";
             modules_.clear();
             return false;
         }
         const std::string digest = line.substr(0, first);
         const std::string stage = line.substr(first + 1, second - first - 1);
-        std::wstring path = Widen(line.substr(second + 1));
-        if (!IsDigest(digest) || Stages().count(stage) == 0 || path.empty()) {
-            error = "line " + std::to_string(number) + " is not <sha256> <stage> <path>";
+        const std::optional<std::uint32_t> subgroup = SubgroupSize(line.substr(second + 1, third - second - 1));
+        std::wstring path = Widen(line.substr(third + 1));
+        if (!IsDigest(digest) || Stages().count(stage) == 0 || !subgroup || path.empty()) {
+            error = "line " + std::to_string(number) + " is not <sha256> <stage> <subgroup> <path>";
             modules_.clear();
             return false;
         }
@@ -147,7 +162,7 @@ bool ShaderStore::Load(const std::wstring& folder, std::string& error) {
                 c = L'\\';
             }
         }
-        modules_[digest] = ShaderModule{stage, folder + L"\\" + path};
+        modules_[digest] = ShaderModule{digest, stage, *subgroup, folder + L"\\" + path};
     }
     return true;
 }

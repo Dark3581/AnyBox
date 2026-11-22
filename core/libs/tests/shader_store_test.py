@@ -48,21 +48,23 @@ def main():
     for name, (_, stage) in shaders.items():
         if name != "cs_untranslated":
             (translated / f"{name}.spv").write_bytes(b"\x03\x02\x23\x07" + shaders[name][0][:8])
-            translation[name] = {"stage": stage, "wave64": False}
+            translation[name] = {"stage": stage, "wave64": False, **({"subgroup_size": 64} if stage == "ps" else {})}
     (translated / "index.json").write_text(json.dumps(translation), encoding="utf-8")
 
     built = run([sys.executable, args.tool, "build", carved, translated, store], expect=1)
     assert "2 modules stored" in built and "1 containers duplicate another" in built and "1 have no translation" in built, built
     index = (store / "modules.txt").read_text(encoding="utf-8").splitlines()
-    assert len(index) == 2 and all(len(line.split("\t")) == 3 for line in index), index
+    assert len(index) == 2 and all(len(line.split("\t")) == 4 for line in index), index
 
     print(run([args.probe, "selftest"]))
     print(run([args.probe, "load", store, "ok", "-"]))
     found = [line.split("\t") for line in run([args.probe, "find", store, carved / "ps_a.dxbc", carved / "vs b.dxbc", carved / "ps_a_copy.dxbc", carved / "cs_untranslated.dxbc"]).splitlines()]
     assert [row[1] for row in found] == ["ps", "vs", "ps", "missing"], found
-    assert Path(found[0][2]).name == "ps_a.spv" and Path(found[1][2]).name == "vs b.spv" and found[2][2] == found[0][2], found
+    assert [row[2] for row in found[:3]] == ["64", "0", "64"], found
+    assert Path(found[0][3]).name == "ps_a.spv" and Path(found[1][3]).name == "vs b.spv" and found[2][3] == found[0][3], found
+    assert found[0][4] == found[2][4] and found[0][4] in [line.split("\t")[0] for line in index], found
     for row in found[:3]:
-        assert Path(row[2]).is_file(), row
+        assert Path(row[3]).is_file(), row
 
     tool_lookup = run([sys.executable, args.tool, "lookup", store, carved / "vs b.dxbc"])
     assert tool_lookup.split(":")[0] == index[[l.split("\t")[1] for l in index].index("vs")].split("\t")[0], (tool_lookup, index)
@@ -70,10 +72,11 @@ def main():
     broken = args.work / "broken"
     broken.mkdir()
     (broken / "modules.txt").write_text(index[0] + "\nnot a line\n", encoding="utf-8")
-    run([args.probe, "load", broken, "fail", "line 2 is not <sha256> <stage> <path>"])
-    digest, _, path = index[0].split("\t")
-    (broken / "modules.txt").write_text(f"{digest}\tzz\t{path}\n", encoding="utf-8")
-    run([args.probe, "load", broken, "fail", "line 1 is not <sha256> <stage> <path>"])
+    run([args.probe, "load", broken, "fail", "line 2 is not <sha256> <stage> <subgroup> <path>"])
+    digest, _, _, path = index[0].split("\t")
+    for line in (f"{digest}\tzz\t0\t{path}", f"{digest}\tps\t16\t{path}", f"{digest}\tps\t{path}"):
+        (broken / "modules.txt").write_text(line + "\n", encoding="utf-8")
+        run([args.probe, "load", broken, "fail", "line 1 is not <sha256> <stage> <subgroup> <path>"])
     run([args.probe, "load", args.work / "nowhere", "fail", "modules.txt not found"])
 
     env = dict(os.environ, ANYBOX_SHADER_STORE=str(store), ANYBOX_NO_REPORT="1", ANYBOX_TRACE="d3d12_x")
