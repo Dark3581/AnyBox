@@ -37,9 +37,10 @@ Built and tested on a GPU without the title's executable (each with its own prob
 
 - **Pipeline state**: compute and graphics descriptions resolve their shaders through the store by the hash of each shader container. Blend, rasterizer, depth-stencil, samples, topology and formats become Vulkan state, and the input layout is matched to the vertex shader's inputs. Each pipeline is created once and taken from the pipeline cache first; one that would need too much memory to compile in the title is refused, not compiled.
 - **Resources**: D3D12 resource states become Vulkan barriers, texture descriptions become Vulkan images (typeless, depth and block-compressed formats included), and view and sampler descriptions become Vulkan image views and samplers.
+- **Commands**: clears, buffer copies, uploads and readbacks through placed footprints (block-compressed included), texture copies and MSAA resolves are recorded on Vulkan; a GPU test reads every result back and compares it.
 - **Shader resources**: the descriptor hash table and bindless set the translated shaders look their images and samplers up in, and the buffer window below 4 GB their buffer addresses point into.
 
-Still needing the executable: the device object and its methods, command lists that record into Vulkan, descriptor heaps and the console descriptor words written into them, the root signature to shader register mapping, mesh pipelines and presentation.
+Still needing the executable: the device object and its methods, the command list objects (draws and dispatches with the title's root arguments), descriptor heaps and the console descriptor words written into them, the root signature to shader register mapping, mesh pipelines and presentation.
 
 The shader set is built on your PC from your own copy, into the build folder, like the rest of the project. It is never committed or shared. With a checkout of the translator:
 

@@ -1,0 +1,61 @@
+#pragma once
+
+#include "CopyLayout.hpp"
+#include "TextureDesc.hpp"
+#include "VulkanDevice.hpp"
+
+#include <windows.h>
+#include <d3d12.h>
+
+#include <string>
+#include <vector>
+
+namespace abx::d3d12x {
+
+struct TextureRef {
+    VkImage image = VK_NULL_HANDLE;
+    D3D12_RESOURCE_DESC desc{};
+    TextureImage layout;
+};
+
+struct BufferRef {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+};
+
+struct AttachmentRef {
+    VkImageView view = VK_NULL_HANDLE;
+    VkExtent2D extent{};
+    std::uint32_t layers = 1;
+    VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+};
+
+class CommandRecorder {
+public:
+    CommandRecorder(const VulkanDevice& device, VkCommandBuffer commands) : device_(device), commands_(commands) {}
+
+    bool InitializeTexture(const TextureRef& texture, D3D12_RESOURCE_STATES initial, std::string& error);
+    bool Transition(const TextureRef& texture, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after, std::string& error);
+    bool BufferTransition(D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after, std::string& error);
+    void UnorderedAccessBarrier();
+    bool ClearRenderTarget(const AttachmentRef& target, const float color[4], const std::vector<D3D12_RECT>& rects, std::string& error);
+    bool ClearDepthStencil(const AttachmentRef& target, D3D12_CLEAR_FLAGS flags, float depth, std::uint8_t stencil, const std::vector<D3D12_RECT>& rects, std::string& error);
+    bool CopyBufferRegion(const BufferRef& destination, UINT64 destinationOffset, const BufferRef& source, UINT64 sourceOffset, UINT64 bytes, std::string& error);
+    bool CopyBufferToTexture(const TextureRef& destination, D3D12_RESOURCE_STATES state, UINT subresource, UINT x, UINT y, UINT z, const BufferRef& source,
+                             const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, const D3D12_BOX* box, std::string& error);
+    bool CopyTextureToBuffer(const BufferRef& destination, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, const TextureRef& source, D3D12_RESOURCE_STATES state,
+                             UINT subresource, const D3D12_BOX* box, std::string& error);
+    bool CopyTexture(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, UINT x, UINT y, UINT z, const TextureRef& source,
+                     D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, const D3D12_BOX* box, std::string& error);
+    bool ResolveSubresource(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, const TextureRef& source,
+                            D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, std::string& error);
+
+private:
+    bool LayoutFor(const TextureRef& texture, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_STATES expected, VkImageLayout& layout, std::string& error) const;
+
+    const VulkanDevice& device_;
+    VkCommandBuffer commands_;
+};
+
+}

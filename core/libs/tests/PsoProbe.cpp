@@ -1,3 +1,6 @@
+#include "BindlessSet.hpp"
+#include "CommandRecorder.hpp"
+#include "CopyLayout.hpp"
 #include "GraphicsPipeline.hpp"
 #include "GraphicsState.hpp"
 #include "PipelineCompiler.hpp"
@@ -1363,6 +1366,291 @@ int ViewsGpu(bool validate) {
     return status;
 }
 
+int CommandsSelfTest() {
+    std::string error;
+    const std::optional<CopyBlock> bc1 = CopyBlockOf(DXGI_FORMAT_BC1_UNORM);
+    if (!bc1 || bc1->width != 4 || bc1->height != 4 || bc1->bytes != 8 || CopyBlockOf(DXGI_FORMAT_BC7_TYPELESS)->bytes != 16) return Fail("block formats");
+    if (CopyBlockOf(DXGI_FORMAT_R16G16B16A16_FLOAT)->bytes != 8 || CopyBlockOf(DXGI_FORMAT_R11G11B10_FLOAT)->bytes != 4 || CopyBlockOf(DXGI_FORMAT_D16_UNORM)->bytes != 2 ||
+        CopyBlockOf(static_cast<DXGI_FORMAT>(200))) return Fail("texel formats");
+    const D3D12_RESOURCE_DESC array = TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 100, 50, 4, 3, D3D12_RESOURCE_FLAG_NONE);
+    const std::optional<Subresource> sub = SplitSubresource(array, 7, 3);
+    if (!sub || sub->mip != 1 || sub->layer != 2 || sub->plane != 0 || SplitSubresource(array, 12, 3)->plane != 1 || SplitSubresource(array, 24, 3)) return Fail("subresource split");
+    if (MipExtent(100, 2) != 25 || MipExtent(100, 7) != 1 || MipExtent(1, 0) != 1) return Fail("mip extent");
+    const std::optional<Footprints> rgba = DesktopCopyableFootprints(array, 3, 0, 3, 0, error);
+    if (!rgba) return Fail("footprints: " + error);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& mip0 = rgba->layouts[0];
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& mip1 = rgba->layouts[1];
+    if (mip0.Offset != 0 || mip0.Footprint.RowPitch != 512 || rgba->rows[0] != 50 || rgba->rowBytes[0] != 400 || mip1.Offset != 25600 || mip1.Footprint.RowPitch != 256 ||
+        mip1.Footprint.Width != 50 || mip1.Footprint.Height != 25) return Fail("rgba footprints");
+    if (rgba->totalBytes != rgba->layouts[2].Offset + 256 * 11 + 100) return Fail("total bytes " + std::to_string(rgba->totalBytes));
+    D3D12_RESOURCE_DESC blocks = TextureDesc2D(DXGI_FORMAT_BC1_UNORM, 8, 8, 1, 3, D3D12_RESOURCE_FLAG_NONE);
+    const std::optional<Footprints> compressed = DesktopCopyableFootprints(blocks, 3, 0, 3, 0, error);
+    if (!compressed || compressed->layouts[0].Footprint.RowPitch != 256 || compressed->rows[0] != 2 || compressed->layouts[2].Footprint.Width != 4 || compressed->rows[2] != 1) return Fail("bc footprints");
+    std::optional<VkBufferImageCopy> region = FootprintRegion(array, 3, VK_IMAGE_ASPECT_COLOR_BIT, 7, mip1, 0, 0, 0, nullptr, error);
+    if (!region || region->bufferRowLength != 64 || region->bufferImageHeight != 25 || region->imageSubresource.mipLevel != 1 || region->imageSubresource.baseArrayLayer != 2 ||
+        region->imageExtent.width != 50 || region->imageExtent.height != 25 || region->bufferOffset != 25600) return Fail("region");
+    const D3D12_BOX box{4, 2, 0, 20, 10, 1};
+    region = FootprintRegion(array, 3, VK_IMAGE_ASPECT_COLOR_BIT, 0, mip0, 10, 5, 0, &box, error);
+    if (!region || region->bufferOffset != 2 * 512 + 4 * 4 || region->imageOffset.x != 10 || region->imageOffset.y != 5 || region->imageExtent.width != 16 || region->imageExtent.height != 8) return Fail("boxed region");
+    region = FootprintRegion(blocks, 3, VK_IMAGE_ASPECT_COLOR_BIT, 2, compressed->layouts[2], 0, 0, 0, nullptr, error);
+    if (!region || region->imageExtent.width != 2 || region->imageExtent.height != 2 || region->bufferRowLength != 128) return Fail("bc edge block: " + error);
+    struct Refusal {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+        const D3D12_RESOURCE_DESC* texture;
+        VkImageAspectFlags aspects;
+        UINT subresource;
+        UINT x;
+        const char* expected;
+    };
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT oddPitch = mip0;
+    oddPitch.Footprint.RowPitch = 514;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT shortPitch = mip0;
+    shortPitch.Footprint.RowPitch = 256;
+    const Refusal refusals[] = {
+        {oddPitch, &array, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, "not a whole number of blocks"},
+        {shortPitch, &array, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, "shorter than a row"},
+        {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 0, 60, "runs past the edge of the mip"},
+        {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 0, 100, "starts outside mip 0"},
+        {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 12, 0, "names a second plane"},
+        {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 24, 0, "outside the texture"},
+        {mip0, &array, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, "depth and stencil planes"},
+        {compressed->layouts[0], &blocks, VK_IMAGE_ASPECT_COLOR_BIT, 0, 2, "block boundary"},
+    };
+    for (const Refusal& refusal : refusals) {
+        error.clear();
+        if (FootprintRegion(*refusal.texture, 3, refusal.aspects, refusal.subresource, refusal.footprint, refusal.x, 0, 0, nullptr, error) ||
+            error.find(refusal.expected) == std::string::npos) return Fail(std::string("refusal '") + refusal.expected + "' gave '" + error + "'");
+    }
+    const D3D12_BOX outside{0, 0, 0, 200, 10, 1};
+    if (FootprintRegion(array, 3, VK_IMAGE_ASPECT_COLOR_BIT, 0, mip0, 0, 0, 0, &outside, error) || error.find("outside the footprint") == std::string::npos) return Fail("box outside");
+    std::puts("PASS commands selftest");
+    return 0;
+}
+
+struct GpuTexture {
+    TextureRef ref;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::vector<VkImageView> views;
+};
+
+int CommandsGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const DeviceFunctions& vk = device->Vk();
+    std::vector<GpuTexture> textures;
+    const auto makeTexture = [&](const D3D12_RESOURCE_DESC& desc) -> GpuTexture* {
+        const std::optional<TextureImage> image = TranslateTextureDesc(desc, error);
+        if (!image) return nullptr;
+        GpuTexture texture;
+        texture.ref.desc = desc;
+        texture.ref.layout = *image;
+        if (vk.createImage(device->Handle(), &image->info, nullptr, &texture.ref.image) != VK_SUCCESS) return nullptr;
+        VkMemoryRequirements needs{};
+        vk.getImageMemoryRequirements(device->Handle(), texture.ref.image, &needs);
+        const std::optional<std::uint32_t> type = device->MemoryType(needs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = needs.size;
+        allocate.memoryTypeIndex = type ? *type : 0;
+        if (!type || vk.allocateMemory(device->Handle(), &allocate, nullptr, &texture.memory) != VK_SUCCESS ||
+            vk.bindImageMemory(device->Handle(), texture.ref.image, texture.memory, 0) != VK_SUCCESS) return nullptr;
+        textures.push_back(texture);
+        return &textures.back();
+    };
+    const auto makeAttachment = [&](GpuTexture& texture, bool depth, UINT mip) -> std::optional<AttachmentRef> {
+        std::optional<ImageView> view;
+        if (depth) {
+            D3D12_DEPTH_STENCIL_VIEW_DESC desc{texture.ref.desc.Format, D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_FLAG_NONE, {}};
+            desc.Texture2D.MipSlice = mip;
+            view = DepthStencilView(texture.ref.desc, &desc, error);
+        } else {
+            D3D12_RENDER_TARGET_VIEW_DESC desc{texture.ref.desc.Format, texture.ref.desc.SampleDesc.Count > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+            desc.Texture2D.MipSlice = mip;
+            view = RenderTargetView(texture.ref.desc, &desc, error);
+        }
+        if (!view) return std::nullopt;
+        view->info.image = texture.ref.image;
+        VkImageView handle = VK_NULL_HANDLE;
+        if (vk.createImageView(device->Handle(), &view->info, nullptr, &handle) != VK_SUCCESS) return std::nullopt;
+        texture.views.push_back(handle);
+        return AttachmentRef{handle, {MipExtent(texture.ref.desc.Width, mip), MipExtent(texture.ref.desc.Height, mip)}, 1, view->info.subresourceRange.aspectMask};
+    };
+    textures.reserve(8);
+    const D3D12_RESOURCE_FLAGS rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    GpuTexture* color = makeTexture(TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 3, rt));
+    GpuTexture* target = makeTexture(TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, rt));
+    GpuTexture* depth = makeTexture(TextureDesc2D(DXGI_FORMAT_D32_FLOAT, 32, 32, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+    D3D12_RESOURCE_DESC msaaDesc = TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 32, 32, 1, 1, rt);
+    msaaDesc.SampleDesc = {4, 0};
+    GpuTexture* msaa = makeTexture(msaaDesc);
+    GpuTexture* resolved = makeTexture(TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 32, 32, 1, 1, D3D12_RESOURCE_FLAG_NONE));
+    const bool bcSupported = device->HasFeature("textureCompressionBC");
+    GpuTexture* blocks = bcSupported ? makeTexture(TextureDesc2D(DXGI_FORMAT_BC1_UNORM, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_NONE)) : nullptr;
+    if (!color || !target || !depth || !msaa || !resolved || (bcSupported && !blocks)) return Fail("textures: " + error);
+    const std::optional<AttachmentRef> colorView = makeAttachment(*color, false, 0);
+    const std::optional<AttachmentRef> targetView = makeAttachment(*target, false, 0);
+    const std::optional<AttachmentRef> depthView = makeAttachment(*depth, true, 0);
+    const std::optional<AttachmentRef> msaaView = makeAttachment(*msaa, false, 0);
+    if (!colorView || !targetView || !depthView || !msaaView) return Fail("views: " + error);
+
+    const VkDeviceSize bufferBytes = 1u << 20;
+    DeviceBuffer upload;
+    DeviceBuffer readback;
+    if (!CreateHostBuffer(*device, bufferBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, upload, error) ||
+        !CreateHostBuffer(*device, bufferBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback, error)) return Fail("buffers: " + error);
+    std::uint8_t* const up = static_cast<std::uint8_t*>(upload.mapped);
+    std::uint8_t* const down = static_cast<std::uint8_t*>(readback.mapped);
+    std::fill(down, down + bufferBytes, std::uint8_t{0xCD});
+    const BufferRef uploadRef{upload.buffer, 0, bufferBytes};
+    const BufferRef readbackRef{readback.buffer, 0, bufferBytes};
+
+    const std::optional<Footprints> colorPrints = DesktopCopyableFootprints(color->ref.desc, 3, 0, 3, 0, error);
+    const std::optional<Footprints> targetPrints = DesktopCopyableFootprints(target->ref.desc, 1, 0, 1, 0x20000, error);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT mip1Back = colorPrints->layouts[1];
+    mip1Back.Offset += 0x40000;
+    const std::optional<Footprints> depthPrints = DesktopCopyableFootprints(depth->ref.desc, 1, 0, 1, 0x60000, error);
+    const std::optional<Footprints> resolvedPrints = DesktopCopyableFootprints(resolved->ref.desc, 1, 0, 1, 0x70000, error);
+    const std::optional<Footprints> blockPrints = bcSupported ? DesktopCopyableFootprints(blocks->ref.desc, 1, 0, 1, 0x80000, error) : std::nullopt;
+    if (!colorPrints || !targetPrints || !depthPrints || !resolvedPrints || (bcSupported && !blockPrints)) return Fail("footprints: " + error);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& mip1 = colorPrints->layouts[1];
+    for (UINT row = 0; row < 32; ++row) {
+        for (UINT column = 0; column < 32 * 4; ++column) up[mip1.Offset + row * mip1.Footprint.RowPitch + column] = static_cast<std::uint8_t>(row * 7 + column);
+    }
+    if (bcSupported) {
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& print = blockPrints->layouts[0];
+        for (UINT row = 0; row < 16; ++row) {
+            for (UINT column = 0; column < 16 * 8; ++column) up[print.Offset + row * print.Footprint.RowPitch + column] = static_cast<std::uint8_t>(row * 13 + column * 3 + 1);
+        }
+    }
+    for (VkDeviceSize index = 0; index < 4096; ++index) up[0x90000 + index] = static_cast<std::uint8_t>(index * 5 + 3);
+
+    bool recorded = true;
+    std::string step;
+    const bool submitted = device->Submit(
+        [&](VkCommandBuffer commands) {
+            CommandRecorder recorder(*device, commands);
+            const auto check = [&](bool ok, const char* name) {
+                if (!ok && recorded) {
+                    recorded = false;
+                    step = name;
+                }
+            };
+            const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+            const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+            const float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            for (const GpuTexture& texture : textures) check(recorder.InitializeTexture(texture.ref, D3D12_RESOURCE_STATE_COMMON, error), "initialize");
+            check(recorder.Transition(color->ref, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "color to render target");
+            check(recorder.ClearRenderTarget(*colorView, red, {}, error), "clear red");
+            check(recorder.ClearRenderTarget(*colorView, green, {{8, 8, 24, 24}}, error), "clear green rect");
+            check(recorder.Transition(target->ref, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "target to render target");
+            check(recorder.ClearRenderTarget(*targetView, blue, {}, error), "clear blue");
+            check(recorder.Transition(color->ref, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST, error), "color to copy dest");
+            check(recorder.CopyBufferToTexture(color->ref, D3D12_RESOURCE_STATE_COPY_DEST, 1, 0, 0, 0, uploadRef, mip1, nullptr, error), "upload mip 1");
+            check(recorder.Transition(color->ref, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "color to copy source");
+            check(recorder.Transition(target->ref, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST, error), "target to copy dest");
+            const D3D12_BOX square{8, 8, 0, 24, 24, 1};
+            check(recorder.CopyTexture(target->ref, D3D12_RESOURCE_STATE_COPY_DEST, 0, 4, 4, 0, color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, &square, error), "texture copy");
+            check(recorder.Transition(target->ref, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "target to copy source");
+            check(recorder.CopyTextureToBuffer(readbackRef, colorPrints->layouts[0], color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read mip 0");
+            check(recorder.CopyTextureToBuffer(readbackRef, mip1Back, color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 1, nullptr, error), "read mip 1");
+            check(recorder.CopyTextureToBuffer(readbackRef, targetPrints->layouts[0], target->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read target");
+            check(recorder.Transition(depth->ref, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_DEPTH_WRITE, error), "depth to write");
+            check(recorder.ClearDepthStencil(*depthView, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, {}, error), "clear depth");
+            check(recorder.ClearDepthStencil(*depthView, D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0, {{0, 0, 8, 8}}, error), "clear depth rect");
+            check(recorder.Transition(depth->ref, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "depth to copy source");
+            check(recorder.CopyTextureToBuffer(readbackRef, depthPrints->layouts[0], depth->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read depth");
+            check(recorder.Transition(msaa->ref, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "msaa to render target");
+            check(recorder.ClearRenderTarget(*msaaView, blue, {}, error), "clear msaa");
+            check(recorder.Transition(msaa->ref, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, error), "msaa to resolve source");
+            check(recorder.Transition(resolved->ref, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RESOLVE_DEST, error), "resolved to resolve dest");
+            check(recorder.ResolveSubresource(resolved->ref, D3D12_RESOURCE_STATE_RESOLVE_DEST, 0, msaa->ref, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, 0, error), "resolve");
+            check(recorder.Transition(resolved->ref, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "resolved to copy source");
+            check(recorder.CopyTextureToBuffer(readbackRef, resolvedPrints->layouts[0], resolved->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read resolved");
+            if (bcSupported) {
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT back = blockPrints->layouts[0];
+                back.Offset += 0x8000;
+                check(recorder.Transition(blocks->ref, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, error), "blocks to copy dest");
+                check(recorder.CopyBufferToTexture(blocks->ref, D3D12_RESOURCE_STATE_COPY_DEST, 0, 0, 0, 0, uploadRef, blockPrints->layouts[0], nullptr, error), "upload blocks");
+                check(recorder.Transition(blocks->ref, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "blocks to copy source");
+                check(recorder.CopyTextureToBuffer(readbackRef, back, blocks->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read blocks");
+            }
+            check(recorder.CopyBufferRegion(readbackRef, 0xA0000, uploadRef, 0x90000, 4096, error), "buffer copy");
+            check(!recorder.CopyBufferRegion(readbackRef, bufferBytes - 16, uploadRef, 0, 32, error), "buffer copy bounds");
+            VkMemoryBarrier2 host{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            host.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+            host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers = &host;
+            vk.cmdPipelineBarrier2(commands, &dependency);
+        },
+        error);
+    int status = 0;
+    if (!submitted || !recorded) status = Fail("recording '" + step + "': " + error);
+    const auto pixel = [&](const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& print, UINT x, UINT y) {
+        const std::uint8_t* p = down + print.Offset + y * print.Footprint.RowPitch + x * 4;
+        return static_cast<std::uint32_t>(p[0]) << 24 | static_cast<std::uint32_t>(p[1]) << 16 | static_cast<std::uint32_t>(p[2]) << 8 | p[3];
+    };
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    if (status == 0) {
+        expect(pixel(colorPrints->layouts[0], 0, 0) == 0xFF0000FFu, "cleared red at (0,0)");
+        expect(pixel(colorPrints->layouts[0], 10, 10) == 0x00FF00FFu, "green rectangle at (10,10)");
+        expect(pixel(colorPrints->layouts[0], 23, 23) == 0x00FF00FFu, "green rectangle at (23,23)");
+        expect(pixel(colorPrints->layouts[0], 24, 24) == 0xFF0000FFu, "red past the rectangle at (24,24)");
+        expect(pixel(colorPrints->layouts[0], 63, 63) == 0xFF0000FFu, "red at (63,63)");
+        bool same = true;
+        for (UINT row = 0; row < 32 && same; ++row) {
+            same = std::memcmp(down + mip1Back.Offset + row * mip1Back.Footprint.RowPitch, up + mip1.Offset + row * mip1.Footprint.RowPitch, 32 * 4) == 0;
+        }
+        expect(same, "mip 1 read back as uploaded");
+        expect(pixel(targetPrints->layouts[0], 0, 0) == 0x0000FFFFu, "blue target at (0,0)");
+        expect(pixel(targetPrints->layouts[0], 4, 4) == 0x00FF00FFu, "copied square at (4,4)");
+        expect(pixel(targetPrints->layouts[0], 19, 19) == 0x00FF00FFu, "copied square at (19,19)");
+        expect(pixel(targetPrints->layouts[0], 20, 20) == 0x0000FFFFu, "blue past the copied square at (20,20)");
+        float nearDepth = 0.0f;
+        float farDepth = 0.0f;
+        std::memcpy(&nearDepth, down + depthPrints->layouts[0].Offset, sizeof(nearDepth));
+        std::memcpy(&farDepth, down + depthPrints->layouts[0].Offset + 16 * depthPrints->layouts[0].Footprint.RowPitch + 16 * 4, sizeof(farDepth));
+        expect(nearDepth == 0.75f && farDepth == 0.25f, "depth read back as " + std::to_string(nearDepth) + " and " + std::to_string(farDepth));
+        expect(pixel(resolvedPrints->layouts[0], 5, 5) == 0x0000FFFFu, "resolved blue");
+        if (bcSupported) {
+            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& print = blockPrints->layouts[0];
+            bool blocksSame = true;
+            for (UINT row = 0; row < 16 && blocksSame; ++row) {
+                blocksSame = std::memcmp(down + print.Offset + 0x8000 + row * print.Footprint.RowPitch, up + print.Offset + row * print.Footprint.RowPitch, 16 * 8) == 0;
+            }
+            expect(blocksSame, "BC1 blocks read back as uploaded");
+        }
+        expect(std::memcmp(down + 0xA0000, up + 0x90000, 4096) == 0, "buffer copy");
+    }
+    std::printf("commands: %zu read-back checks%s\n", checks, bcSupported ? "" : " (no BC support: block copy skipped)");
+    for (GpuTexture& texture : textures) {
+        for (VkImageView view : texture.views) vk.destroyImageView(device->Handle(), view, nullptr);
+        vk.destroyImage(device->Handle(), texture.ref.image, nullptr);
+        vk.freeMemory(device->Handle(), texture.memory, nullptr);
+    }
+    DestroyBuffer(*device, upload);
+    DestroyBuffer(*device, readback);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS commands gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1375,11 +1663,13 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "states-selftest") == 0) return StatesSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "textures-selftest") == 0) return TexturesSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "views-selftest") == 0) return ViewsSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "commands-selftest") == 0) return CommandsSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "commands-gpu") == 0) return CommandsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "views-gpu") == 0) return ViewsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "textures-gpu") == 0) return TexturesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate]");
     return 2;
 }

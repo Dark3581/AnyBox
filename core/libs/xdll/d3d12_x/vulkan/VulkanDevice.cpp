@@ -495,6 +495,14 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdPushConstants = DeviceFunction<PFN_vkCmdPushConstants>(getDeviceProcAddr, device_, "vkCmdPushConstants");
     vk_.cmdDispatch = DeviceFunction<PFN_vkCmdDispatch>(getDeviceProcAddr, device_, "vkCmdDispatch");
     vk_.cmdClearColorImage = DeviceFunction<PFN_vkCmdClearColorImage>(getDeviceProcAddr, device_, "vkCmdClearColorImage");
+    vk_.cmdBeginRendering = DeviceFunction<PFN_vkCmdBeginRendering>(getDeviceProcAddr, device_, "vkCmdBeginRendering");
+    vk_.cmdEndRendering = DeviceFunction<PFN_vkCmdEndRendering>(getDeviceProcAddr, device_, "vkCmdEndRendering");
+    vk_.cmdClearAttachments = DeviceFunction<PFN_vkCmdClearAttachments>(getDeviceProcAddr, device_, "vkCmdClearAttachments");
+    vk_.cmdCopyBuffer = DeviceFunction<PFN_vkCmdCopyBuffer>(getDeviceProcAddr, device_, "vkCmdCopyBuffer");
+    vk_.cmdCopyBufferToImage = DeviceFunction<PFN_vkCmdCopyBufferToImage>(getDeviceProcAddr, device_, "vkCmdCopyBufferToImage");
+    vk_.cmdCopyImageToBuffer = DeviceFunction<PFN_vkCmdCopyImageToBuffer>(getDeviceProcAddr, device_, "vkCmdCopyImageToBuffer");
+    vk_.cmdCopyImage = DeviceFunction<PFN_vkCmdCopyImage>(getDeviceProcAddr, device_, "vkCmdCopyImage");
+    vk_.cmdResolveImage = DeviceFunction<PFN_vkCmdResolveImage>(getDeviceProcAddr, device_, "vkCmdResolveImage");
     vk_.queueSubmit = DeviceFunction<PFN_vkQueueSubmit>(getDeviceProcAddr, device_, "vkQueueSubmit");
     vk_.createFence = DeviceFunction<PFN_vkCreateFence>(getDeviceProcAddr, device_, "vkCreateFence");
     vk_.destroyFence = DeviceFunction<PFN_vkDestroyFence>(getDeviceProcAddr, device_, "vkDestroyFence");

@@ -68,6 +68,14 @@ struct DeviceFunctions {
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
     PFN_vkCmdClearColorImage cmdClearColorImage = nullptr;
+    PFN_vkCmdBeginRendering cmdBeginRendering = nullptr;
+    PFN_vkCmdEndRendering cmdEndRendering = nullptr;
+    PFN_vkCmdClearAttachments cmdClearAttachments = nullptr;
+    PFN_vkCmdCopyBuffer cmdCopyBuffer = nullptr;
+    PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage = nullptr;
+    PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
+    PFN_vkCmdCopyImage cmdCopyImage = nullptr;
+    PFN_vkCmdResolveImage cmdResolveImage = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
     PFN_vkCreateFence createFence = nullptr;
     PFN_vkDestroyFence destroyFence = nullptr;
