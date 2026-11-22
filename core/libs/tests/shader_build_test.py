@@ -14,6 +14,7 @@ import spirv_layout
 COMMAND_LINE = 30000
 COMPUTE_SAMPLE = 60
 COMPUTE_SAMPLE_BYTES = 1 << 20
+PSO_SAMPLE = 12
 
 
 def batches(paths, fixed):
@@ -41,10 +42,12 @@ def check_lookups(args, layout, translation, store):
         assert len(rows) == len(batch), (len(rows), len(batch))
         for container, row in zip(batch, rows):
             stem = container.stem
-            assert len(row) == 3, f"{stem}: not in the store"
+            assert len(row) == 5, f"{stem}: not in the store"
             expected = translation[stem]["stage"]
             assert row[1] == expected, f"{stem}: stage {row[1]}, translation says {expected}"
-            module = Path(row[2])
+            subgroup = translation[stem].get("subgroup_size") or 0
+            assert row[2] == str(subgroup), f"{stem}: subgroup {row[2]}, translation says {subgroup}"
+            module = Path(row[3])
             assert module.is_file(), f"{stem}: {module} is missing"
             shared += module.stem != stem
             found += 1
@@ -119,6 +122,66 @@ def check_compute(args, layout):
     print(f"compute: {sum(line.startswith('OK') for line in lines)} of {len(sample)} sampled compute modules (of {len(compute)} up to {COMPUTE_SAMPLE_BYTES >> 20} MiB) compiled")
 
 
+def pso_rows(output):
+    found = []
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 6 and fields[1] in ("ready", "compiled", "refused", "failed"):
+            found.append({"container": fields[0], "origin": fields[1], "bytes": int(fields[3]), "seconds": float(fields[4]), "error": fields[5]})
+    return found
+
+
+def check_pso(args, layout, summary):
+    compute = sorted(((path.stat().st_size, path, module) for path, module in store_modules(layout) if module["stage"] == "cs"), key=lambda item: (item[0], item[2]["name"]))
+    assert compute, "the store has no compute module"
+    small = [item for item in compute if item[0] <= COMPUTE_SAMPLE_BYTES]
+    step = max(1, len(small) // PSO_SAMPLE)
+    sample = small[::step][:PSO_SAMPLE] + [compute[-1]]
+    containers = [layout["carved"] / f"{module['name']}.dxbc" for _, _, module in sample]
+    for container in containers:
+        assert container.is_file(), f"{container} is missing"
+    work = layout["summary"].parent
+    listing = work / "pso_sample.txt"
+    listing.write_text("".join(f"{container}\n" for container in containers), encoding="utf-8", newline="\n")
+    features = sorted({feature for _, _, m in sample for feature in m["translation"].get("features", [])})
+    base = [str(args.pso_probe), "compute", str(layout["store"]), str(listing), "--limit", str(COMPUTE_SAMPLE_BYTES), "--threads", "4"]
+    if features:
+        base += ["--features", ",".join(features)]
+    if any(m["translation"].get("needs_maintenance8") for _, _, m in sample):
+        base.append("--maintenance8")
+    env = dict(os.environ, PATH=str(args.libs) + os.pathsep + os.environ.get("PATH", ""), ANYBOX_NO_REPORT="1")
+    largest = str(containers[-1])
+    print(f"pso: {len(sample) - 1} compute shaders up to {COMPUTE_SAMPLE_BYTES >> 20} MiB and the largest, {sample[-1][2]['name']} ({sample[-1][0]} bytes), "
+          f"with a run-time compile limit of {COMPUTE_SAMPLE_BYTES} bytes")
+    fresh = work / "pso_fresh_cache.bin"
+    fresh.unlink(missing_ok=True)
+    run = subprocess.run(base + ["--cache", str(fresh)], capture_output=True, text=True, env=env, timeout=1500)
+    if run.returncode == 3:
+        print(f"SKIP pso check: {run.stdout.strip()}")
+        return
+    assert run.returncode == 0, (run.stdout[-3000:], run.stderr[-2000:])
+    found = pso_rows(run.stdout)
+    assert len(found) == len(containers), run.stdout[-3000:]
+    for row in found:
+        print(f"  empty cache: {Path(row['container']).stem} {row['origin']} {row['seconds']:.3f}s {row['error']}")
+    assert all(row["origin"] in ("ready", "compiled") for row in found[:-1]), "a sampled compute pipeline failed through the shader store"
+    assert found[-1]["origin"] in ("ready", "refused"), f"the largest module was {found[-1]['origin']} although it is over the run-time compile limit"
+    cache = layout["cache"]
+    if not cache.is_file():
+        print(f"no offline cache at {cache}: run the shader_pipelines target to fill it")
+        return
+    run = subprocess.run(base + ["--cache", str(cache)], capture_output=True, text=True, env=env, timeout=1500)
+    assert run.returncode == 0, (run.stdout[-3000:], run.stderr[-2000:])
+    print("\n".join(line for line in run.stdout.splitlines() if line.startswith("cache seeded")))
+    found = pso_rows(run.stdout)
+    assert len(found) == len(containers) and all(row["origin"] != "failed" for row in found), run.stdout[-3000:]
+    ready = sum(row["origin"] == "ready" for row in found)
+    print(f"  offline cache: {ready} of {len(found)} ready, largest {found[-1]['origin']}")
+    pipelines = summary.get("pipelines") or {}
+    if pipelines and build_shaders.pipelines_passed(pipelines):
+        assert ready == len(found), "the offline pipeline check passed, so every sampled pipeline should come from its cache"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shaders", type=Path, required=True)
@@ -126,7 +189,8 @@ def main():
     parser.add_argument("--libs", type=Path, required=True)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--pipeline-probe", type=Path, required=True)
-    parser.add_argument("--check", choices=("store", "gpu", "layout", "compute", "pipelines"), required=True)
+    parser.add_argument("--pso-probe", type=Path, required=True)
+    parser.add_argument("--check", choices=("store", "gpu", "layout", "compute", "pso", "pipelines"), required=True)
     args = parser.parse_args()
     layout = build_shaders.layout(args.shaders)
     summary_path = layout["summary"]
@@ -151,6 +215,8 @@ def main():
         check_layout(args, layout)
     elif args.check == "compute":
         check_compute(args, layout)
+    elif args.check == "pso":
+        check_pso(args, layout, summary)
     else:
         pipelines = summary.get("pipelines")
         if pipelines is None:

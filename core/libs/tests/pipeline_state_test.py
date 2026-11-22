@@ -1,0 +1,144 @@
+import argparse
+import json
+import os
+import random
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+
+def container(fill, size=48):
+    data = bytearray(bytes([fill]) * size)
+    data[0:4] = b"DXBC"
+    struct.pack_into("<I", data, 24, size)
+    return bytes(data)
+
+
+def empty_compute(local_x):
+    words = [0x07230203, 0x00010000, 0, 5, 0,
+             0x00020011, 1,
+             0x0003000E, 0, 1,
+             0x0005000F, 5, 1, 0x6E69616D, 0,
+             0x00060010, 1, 17, local_x, 1, 1,
+             0x00020013, 2,
+             0x00030021, 3, 2,
+             0x00050036, 2, 1, 0, 3,
+             0x000200F8, 4,
+             0x000100FD,
+             0x00010038]
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+def run(command, env, expect=0):
+    result = subprocess.run([str(part) for part in command], capture_output=True, text=True, env=env, timeout=600)
+    print(result.stdout.strip())
+    assert result.returncode == expect, (command, result.returncode, result.stdout[-2000:], result.stderr[-2000:])
+    return result.stdout
+
+
+def rows(output, containers):
+    found = {}
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 6 and fields[0] in containers:
+            found.setdefault(fields[0], []).append({"origin": fields[1], "hit": fields[2] == "1", "bytes": int(fields[3]), "error": fields[5]})
+    return found
+
+
+def stats(output):
+    line = next(line for line in output.splitlines() if line.startswith("stats "))
+    return {key: int(value) for key, value in (field.split("=") for field in line.split()[1:])}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--probe", type=Path, required=True)
+    parser.add_argument("--libs", type=Path, required=True)
+    parser.add_argument("--tool", type=Path, required=True)
+    parser.add_argument("--work", type=Path, required=True)
+    args = parser.parse_args()
+    shutil.rmtree(args.work, ignore_errors=True)
+    carved, translated, store = args.work / "carved", args.work / "translated", args.work / "store"
+    carved.mkdir(parents=True)
+    translated.mkdir(parents=True)
+    env = dict(os.environ, PATH=str(args.libs) + os.pathsep + os.environ.get("PATH", ""), ANYBOX_NO_REPORT="1")
+
+    unique = random.SystemRandom().randrange(2, 1024)
+    shaders = {
+        "cs_a": (container(1), {"stage": "cs", "subgroup_size": None}, empty_compute(1)),
+        "cs_b": (container(2), {"stage": "cs", "subgroup_size": 32}, empty_compute(2)),
+        "cs_new": (container(3), {"stage": "cs", "subgroup_size": None}, empty_compute(unique)),
+        "ps_x": (container(4), {"stage": "ps", "subgroup_size": 64}, b"\x03\x02\x23\x07" + bytes(16)),
+    }
+    for name, (data, details, spirv) in shaders.items():
+        (carved / f"{name}.dxbc").write_bytes(data)
+        (translated / f"{name}.spv").write_bytes(spirv)
+    (carved / "index.json").write_text(json.dumps([{"name": n, "file": f"{n}.dxbc"} for n in shaders]), encoding="utf-8")
+    (translated / "index.json").write_text(json.dumps({n: d for n, (_, d, _) in shaders.items()}), encoding="utf-8")
+    run([sys.executable, args.tool, "build", carved, translated, store], env)
+    (carved / "unknown.dxbc").write_bytes(container(9))
+    (carved / "junk.bin").write_bytes(b"not a container at all, but long enough to read")
+
+    def resolve(container_path, *extra):
+        return run([args.probe, "resolve", store, container_path, *extra], env).strip().split("\t")
+
+    resolved = resolve(carved / "cs_b.dxbc")
+    assert resolved[0] == "ok" and len(resolved[1]) == 64 and resolved[2] == "32" and Path(resolved[3]).name == "cs_b.spv", resolved
+    assert resolve(carved / "cs_a.dxbc", "--cached", "64")[:1] == ["ok"]
+    assert resolve(carved / "cs_a.dxbc")[2] == "0"
+    assert resolve(carved / "ps_x.dxbc")[1].startswith("the shader store has stage ps for compute shader ")
+    assert resolve(carved / "unknown.dxbc")[1].endswith(" is not in the shader store")
+    assert resolve(carved / "junk.bin")[1] == "the compute shader is not a DXBC container"
+    assert resolve("none")[1] == "the description has no compute shader"
+    assert resolve(carved / "cs_a.dxbc", "--flags", "1")[1] == "pipeline state flags 0x1 are not supported"
+    assert resolve(carved / "cs_a.dxbc", "--node", "2")[1] == "node mask 0x2 names a GPU node other than the first"
+    assert resolve(carved / "cs_a.dxbc", "--node", "1")[0] == "ok"
+
+    names = [carved / "cs_a.dxbc", carved / "cs_b.dxbc", carved / "cs_a.dxbc", carved / "ps_x.dxbc", carved / "cs_a.dxbc", carved / "cs_b.dxbc"]
+    listing = args.work / "containers.txt"
+    listing.write_text("".join(f"{name}\n" for name in names), encoding="utf-8")
+    cache = args.work / "cache.bin"
+    command = [args.probe, "compute", store, listing, "--cache", cache, "--threads", "4", "--save"]
+    probe = subprocess.run([str(part) for part in command], capture_output=True, text=True, env=env, timeout=600)
+    print(probe.stdout.strip())
+    if probe.returncode == 3:
+        print("SKIP pipeline creation: no usable Vulkan device")
+        print("PASS pipeline_state (resolution only)")
+        return
+    assert probe.returncode == 0, (probe.stdout[-2000:], probe.stderr[-2000:])
+    keys = {str(name) for name in names}
+    first = rows(probe.stdout, keys)
+    for name in (carved / "cs_a.dxbc", carved / "cs_b.dxbc"):
+        entries = first[str(name)]
+        assert {entry["origin"] for entry in entries} <= {"ready", "compiled"} and len({entry["origin"] for entry in entries}) == 1, (name, entries)
+        assert all(entry["bytes"] == len(shaders[name.stem][2]) for entry in entries), entries
+    assert first[str(carved / "ps_x.dxbc")][0]["error"].startswith("the shader store has stage ps"), first
+    counted = stats(probe.stdout)
+    assert counted["ready"] + counted["compiled"] == 2 and counted["refused"] == 0 and counted["failed"] == 0, counted
+    cache_control = "pipeline cache control yes" in probe.stdout
+
+    second = run(command, env)
+    if cache_control:
+        assert stats(second) == {"ready": 2, "compiled": 0, "refused": 0, "failed": 0}, second
+
+    fresh = args.work / "fresh.bin"
+    limited = args.work / "limited.txt"
+    limited.write_text(f"{carved / 'cs_new.dxbc'}\n{carved / 'cs_a.dxbc'}\n", encoding="utf-8")
+    output = run([args.probe, "compute", store, limited, "--cache", fresh, "--limit", "16"], env)
+    counted = stats(output)
+    assert counted["compiled"] == 0 and counted["failed"] == 0 and counted["refused"] + counted["ready"] == 2, counted
+    for entry in sum(rows(output, {str(carved / "cs_new.dxbc"), str(carved / "cs_a.dxbc")}).values(), []):
+        if entry["origin"] == "refused":
+            expected = "build the cache offline" if cache_control else "cannot tell whether the pipeline cache holds it"
+            assert expected in entry["error"], entry
+    print(f"over the limit with an empty cache: {counted['refused']} refused, {counted['ready']} ready from the driver's own cache")
+
+    output = run([args.probe, "compute", store, limited, "--cache", fresh, "--limit", "100000"], env)
+    assert stats(output)["failed"] == 0 and stats(output)["refused"] == 0, output
+    print("PASS pipeline_state")
+
+
+if __name__ == "__main__":
+    main()

@@ -75,6 +75,7 @@ const FeatureEntry kLayoutFeatures[] = {
 const FeatureEntry kOptionalFeatures[] = {
     {"subgroupSizeControl", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.subgroupSizeControl; }},
     {"computeFullSubgroups", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.computeFullSubgroups; }},
+    {"pipelineCreationCacheControl", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.pipelineCreationCacheControl; }},
 };
 
 const FeatureEntry* FindFeature(const std::string& name) {
@@ -398,6 +399,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         }
     }
     subgroupSizeControl_ = supported.v13.subgroupSizeControl == VK_TRUE;
+    pipelineCacheControl_ = supported.v13.pipelineCreationCacheControl == VK_TRUE;
     if (requirements.hostMemoryImport) {
         useExtensions.insert(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};

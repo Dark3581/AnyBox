@@ -63,6 +63,17 @@ if(Python3_FOUND)
             --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR} --tool ${CMAKE_SOURCE_DIR}/tools/shader_store.py --work ${CMAKE_CURRENT_BINARY_DIR}/shader_store)
 endif()
 
+add_executable(pso_probe PsoProbe.cpp)
+target_link_libraries(pso_probe PRIVATE d3d12_x_pso)
+target_include_directories(pso_probe PRIVATE ${ANYBOX_LIBS_INCLUDE})
+anybox_static_runtime(pso_probe)
+
+if(Python3_FOUND)
+    add_test(NAME pipeline_state
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_state_test.py
+            --probe $<TARGET_FILE:pso_probe> --libs ${ANYBOX_LIBS_DIR} --tool ${CMAKE_SOURCE_DIR}/tools/shader_store.py --work ${CMAKE_CURRENT_BINARY_DIR}/pipeline_state)
+endif()
+
 if(Python3_FOUND)
     add_test(NAME pipeline_probe
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_probe_test.py
@@ -71,11 +82,11 @@ if(Python3_FOUND)
 endif()
 
 if(ANYBOX_SHADERS_ENABLED)
-    foreach(check IN ITEMS store gpu layout compute pipelines)
+    foreach(check IN ITEMS store gpu layout compute pso pipelines)
         add_test(NAME shaders_${check}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/shader_build_test.py
                 --shaders ${ANYBOX_SHADER_DIR} --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR}
-                --pipeline-probe $<TARGET_FILE:pipeline_probe> --build-dir ${CMAKE_BINARY_DIR} --check ${check})
+                --pipeline-probe $<TARGET_FILE:pipeline_probe> --pso-probe $<TARGET_FILE:pso_probe> --build-dir ${CMAKE_BINARY_DIR} --check ${check})
         set_tests_properties(shaders_${check} PROPERTIES LABELS shaders TIMEOUT 1800 SKIP_REGULAR_EXPRESSION "SKIP ")
     endforeach()
 endif()

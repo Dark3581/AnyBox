@@ -79,7 +79,7 @@ python tools/shader_store.py build <carved folder> <translated folder> <out>\sha
 python tools/shader_store.py lookup <out>\shaders <container.dxbc>
 ```
 
-`build` writes `modules.txt` (one `<sha256> <stage> <path>` line per module, tab-separated, paths relative to the store) and `modules.json` (the translator's details per module). Byte-identical containers share a module; a hash whose copies translate to different modules or stages is left out and counted. `d3d12_x` loads `modules.txt` from `ANYBOX_SHADER_STORE`, or from `shaders` beside the executable. The store is built from your own copy and stays on your machine: never commit it or attach it to an issue.
+`build` writes `modules.txt` (one `<sha256> <stage> <subgroup> <path>` line per module, tab-separated; the subgroup size a pipeline must require is `32`, `64` or `0` for any; paths are relative to the store) and `modules.json` (the translator's details per module). Byte-identical containers share a module; a hash whose copies translate to different modules or stages is left out and counted. `d3d12_x` loads `modules.txt` from `ANYBOX_SHADER_STORE`, or from `shaders` beside the executable. The store is built from your own copy and stays on your machine: never commit it or attach it to an issue.
 
 ## Building shaders with the project
 
@@ -118,6 +118,7 @@ Each step writes `build/shaders/build.json`: the translator's revision and wheth
 | `shaders_gpu` | At least one Vulkan device supports what every stored module needs (`tools/gpu_report.py`). Skipped without Vulkan. |
 | `shaders_layout` | Every stored module's descriptor bindings (read from its SPIR-V by `tools/spirv_layout.py`) and push constant size fit the title layout `d3d12_x` creates pipelines with (`anybox-pipeline-probe layout`). |
 | `shaders_compute` | An evenly spaced sample of 60 compute modules up to 1 MiB compiles through `d3d12_x`'s own device and pipeline code, under the Khronos validation layer when it is installed (any validation error fails the test). Skipped without a usable Vulkan device. |
+| `shaders_pso` | 12 compute shaders up to 1 MiB and the largest compute shader go from their carved containers through the store and `d3d12_x`'s pipeline state path, with a 1 MiB run-time compile limit. With an empty cache the small ones are created and the largest is refused rather than compiled (or found in the driver's own cache). With `build/shaders/pipeline_cache.bin` every one must come from the cache once `shaders_pipelines` passes. Skipped without a usable Vulkan device. |
 | `shaders_pipelines` | The last `shader_pipelines` run covered every entry, every chunk completed, and no module or pipeline failed. Skipped until it has run. |
 
 `build.json` and the logs name shaders: like the store, they stay on your machine.

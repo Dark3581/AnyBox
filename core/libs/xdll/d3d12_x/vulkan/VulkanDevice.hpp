@@ -98,6 +98,7 @@ public:
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
     const std::vector<std::string>& EnabledExtensions() const { return extensions_; }
     bool CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const;
+    bool PipelineCacheControl() const { return pipelineCacheControl_; }
     std::size_t ValidationErrors() const;
     std::vector<std::string> ValidationMessages() const;
 
@@ -128,6 +129,7 @@ private:
     VkDeviceSize hostImportAlignment_ = 0;
     PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties_ = nullptr;
     bool subgroupSizeControl_ = false;
+    bool pipelineCacheControl_ = false;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     std::vector<std::string> enabled_;
