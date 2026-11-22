@@ -6,10 +6,13 @@ from pathlib import Path
 
 MAGIC = 0x07230203
 OP_DECORATE, OP_VARIABLE, OP_CONSTANT, OP_FUNCTION = 71, 59, 43, 54
+OP_TYPE_INT, OP_TYPE_FLOAT = 21, 22
 OP_TYPE_IMAGE, OP_TYPE_SAMPLER, OP_TYPE_ARRAY, OP_TYPE_RUNTIME_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER = 25, 26, 28, 29, 30, 32
 DECORATION_BINDING, DECORATION_SET = 33, 34
 STORAGE_UNIFORM_CONSTANT, STORAGE_UNIFORM, STORAGE_STORAGE_BUFFER = 0, 2, 12
 DIMS = {0: "1d", 1: "2d", 2: "3d"}
+FORMATS = {0: "unknown", 33: "r32ui"}
+FIELDS = ("type", "dim", "arrayed", "component", "format")
 
 
 class LayoutError(Exception):
@@ -27,7 +30,7 @@ def check_header(data):
 def descriptor_bindings(data):
     count = check_header(data)
     types, constants, binding, descriptor_set, variables = {}, {}, {}, {}, []
-    wanted = (OP_DECORATE, OP_TYPE_IMAGE, OP_TYPE_SAMPLER, OP_TYPE_ARRAY, OP_TYPE_RUNTIME_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER, OP_CONSTANT, OP_VARIABLE)
+    wanted = (OP_DECORATE, OP_TYPE_INT, OP_TYPE_FLOAT, OP_TYPE_IMAGE, OP_TYPE_SAMPLER, OP_TYPE_ARRAY, OP_TYPE_RUNTIME_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER, OP_CONSTANT, OP_VARIABLE)
     index = 5
     while index < count:
         (word,) = struct.unpack_from("<I", data, index * 4)
@@ -42,7 +45,7 @@ def descriptor_bindings(data):
         operands = struct.unpack_from(f"<{length - 1}I", data, index * 4 + 4)
         if opcode == OP_DECORATE and len(operands) >= 3 and operands[1] in (DECORATION_BINDING, DECORATION_SET):
             (binding if operands[1] == DECORATION_BINDING else descriptor_set)[operands[0]] = operands[2]
-        elif opcode in (OP_TYPE_IMAGE, OP_TYPE_SAMPLER, OP_TYPE_ARRAY, OP_TYPE_RUNTIME_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER):
+        elif opcode in (OP_TYPE_INT, OP_TYPE_FLOAT, OP_TYPE_IMAGE, OP_TYPE_SAMPLER, OP_TYPE_ARRAY, OP_TYPE_RUNTIME_ARRAY, OP_TYPE_STRUCT, OP_TYPE_POINTER):
             types[operands[0]] = (opcode, operands[1:])
         elif opcode == OP_CONSTANT and len(operands) >= 3:
             constants[operands[1]] = operands[2]
@@ -70,11 +73,19 @@ def descriptor_bindings(data):
             dim, arrayed, sampled = rest[1], rest[3], rest[5]
             if dim not in DIMS or sampled not in (1, 2):
                 raise LayoutError(f"binding {binding[variable]} is an image of dim {dim}, sampled {sampled}")
-            entry = {"type": "sampled_image" if sampled == 1 else "storage_image", "dim": DIMS[dim], "arrayed": bool(arrayed)}
+            component_type = types.get(rest[0], (None, ()))
+            if component_type[0] == OP_TYPE_FLOAT:
+                component = "float"
+            elif component_type[0] == OP_TYPE_INT:
+                component = "sint" if component_type[1][1] else "uint"
+            else:
+                raise LayoutError(f"binding {binding[variable]} samples an unsupported component type")
+            entry = {"type": "sampled_image" if sampled == 1 else "storage_image", "dim": DIMS[dim], "arrayed": bool(arrayed),
+                     "component": component, "format": FORMATS.get(rest[6], f"format{rest[6]}")}
         elif opcode == OP_TYPE_SAMPLER:
-            entry = {"type": "sampler", "dim": "none", "arrayed": False}
+            entry = {"type": "sampler", "dim": "none", "arrayed": False, "component": "none", "format": "none"}
         elif opcode == OP_TYPE_STRUCT and storage in (STORAGE_STORAGE_BUFFER, STORAGE_UNIFORM):
-            entry = {"type": "storage_buffer" if storage == STORAGE_STORAGE_BUFFER else "uniform_buffer", "dim": "none", "arrayed": False}
+            entry = {"type": "storage_buffer" if storage == STORAGE_STORAGE_BUFFER else "uniform_buffer", "dim": "none", "arrayed": False, "component": "none", "format": "none"}
         else:
             raise LayoutError(f"binding {binding[variable]} has an unsupported type (opcode {opcode})")
         entry["count"] = count
@@ -90,7 +101,7 @@ def mismatches(found, layout):
         if spec is None:
             problems.append(f"set {key[0]} binding {key[1]} is not in the layout")
             continue
-        for field in ("type", "dim", "arrayed"):
+        for field in FIELDS:
             if entry[field] != spec[field]:
                 problems.append(f"binding {key[1]}: {field} {entry[field]}, the layout has {spec[field]}")
         if entry["count"] is not None and entry["count"] > spec["count"]:

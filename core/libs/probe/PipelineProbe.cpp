@@ -1,3 +1,5 @@
+#include "BindlessSet.hpp"
+#include "DescriptorTable.hpp"
 #include "PipelineCompiler.hpp"
 #include "TitleLayout.hpp"
 #include "VulkanDevice.hpp"
@@ -48,6 +50,10 @@ const std::uint32_t kOversizedPushConstants[] = {
 };
 
 constexpr int kNoValidation = 4;
+
+const std::uint32_t kDescriptorLookup[] = {
+#include "shaders/descriptor_lookup.inc"
+};
 
 int Fail(const std::string& what) {
     std::printf("FAIL %s\n", what.c_str());
@@ -194,6 +200,138 @@ int ValidationSelfTest(const std::filesystem::path& work) {
     return 0;
 }
 
+class KeySource {
+public:
+    explicit KeySource(std::uint32_t seed) : state_(seed) {}
+    std::uint32_t Next() {
+        std::uint32_t value = state_ += 0x9E3779B9u;
+        value = (value ^ (value >> 16)) * 0x7FEB352Du;
+        value = (value ^ (value >> 15)) * 0x846CA68Bu;
+        return value ^ (value >> 16);
+    }
+    DescriptorKey Image() {
+        std::uint32_t words[8];
+        for (std::uint32_t& word : words) word = Next();
+        return ImageKey(words);
+    }
+    DescriptorKey Sampler() {
+        std::uint32_t words[4];
+        for (std::uint32_t& word : words) word = Next();
+        return SamplerKey(words);
+    }
+
+private:
+    std::uint32_t state_;
+};
+
+int Bindless(const std::filesystem::path& work, bool validate) {
+    const DescriptorKey zero{};
+    const std::uint32_t countingWords[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::uint32_t samplerWords[4] = {0x92, 0xC00000, 0x14500000, 0};
+    const DescriptorKey sampler = SamplerKey(samplerWords);
+    if (DescriptorHash(zero) != 0x9BE17165u || DescriptorHash(ImageKey(countingWords)) != 0x2804678Du || DescriptorHash(sampler) != 0x606295D3u) {
+        return Fail("descriptor hash vectors");
+    }
+    if (sampler[3] != 0 || sampler[4] != 0xFFFFFFFFu || sampler[7] != 0xFFFFFFFFu) return Fail("sampler key padding");
+
+    DeviceRequirements requirements;
+    requirements.features.insert("bufferDeviceAddress");
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const std::unique_ptr<BindlessSet> set = BindlessSet::Create(*device, error);
+    if (!set) return Fail("bindless set: " + error);
+
+    DescriptorHashTable& table = set->Table();
+    const std::uint32_t initialSlots = table.Mask() + 1;
+    if (table.Insert(zero, 5) || table.Insert(sampler, 0)) return Fail("the zero key and index 0 must be refused");
+    KeySource source(12345);
+    std::vector<std::pair<DescriptorKey, std::uint32_t>> expected;
+    for (std::uint32_t index = 1; index <= 3000; ++index) {
+        const DescriptorKey key = source.Image();
+        if (!table.Insert(key, index)) return Fail("insert");
+        expected.emplace_back(key, index);
+    }
+    for (std::uint32_t index = 0; index < 200; ++index) {
+        const DescriptorKey key = source.Sampler();
+        if (!table.Insert(key, 4001 + index)) return Fail("insert sampler");
+        expected.emplace_back(key, 4001 + index);
+    }
+    if (!table.Insert(expected[7].first, 7777)) return Fail("replace");
+    expected[7].second = 7777;
+    for (std::size_t item = 0; item < 3000; item += 10) {
+        if (!table.Erase(expected[item].first)) return Fail("erase");
+        expected[item].second = 0;
+    }
+    if (table.Erase(expected[0].first)) return Fail("erase twice");
+    for (std::uint32_t index = 0; index < 500; ++index) expected.emplace_back(source.Image(), 0);
+    expected.emplace_back(zero, 0);
+    if (table.Size() != 3200 - 300 || table.Mask() + 1 <= initialSlots) return Fail("table size or growth");
+    for (const auto& [key, index] : expected) {
+        if (table.Lookup(key) != index) return Fail("CPU lookup");
+    }
+    if (!set->Upload(error)) return Fail("upload: " + error);
+
+    const std::uint32_t count = static_cast<std::uint32_t>(expected.size());
+    DeviceBuffer keys, results;
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (!CreateHostBuffer(*device, count * 32ull, usage, keys, error) || !CreateHostBuffer(*device, count * 4ull, usage, results, error)) {
+        return Fail("buffers: " + error);
+    }
+    for (std::uint32_t item = 0; item < count; ++item) {
+        std::memcpy(static_cast<char*>(keys.mapped) + item * 32ull, expected[item].first.data(), 32);
+    }
+    std::memset(results.mapped, 0xCD, count * 4ull);
+    std::filesystem::create_directories(work);
+    const std::filesystem::path shader = work / "descriptor_lookup.spv";
+    std::ofstream(shader, std::ios::binary).write(reinterpret_cast<const char*>(kDescriptorLookup), sizeof(kDescriptorLookup));
+    PipelineCache cache(*device, {});
+    ComputePipeline pipeline;
+    const CompileOutcome outcome = CompileCompute(*device, cache.Handle(), {"descriptor_lookup", shader, 0}, &pipeline);
+    if (!outcome.ok) return Fail("lookup shader: " + outcome.error);
+    struct {
+        VkDeviceAddress keys;
+        VkDeviceAddress results;
+        std::uint32_t count;
+    } constants{keys.address, results.address, count};
+    const DeviceFunctions& vk = device->Vk();
+    const VkDescriptorSet descriptorSet = set->Set();
+    const bool submitted = device->Submit(
+        [&](VkCommandBuffer commands) {
+            vk.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle());
+            vk.cmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, device->TitlePipelineLayout(), 0, 1, &descriptorSet, 0, nullptr);
+            vk.cmdPushConstants(commands, device->TitlePipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(constants), &constants);
+            vk.cmdDispatch(commands, (count + 63) / 64, 1, 1);
+            VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vk.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        },
+        error);
+    if (!submitted) return Fail("dispatch: " + error);
+    std::size_t wrong = 0;
+    for (std::uint32_t item = 0; item < count; ++item) {
+        const std::uint32_t got = static_cast<const std::uint32_t*>(results.mapped)[item];
+        if (got != expected[item].second && wrong++ < 5) std::printf("item %u: GPU %u, expected %u\n", item, got, expected[item].second);
+    }
+    DestroyBuffer(*device, keys);
+    DestroyBuffer(*device, results);
+    std::printf("table: %zu entries in %u slots (started at %u), %zu fallback images; GPU lookups: %u, wrong: %zu\n", table.Size(), table.Mask() + 1, initialSlots,
+                set->FallbackImages(), count, wrong);
+    if (wrong != 0) return Fail("GPU lookups differ from the table");
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.400s\n", message.c_str());
+        if (device->ValidationErrors() != 0) return 1;
+    }
+    std::puts("PASS bindless");
+    return 0;
+}
+
 int Compile(int argc, char** argv) {
     const std::string jobsFile = FindOption(argc, argv, "--jobs-file", "");
     if (jobsFile.empty()) return Fail("--jobs-file is required");
@@ -253,7 +391,7 @@ int Compile(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) return Fail("usage: anybox-pipeline-probe layout | selftest <work folder> | validation <work folder> | compile --jobs-file <file> [--features a,b] [--maintenance8] [--validate] [--cache <file>] [--workers N] [--exclusive-bytes N]");
+    if (argc < 2) return Fail("usage: anybox-pipeline-probe layout | selftest <work folder> | validation <work folder> | bindless <work folder> [--validate] | compile --jobs-file <file> [--features a,b] [--maintenance8] [--validate] [--cache <file>] [--workers N] [--exclusive-bytes N]");
     const std::string command = argv[1];
     if (command == "layout") {
         std::fputs(TitleLayoutJson().c_str(), stdout);
@@ -262,5 +400,6 @@ int main(int argc, char** argv) {
     if (command == "selftest" && argc == 3) return SelfTest(Utf8Path(argv[2]));
     if (command == "validation" && argc == 3) return ValidationSelfTest(Utf8Path(argv[2]));
     if (command == "compile") return Compile(argc, argv);
+    if (command == "bindless" && argc >= 3) return Bindless(Utf8Path(argv[2]), HasFlag(argc, argv, "--validate"));
     return Fail("unknown command");
 }

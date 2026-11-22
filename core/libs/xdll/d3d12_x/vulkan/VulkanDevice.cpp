@@ -375,6 +375,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     getFeatures2(physical_, &supported.core);
     FeatureChain enabled;
     std::set<std::string> useExtensions;
+    bufferDeviceAddress_ = requirements.features.count("bufferDeviceAddress") != 0;
     for (const std::string& feature : requirements.features) {
         const FeatureEntry* entry = FindFeature(feature);
         entry->field(enabled) = VK_TRUE;
@@ -436,6 +437,42 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.destroyDescriptorSetLayout = DeviceFunction<PFN_vkDestroyDescriptorSetLayout>(getDeviceProcAddr, device_, "vkDestroyDescriptorSetLayout");
     vk_.createPipelineLayout = DeviceFunction<PFN_vkCreatePipelineLayout>(getDeviceProcAddr, device_, "vkCreatePipelineLayout");
     vk_.destroyPipelineLayout = DeviceFunction<PFN_vkDestroyPipelineLayout>(getDeviceProcAddr, device_, "vkDestroyPipelineLayout");
+    vk_.createBuffer = DeviceFunction<PFN_vkCreateBuffer>(getDeviceProcAddr, device_, "vkCreateBuffer");
+    vk_.destroyBuffer = DeviceFunction<PFN_vkDestroyBuffer>(getDeviceProcAddr, device_, "vkDestroyBuffer");
+    vk_.getBufferMemoryRequirements = DeviceFunction<PFN_vkGetBufferMemoryRequirements>(getDeviceProcAddr, device_, "vkGetBufferMemoryRequirements");
+    vk_.allocateMemory = DeviceFunction<PFN_vkAllocateMemory>(getDeviceProcAddr, device_, "vkAllocateMemory");
+    vk_.freeMemory = DeviceFunction<PFN_vkFreeMemory>(getDeviceProcAddr, device_, "vkFreeMemory");
+    vk_.bindBufferMemory = DeviceFunction<PFN_vkBindBufferMemory>(getDeviceProcAddr, device_, "vkBindBufferMemory");
+    vk_.mapMemory = DeviceFunction<PFN_vkMapMemory>(getDeviceProcAddr, device_, "vkMapMemory");
+    vk_.unmapMemory = DeviceFunction<PFN_vkUnmapMemory>(getDeviceProcAddr, device_, "vkUnmapMemory");
+    vk_.createImage = DeviceFunction<PFN_vkCreateImage>(getDeviceProcAddr, device_, "vkCreateImage");
+    vk_.destroyImage = DeviceFunction<PFN_vkDestroyImage>(getDeviceProcAddr, device_, "vkDestroyImage");
+    vk_.getImageMemoryRequirements = DeviceFunction<PFN_vkGetImageMemoryRequirements>(getDeviceProcAddr, device_, "vkGetImageMemoryRequirements");
+    vk_.bindImageMemory = DeviceFunction<PFN_vkBindImageMemory>(getDeviceProcAddr, device_, "vkBindImageMemory");
+    vk_.createImageView = DeviceFunction<PFN_vkCreateImageView>(getDeviceProcAddr, device_, "vkCreateImageView");
+    vk_.destroyImageView = DeviceFunction<PFN_vkDestroyImageView>(getDeviceProcAddr, device_, "vkDestroyImageView");
+    vk_.createSampler = DeviceFunction<PFN_vkCreateSampler>(getDeviceProcAddr, device_, "vkCreateSampler");
+    vk_.destroySampler = DeviceFunction<PFN_vkDestroySampler>(getDeviceProcAddr, device_, "vkDestroySampler");
+    vk_.createDescriptorPool = DeviceFunction<PFN_vkCreateDescriptorPool>(getDeviceProcAddr, device_, "vkCreateDescriptorPool");
+    vk_.destroyDescriptorPool = DeviceFunction<PFN_vkDestroyDescriptorPool>(getDeviceProcAddr, device_, "vkDestroyDescriptorPool");
+    vk_.allocateDescriptorSets = DeviceFunction<PFN_vkAllocateDescriptorSets>(getDeviceProcAddr, device_, "vkAllocateDescriptorSets");
+    vk_.updateDescriptorSets = DeviceFunction<PFN_vkUpdateDescriptorSets>(getDeviceProcAddr, device_, "vkUpdateDescriptorSets");
+    vk_.createCommandPool = DeviceFunction<PFN_vkCreateCommandPool>(getDeviceProcAddr, device_, "vkCreateCommandPool");
+    vk_.destroyCommandPool = DeviceFunction<PFN_vkDestroyCommandPool>(getDeviceProcAddr, device_, "vkDestroyCommandPool");
+    vk_.allocateCommandBuffers = DeviceFunction<PFN_vkAllocateCommandBuffers>(getDeviceProcAddr, device_, "vkAllocateCommandBuffers");
+    vk_.beginCommandBuffer = DeviceFunction<PFN_vkBeginCommandBuffer>(getDeviceProcAddr, device_, "vkBeginCommandBuffer");
+    vk_.endCommandBuffer = DeviceFunction<PFN_vkEndCommandBuffer>(getDeviceProcAddr, device_, "vkEndCommandBuffer");
+    vk_.cmdPipelineBarrier = DeviceFunction<PFN_vkCmdPipelineBarrier>(getDeviceProcAddr, device_, "vkCmdPipelineBarrier");
+    vk_.cmdBindPipeline = DeviceFunction<PFN_vkCmdBindPipeline>(getDeviceProcAddr, device_, "vkCmdBindPipeline");
+    vk_.cmdBindDescriptorSets = DeviceFunction<PFN_vkCmdBindDescriptorSets>(getDeviceProcAddr, device_, "vkCmdBindDescriptorSets");
+    vk_.cmdPushConstants = DeviceFunction<PFN_vkCmdPushConstants>(getDeviceProcAddr, device_, "vkCmdPushConstants");
+    vk_.cmdDispatch = DeviceFunction<PFN_vkCmdDispatch>(getDeviceProcAddr, device_, "vkCmdDispatch");
+    vk_.cmdClearColorImage = DeviceFunction<PFN_vkCmdClearColorImage>(getDeviceProcAddr, device_, "vkCmdClearColorImage");
+    vk_.queueSubmit = DeviceFunction<PFN_vkQueueSubmit>(getDeviceProcAddr, device_, "vkQueueSubmit");
+    vk_.createFence = DeviceFunction<PFN_vkCreateFence>(getDeviceProcAddr, device_, "vkCreateFence");
+    vk_.destroyFence = DeviceFunction<PFN_vkDestroyFence>(getDeviceProcAddr, device_, "vkDestroyFence");
+    vk_.waitForFences = DeviceFunction<PFN_vkWaitForFences>(getDeviceProcAddr, device_, "vkWaitForFences");
+    vk_.getBufferDeviceAddress = DeviceFunction<PFN_vkGetBufferDeviceAddress>(getDeviceProcAddr, device_, "vkGetBufferDeviceAddress");
     if (vk_.destroyDevice == nullptr) {
         error = "vkDestroyDevice is not available";
         return false;
@@ -447,6 +484,13 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
             return false;
         }
     }
+    vk_.getDeviceQueue(device_, queueFamily_, 0, &queue_);
+    const auto getMemoryProperties = LoadInstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties>(loader, rawInstance, "vkGetPhysicalDeviceMemoryProperties");
+    if (getMemoryProperties == nullptr || queue_ == VK_NULL_HANDLE) {
+        error = "no device queue or memory properties";
+        return false;
+    }
+    getMemoryProperties(physical_, &memory_);
     return true;
 }
 
@@ -512,6 +556,61 @@ std::size_t VulkanDevice::ValidationErrors() const {
 std::vector<std::string> VulkanDevice::ValidationMessages() const {
     std::lock_guard<std::mutex> guard(messagesLock_);
     return validationMessages_;
+}
+
+std::optional<std::uint32_t> VulkanDevice::MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const {
+    for (std::uint32_t index = 0; index < memory_.memoryTypeCount; ++index) {
+        if ((typeBits & (1u << index)) != 0 && (memory_.memoryTypes[index].propertyFlags & required) == required) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+bool VulkanDevice::Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const {
+    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolInfo.queueFamilyIndex = queueFamily_;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (vk_.createCommandPool(device_, &poolInfo, nullptr, &pool) != VK_SUCCESS) {
+        error = "vkCreateCommandPool failed";
+        return false;
+    }
+    VkFence fence = VK_NULL_HANDLE;
+    const auto cleanup = [&] {
+        if (fence != VK_NULL_HANDLE) vk_.destroyFence(device_, fence, nullptr);
+        vk_.destroyCommandPool(device_, pool, nullptr);
+    };
+    VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocateInfo.commandPool = pool;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandBufferCount = 1;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vk_.allocateCommandBuffers(device_, &allocateInfo, &commands) != VK_SUCCESS || vk_.beginCommandBuffer(commands, &begin) != VK_SUCCESS) {
+        cleanup();
+        error = "cannot start a command buffer";
+        return false;
+    }
+    record(commands);
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &commands;
+    if (vk_.endCommandBuffer(commands) != VK_SUCCESS || vk_.createFence(device_, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+        cleanup();
+        error = "cannot finish a command buffer";
+        return false;
+    }
+    const VkResult submitted = vk_.queueSubmit(queue_, 1, &submit, fence);
+    const VkResult waited = submitted == VK_SUCCESS ? vk_.waitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX) : submitted;
+    cleanup();
+    if (waited != VK_SUCCESS) {
+        error = "vkQueueSubmit or vkWaitForFences failed with " + std::to_string(static_cast<int>(waited));
+        return false;
+    }
+    return true;
 }
 
 bool VulkanDevice::CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const {

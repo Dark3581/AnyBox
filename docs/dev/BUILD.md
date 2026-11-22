@@ -23,13 +23,21 @@ Outputs:
 - `build/anybox-relinker.exe`
 - `build/anybox-module-probe.exe`, used by `tools/module_check.py`
 - `build/anybox-gpu-report.exe`, used by `tools/gpu_report.py`
-- `build/anybox-pipeline-probe.exe`, which creates `d3d12_x`'s Vulkan device and compiles compute pipelines (`layout`, `selftest`, `validation`, `compile`)
+- `build/anybox-pipeline-probe.exe`, which creates `d3d12_x`'s Vulkan device and compiles compute pipelines (`layout`, `selftest`, `validation`, `compile`, `bindless`)
 - `build/libs/ab_*.dll`, including `ab_runtime.dll`
 - `build/libs/anybox-libs.map`, the DLL routing table
 
 ## Shaders (optional)
 
 With `-DANYBOX_GAME_PACKAGE` and `-DANYBOX_SHADER_TRANSLATOR`, the build gets `shaders` and `shader_pipelines` targets that build a title's shader set from your own package into `build/shaders`, and tests labelled `shaders` that check it. See [Building shaders with the project](GAME_TESTING.md#building-shaders-with-the-project).
+
+## Probe shaders
+
+The probes run a few test shaders, compiled ahead of time so the build needs no shader compiler. Each `core/libs/probe/shaders/<name>.comp` sits next to its compiled `<name>.inc`; after editing one, regenerate it with the Vulkan SDK's `glslc`:
+
+```
+glslc --target-env=vulkan1.3 -O -mfmt=num core/libs/probe/shaders/<name>.comp -o core/libs/probe/shaders/<name>.inc
+```
 
 ## Relinker only
 

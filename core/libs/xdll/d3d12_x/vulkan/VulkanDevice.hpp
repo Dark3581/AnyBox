@@ -4,8 +4,10 @@
 #include "VulkanLoader.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -32,6 +34,42 @@ struct DeviceFunctions {
     PFN_vkDestroyDescriptorSetLayout destroyDescriptorSetLayout = nullptr;
     PFN_vkCreatePipelineLayout createPipelineLayout = nullptr;
     PFN_vkDestroyPipelineLayout destroyPipelineLayout = nullptr;
+    PFN_vkCreateBuffer createBuffer = nullptr;
+    PFN_vkDestroyBuffer destroyBuffer = nullptr;
+    PFN_vkGetBufferMemoryRequirements getBufferMemoryRequirements = nullptr;
+    PFN_vkAllocateMemory allocateMemory = nullptr;
+    PFN_vkFreeMemory freeMemory = nullptr;
+    PFN_vkBindBufferMemory bindBufferMemory = nullptr;
+    PFN_vkMapMemory mapMemory = nullptr;
+    PFN_vkUnmapMemory unmapMemory = nullptr;
+    PFN_vkCreateImage createImage = nullptr;
+    PFN_vkDestroyImage destroyImage = nullptr;
+    PFN_vkGetImageMemoryRequirements getImageMemoryRequirements = nullptr;
+    PFN_vkBindImageMemory bindImageMemory = nullptr;
+    PFN_vkCreateImageView createImageView = nullptr;
+    PFN_vkDestroyImageView destroyImageView = nullptr;
+    PFN_vkCreateSampler createSampler = nullptr;
+    PFN_vkDestroySampler destroySampler = nullptr;
+    PFN_vkCreateDescriptorPool createDescriptorPool = nullptr;
+    PFN_vkDestroyDescriptorPool destroyDescriptorPool = nullptr;
+    PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
+    PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
+    PFN_vkCreateCommandPool createCommandPool = nullptr;
+    PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
+    PFN_vkAllocateCommandBuffers allocateCommandBuffers = nullptr;
+    PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
+    PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
+    PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
+    PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
+    PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets = nullptr;
+    PFN_vkCmdPushConstants cmdPushConstants = nullptr;
+    PFN_vkCmdDispatch cmdDispatch = nullptr;
+    PFN_vkCmdClearColorImage cmdClearColorImage = nullptr;
+    PFN_vkQueueSubmit queueSubmit = nullptr;
+    PFN_vkCreateFence createFence = nullptr;
+    PFN_vkDestroyFence destroyFence = nullptr;
+    PFN_vkWaitForFences waitForFences = nullptr;
+    PFN_vkGetBufferDeviceAddress getBufferDeviceAddress = nullptr;
 };
 
 const std::vector<std::string>& KnownShaderFeatures();
@@ -49,6 +87,11 @@ public:
     const VkPhysicalDeviceProperties& Properties() const { return properties_; }
     std::uint32_t QueueFamily() const { return queueFamily_; }
     VkPipelineLayout TitlePipelineLayout() const { return pipelineLayout_; }
+    VkDescriptorSetLayout TitleSetLayout() const { return setLayout_; }
+    VkQueue Queue() const { return queue_; }
+    bool BufferDeviceAddress() const { return bufferDeviceAddress_; }
+    std::optional<std::uint32_t> MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
+    bool Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
     const std::vector<std::string>& EnabledExtensions() const { return extensions_; }
     bool CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const;
@@ -76,6 +119,9 @@ private:
     VkPhysicalDeviceProperties properties_{};
     VkPhysicalDeviceVulkan12Properties limits12_{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     std::uint32_t queueFamily_ = 0;
+    VkQueue queue_ = VK_NULL_HANDLE;
+    VkPhysicalDeviceMemoryProperties memory_{};
+    bool bufferDeviceAddress_ = false;
     bool subgroupSizeControl_ = false;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;

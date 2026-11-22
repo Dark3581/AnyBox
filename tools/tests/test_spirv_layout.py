@@ -30,11 +30,11 @@ MODULE = bytes.fromhex(
 )
 
 LAYOUT = {"set": 0, "pushConstantBytes": 144, "bindings": [
-    {"binding": 0, "type": "sampled_image", "dim": "2d", "arrayed": False, "count": 8192},
-    {"binding": 1, "type": "sampler", "dim": "none", "arrayed": False, "count": 2048},
-    {"binding": 2, "type": "storage_buffer", "dim": "none", "arrayed": False, "count": 1},
-    {"binding": 3, "type": "sampled_image", "dim": "2d", "arrayed": True, "count": 2048},
-    {"binding": 7, "type": "storage_image", "dim": "3d", "arrayed": False, "count": 256},
+    {"binding": 0, "type": "sampled_image", "dim": "2d", "arrayed": False, "component": "float", "format": "unknown", "count": 8192},
+    {"binding": 1, "type": "sampler", "dim": "none", "arrayed": False, "component": "none", "format": "none", "count": 2048},
+    {"binding": 2, "type": "storage_buffer", "dim": "none", "arrayed": False, "component": "none", "format": "none", "count": 1},
+    {"binding": 3, "type": "sampled_image", "dim": "2d", "arrayed": True, "component": "float", "format": "unknown", "count": 2048},
+    {"binding": 7, "type": "storage_image", "dim": "3d", "arrayed": False, "component": "float", "format": "unknown", "count": 256},
 ]}
 
 
@@ -42,11 +42,11 @@ class SpirvLayoutTest(unittest.TestCase):
     def test_reflects_every_binding(self):
         found = spirv_layout.descriptor_bindings(MODULE)
         self.assertEqual(found, {
-            (0, 0): {"type": "sampled_image", "dim": "2d", "arrayed": False, "count": None},
-            (0, 1): {"type": "sampler", "dim": "none", "arrayed": False, "count": None},
-            (0, 2): {"type": "storage_buffer", "dim": "none", "arrayed": False, "count": 1},
-            (0, 3): {"type": "sampled_image", "dim": "2d", "arrayed": True, "count": 4},
-            (0, 7): {"type": "storage_image", "dim": "3d", "arrayed": False, "count": None},
+            (0, 0): {"type": "sampled_image", "dim": "2d", "arrayed": False, "component": "float", "format": "unknown", "count": None},
+            (0, 1): {"type": "sampler", "dim": "none", "arrayed": False, "component": "none", "format": "none", "count": None},
+            (0, 2): {"type": "storage_buffer", "dim": "none", "arrayed": False, "component": "none", "format": "none", "count": 1},
+            (0, 3): {"type": "sampled_image", "dim": "2d", "arrayed": True, "component": "float", "format": "unknown", "count": 4},
+            (0, 7): {"type": "storage_image", "dim": "3d", "arrayed": False, "component": "float", "format": "unknown", "count": None},
         })
 
     def test_fits_its_layout(self):
@@ -57,6 +57,7 @@ class SpirvLayoutTest(unittest.TestCase):
         layout["bindings"][3]["arrayed"] = False
         layout["bindings"][3]["count"] = 2
         layout["bindings"][4]["type"] = "sampled_image"
+        layout["bindings"][4]["format"] = "r32ui"
         del layout["bindings"][1]
         problems = spirv_layout.mismatches(spirv_layout.descriptor_bindings(MODULE), layout)
         self.assertEqual(problems, [
@@ -64,6 +65,7 @@ class SpirvLayoutTest(unittest.TestCase):
             "binding 3: arrayed True, the layout has False",
             "binding 3: 4 descriptors, the layout has 2",
             "binding 7: type storage_image, the layout has sampled_image",
+            "binding 7: format unknown, the layout has r32ui",
         ])
 
     def test_rejects_what_is_not_spirv(self):

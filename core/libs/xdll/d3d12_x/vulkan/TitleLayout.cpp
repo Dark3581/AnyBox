@@ -4,33 +4,36 @@ namespace abx::d3d12x {
 
 namespace {
 
-BindingSpec Spec(std::uint32_t binding, DescriptorKind kind, ImageDim dim, bool arrayed, std::uint32_t count) {
-    return BindingSpec{binding, kind, dim, arrayed, count};
+BindingSpec Spec(std::uint32_t binding, DescriptorKind kind, ImageDim dim, bool arrayed, ImageComponent component, ImageFormat format, std::uint32_t count) {
+    return BindingSpec{binding, kind, dim, arrayed, component, format, count};
 }
 
 std::vector<BindingSpec> Build() {
     using K = DescriptorKind;
     using D = ImageDim;
+    using C = ImageComponent;
+    using F = ImageFormat;
     std::vector<BindingSpec> bindings = {
-        Spec(0, K::SampledImage, D::Dim2D, false, 8192),
-        Spec(1, K::Sampler, D::None, false, 2048),
-        Spec(2, K::StorageBuffer, D::None, false, 1),
-        Spec(3, K::SampledImage, D::Dim2D, true, 2048),
-        Spec(4, K::StorageImage, D::Dim2D, false, 1024),
-        Spec(5, K::SampledImage, D::Dim1D, false, 256),
-        Spec(6, K::SampledImage, D::Dim3D, false, 512),
-        Spec(7, K::StorageImage, D::Dim3D, false, 256),
+        Spec(0, K::SampledImage, D::Dim2D, false, C::Float, F::Unknown, 8192),
+        Spec(1, K::Sampler, D::None, false, C::None, F::None, 2048),
+        Spec(2, K::StorageBuffer, D::None, false, C::None, F::None, 1),
+        Spec(3, K::SampledImage, D::Dim2D, true, C::Float, F::Unknown, 2048),
+        Spec(4, K::StorageImage, D::Dim2D, false, C::Uint, F::R32ui, 1024),
+        Spec(5, K::SampledImage, D::Dim1D, false, C::Float, F::Unknown, 256),
+        Spec(6, K::SampledImage, D::Dim3D, false, C::Float, F::Unknown, 512),
+        Spec(7, K::StorageImage, D::Dim3D, false, C::Uint, F::R32ui, 256),
     };
     const ImageDim storageDims[] = {D::Dim2D, D::Dim2D, D::Dim3D};
     const bool storageArrayed[] = {false, true, false};
     const std::uint32_t storageCounts[] = {1024, 256, 256};
+    const ImageComponent components[] = {C::Float, C::Uint, C::Sint};
     for (std::uint32_t dim = 0; dim < 3; ++dim) {
         for (std::uint32_t component = 0; component < 3; ++component) {
-            bindings.push_back(Spec(8 + 3 * dim + component, K::StorageImage, storageDims[dim], storageArrayed[dim], storageCounts[dim]));
+            bindings.push_back(Spec(8 + 3 * dim + component, K::StorageImage, storageDims[dim], storageArrayed[dim], components[component], F::Unknown, storageCounts[dim]));
         }
     }
     for (std::uint32_t component = 0; component < 3; ++component) {
-        bindings.push_back(Spec(17 + component, K::StorageImage, D::Dim1D, false, 256));
+        bindings.push_back(Spec(17 + component, K::StorageImage, D::Dim1D, false, components[component], F::Unknown, 256));
     }
     return bindings;
 }
@@ -62,6 +65,25 @@ const char* DimName(ImageDim dim) {
     return "unknown";
 }
 
+const char* ComponentName(ImageComponent component) {
+    switch (component) {
+    case ImageComponent::None: return "none";
+    case ImageComponent::Float: return "float";
+    case ImageComponent::Uint: return "uint";
+    case ImageComponent::Sint: return "sint";
+    }
+    return "unknown";
+}
+
+const char* FormatName(ImageFormat format) {
+    switch (format) {
+    case ImageFormat::None: return "none";
+    case ImageFormat::Unknown: return "unknown";
+    case ImageFormat::R32ui: return "r32ui";
+    }
+    return "unknown";
+}
+
 std::string TitleLayoutJson() {
     std::string out = "{\"format\": \"anybox-title-layout\", \"version\": 1, \"set\": 0, \"pushConstantBytes\": " + std::to_string(kTitlePushConstantBytes) +
                       ", \"bindings\": [";
@@ -70,7 +92,8 @@ std::string TitleLayoutJson() {
         out += first ? "\n  " : ",\n  ";
         first = false;
         out += "{\"binding\": " + std::to_string(spec.binding) + ", \"type\": \"" + KindName(spec.kind) + "\", \"dim\": \"" + DimName(spec.dim) +
-               "\", \"arrayed\": " + (spec.arrayed ? "true" : "false") + ", \"count\": " + std::to_string(spec.count) + "}";
+               "\", \"arrayed\": " + (spec.arrayed ? "true" : "false") + ", \"component\": \"" + ComponentName(spec.component) +
+               "\", \"format\": \"" + FormatName(spec.format) + "\", \"count\": " + std::to_string(spec.count) + "}";
     }
     out += "\n]}\n";
     return out;

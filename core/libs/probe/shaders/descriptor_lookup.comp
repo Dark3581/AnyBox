@@ -1,0 +1,49 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorTable {
+    uint words[];
+} table;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Keys {
+    uint words[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Results {
+    uint words[];
+};
+
+layout(push_constant) uniform Lookup {
+    Keys keys;
+    Results results;
+    uint count;
+} lookup;
+
+void main() {
+    uint item = gl_GlobalInvocationID.x;
+    if (item >= lookup.count) {
+        return;
+    }
+    uint key[8];
+    uint hash = 2166136261u;
+    for (int word = 0; word < 8; ++word) {
+        key[word] = lookup.keys.words[item * 8u + uint(word)];
+        hash = (hash ^ key[word]) * 16777619u;
+    }
+    uint mask = table.words[0];
+    uint found = 0u;
+    for (uint probe = 0u; probe < 8u; ++probe) {
+        uint base = ((hash + probe) & mask) * 10u;
+        bool match = true;
+        for (int word = 0; word < 8; ++word) {
+            match = match && table.words[base + 1u + uint(word)] == key[word];
+        }
+        if (match) {
+            found = table.words[base + 9u];
+            break;
+        }
+    }
+    lookup.results.words[item] = found;
+}

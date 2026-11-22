@@ -4,11 +4,13 @@ import subprocess
 from pathlib import Path
 
 EXPECTED = {
-    0: ("sampled_image", "2d", False), 1: ("sampler", "none", False), 2: ("storage_buffer", "none", False),
-    3: ("sampled_image", "2d", True), 4: ("storage_image", "2d", False), 5: ("sampled_image", "1d", False),
-    6: ("sampled_image", "3d", False), 7: ("storage_image", "3d", False),
-    **{8 + i: ("storage_image", "2d", False) for i in range(3)}, **{11 + i: ("storage_image", "2d", True) for i in range(3)},
-    **{14 + i: ("storage_image", "3d", False) for i in range(3)}, **{17 + i: ("storage_image", "1d", False) for i in range(3)},
+    0: ("sampled_image", "2d", False, "float", "unknown"), 1: ("sampler", "none", False, "none", "none"),
+    2: ("storage_buffer", "none", False, "none", "none"), 3: ("sampled_image", "2d", True, "float", "unknown"),
+    4: ("storage_image", "2d", False, "uint", "r32ui"), 5: ("sampled_image", "1d", False, "float", "unknown"),
+    6: ("sampled_image", "3d", False, "float", "unknown"), 7: ("storage_image", "3d", False, "uint", "r32ui"),
+    **{8 + 3 * d + c: ("storage_image", dim, arrayed, component, "unknown")
+       for d, (dim, arrayed) in enumerate((("2d", False), ("2d", True), ("3d", False))) for c, component in enumerate(("float", "uint", "sint"))},
+    **{17 + c: ("storage_image", "1d", False, component, "unknown") for c, component in enumerate(("float", "uint", "sint"))},
 }
 
 
@@ -26,7 +28,7 @@ def main():
 
     layout = json.loads(run([args.probe, "layout"]).stdout)
     assert layout["format"] == "anybox-title-layout" and layout["set"] == 0 and layout["pushConstantBytes"] == 144, layout
-    found = {b["binding"]: (b["type"], b["dim"], b["arrayed"]) for b in layout["bindings"]}
+    found = {b["binding"]: (b["type"], b["dim"], b["arrayed"], b["component"], b["format"]) for b in layout["bindings"]}
     assert found == EXPECTED, found
     assert all(b["count"] >= 1 for b in layout["bindings"]) and next(b for b in layout["bindings"] if b["binding"] == 2)["count"] == 1, layout
 
@@ -44,6 +46,11 @@ def main():
         print("validation layer not installed: validation check not run")
     else:
         assert validation.returncode == 0 and "outside the VkPushConstantRange" in validation.stdout, (validation.returncode, validation.stdout)
+
+    bindless = run([args.probe, "bindless", args.work / "bindless", "--validate"])
+    if bindless.returncode == 4:
+        bindless = run([args.probe, "bindless", args.work / "bindless"])
+    assert bindless.returncode == 0 and "PASS bindless" in bindless.stdout and "wrong: 0" in bindless.stdout, (bindless.returncode, bindless.stdout)
     print("PASS pipeline_probe")
 
 
