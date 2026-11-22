@@ -28,6 +28,7 @@ constexpr std::uint64_t kTexturePitchAlignment = D3D12_TEXTURE_DATA_PITCH_ALIGNM
 constexpr std::uint64_t kTexturePlacementAlignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
 
 std::optional<CopyBlock> CopyBlockOf(DXGI_FORMAT format);
+std::optional<VkImageAspectFlags> PlaneAspect(VkImageAspectFlags aspects, std::uint32_t plane);
 std::optional<Subresource> SplitSubresource(const D3D12_RESOURCE_DESC& desc, UINT index, std::uint32_t mipLevels);
 std::uint32_t MipExtent(std::uint64_t size, std::uint32_t mip);
 

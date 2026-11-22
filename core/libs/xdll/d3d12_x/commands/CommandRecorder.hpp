@@ -30,6 +30,7 @@ struct AttachmentRef {
     VkExtent2D extent{};
     std::uint32_t layers = 1;
     VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+    D3D12_DSV_FLAGS readOnly = D3D12_DSV_FLAG_NONE;
 };
 
 struct VertexBufferRef {

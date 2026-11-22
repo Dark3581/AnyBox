@@ -56,6 +56,8 @@ std::optional<CopyBlock> CopyBlockOf(DXGI_FORMAT format) {
     case DXGI_FORMAT_R16G16_SNORM:
     case DXGI_FORMAT_R16G16_SINT:
     case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
     case DXGI_FORMAT_D32_FLOAT:
     case DXGI_FORMAT_R32_FLOAT:
     case DXGI_FORMAT_R32_UINT:
@@ -136,6 +138,18 @@ std::optional<Subresource> SplitSubresource(const D3D12_RESOURCE_DESC& desc, UIN
     return Subresource{index % mipLevels, static_cast<std::uint32_t>((index / mipLevels) % layers), plane};
 }
 
+std::optional<VkImageAspectFlags> PlaneAspect(VkImageAspectFlags aspects, std::uint32_t plane) {
+    const bool depth = (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+    const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    if (plane == 0) {
+        return depth ? VK_IMAGE_ASPECT_DEPTH_BIT : (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+    if (plane == 1 && depth && stencil) {
+        return VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+    return std::nullopt;
+}
+
 std::optional<Footprints> DesktopCopyableFootprints(const D3D12_RESOURCE_DESC& desc, std::uint32_t mipLevels, UINT first, UINT count, UINT64 baseOffset, std::string& error) {
     const std::optional<CopyBlock> block = CopyBlockOf(desc.Format);
     if (!block) {
@@ -182,21 +196,23 @@ std::optional<VkBufferImageCopy> FootprintRegion(const D3D12_RESOURCE_DESC& text
         error = "subresource " + std::to_string(subresource) + " is outside the texture";
         return std::nullopt;
     }
-    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    if ((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
-        if ((aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
-            error = "copies of a texture with depth and stencil planes are not supported";
-            return std::nullopt;
-        }
-        aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-    }
-    if (sub->plane != 0) {
-        error = "subresource " + std::to_string(subresource) + " names a second plane";
+    const std::optional<VkImageAspectFlags> planeAspect = PlaneAspect(aspects, sub->plane);
+    if (!planeAspect) {
+        error = "subresource " + std::to_string(subresource) + " names a plane the texture does not have";
         return std::nullopt;
     }
+    const VkImageAspectFlags aspect = *planeAspect;
     const std::optional<CopyBlock> block = CopyBlockOf(footprint.Footprint.Format);
     if (!block) {
         error = "footprint format " + std::to_string(static_cast<int>(footprint.Footprint.Format)) + " has no copy layout";
+        return std::nullopt;
+    }
+    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT && block->bytes != 1) {
+        error = "a stencil plane copy needs a footprint format of 1 byte per texel";
+        return std::nullopt;
+    }
+    if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 && block->bytes != 4) {
+        error = "the depth plane of a depth-stencil texture copies as 4 bytes per texel";
         return std::nullopt;
     }
     if (footprint.Footprint.RowPitch % block->bytes != 0 || footprint.Offset % block->bytes != 0 || footprint.Footprint.Width == 0 || footprint.Footprint.Height == 0 ||

@@ -87,10 +87,18 @@ bool CommandRecorder::BeginRendering(const std::vector<AttachmentRef>& colors, c
     rendering.colorAttachmentCount = static_cast<std::uint32_t>(attachments.size());
     rendering.pColorAttachments = attachments.empty() ? nullptr : attachments.data();
     if (depthStencil != nullptr) {
+        const UINT readOnly = static_cast<UINT>(depthStencil->readOnly);
+        const bool hasStencil = (depthStencil->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+        const bool depthReadOnly = (readOnly & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0 || (depthStencil->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) == 0;
+        const bool stencilReadOnly = (readOnly & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0 || !hasStencil;
+        if (readOnly != 0 && depthReadOnly != stencilReadOnly) {
+            error = "a depth-stencil pass that is read-only for only one of its planes is not supported";
+            return false;
+        }
         depth.imageView = depthStencil->view;
-        depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth.imageLayout = readOnly != 0 ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depth.storeOp = readOnly != 0 ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
         stencil = depth;
         if ((depthStencil->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) rendering.pDepthAttachment = &depth;
         if ((depthStencil->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) rendering.pStencilAttachment = &stencil;
@@ -492,14 +500,17 @@ bool CommandRecorder::CopyTexture(const TextureRef& destination, D3D12_RESOURCE_
         !LayoutFor(source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceLayout, error)) {
         return false;
     }
-    if (TexelBytes(destination) == 0 || TexelBytes(destination) != TexelBytes(source)) {
-        error = "the two textures' formats are not copy compatible";
-        return false;
-    }
     const std::optional<Subresource> to = SplitSubresource(destination.desc, destinationSubresource, destination.layout.info.mipLevels);
     const std::optional<Subresource> from = SplitSubresource(source.desc, sourceSubresource, source.layout.info.mipLevels);
-    if (!to || !from || to->plane != 0 || from->plane != 0) {
-        error = "a copy subresource is outside its texture or names a second plane";
+    const std::optional<VkImageAspectFlags> toAspect = to ? PlaneAspect(destination.layout.format.aspects, to->plane) : std::nullopt;
+    const std::optional<VkImageAspectFlags> fromAspect = from ? PlaneAspect(source.layout.format.aspects, from->plane) : std::nullopt;
+    if (!toAspect || !fromAspect) {
+        error = "a copy subresource is outside its texture or names a plane it does not have";
+        return false;
+    }
+    if (*toAspect != *fromAspect || (*toAspect == VK_IMAGE_ASPECT_COLOR_BIT && (TexelBytes(destination) == 0 || TexelBytes(destination) != TexelBytes(source))) ||
+        (*toAspect != VK_IMAGE_ASPECT_COLOR_BIT && destination.layout.info.format != source.layout.info.format)) {
+        error = "the two textures' formats or planes are not copy compatible";
         return false;
     }
     const auto extentOf = [](const TextureRef& texture, std::uint32_t mip) {
@@ -516,8 +527,8 @@ bool CommandRecorder::CopyTexture(const TextureRef& destination, D3D12_RESOURCE_
         return false;
     }
     VkImageCopy copy{};
-    copy.srcSubresource = {source.layout.format.aspects, from->mip, source.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : from->layer, 1};
-    copy.dstSubresource = {destination.layout.format.aspects, to->mip, destination.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : to->layer, 1};
+    copy.srcSubresource = {*fromAspect, from->mip, source.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : from->layer, 1};
+    copy.dstSubresource = {*toAspect, to->mip, destination.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : to->layer, 1};
     copy.srcOffset = {static_cast<std::int32_t>(region.left), static_cast<std::int32_t>(region.top), static_cast<std::int32_t>(region.front)};
     copy.dstOffset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), static_cast<std::int32_t>(z)};
     copy.extent = {region.right - region.left, region.bottom - region.top, region.back - region.front};

@@ -1412,9 +1412,10 @@ int CommandsSelfTest() {
         {shortPitch, &array, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, "shorter than a row"},
         {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 0, 60, "runs past the edge of the mip"},
         {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 0, 100, "starts outside mip 0"},
-        {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 12, 0, "names a second plane"},
+        {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 12, 0, "names a plane the texture does not have"},
         {mip0, &array, VK_IMAGE_ASPECT_COLOR_BIT, 24, 0, "outside the texture"},
-        {mip0, &array, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, "depth and stencil planes"},
+        {mip0, &array, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 12, 0, "a stencil plane copy needs a footprint format of 1 byte"},
+        {mip1, &array, VK_IMAGE_ASPECT_DEPTH_BIT, 12, 0, "names a plane the texture does not have"},
         {compressed->layouts[0], &blocks, VK_IMAGE_ASPECT_COLOR_BIT, 0, 2, "block boundary"},
     };
     for (const Refusal& refusal : refusals) {
@@ -1422,6 +1423,8 @@ int CommandsSelfTest() {
         if (FootprintRegion(*refusal.texture, 3, refusal.aspects, refusal.subresource, refusal.footprint, refusal.x, 0, 0, nullptr, error) ||
             error.find(refusal.expected) == std::string::npos) return Fail(std::string("refusal '") + refusal.expected + "' gave '" + error + "'");
     }
+    if (PlaneAspect(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1) != VK_IMAGE_ASPECT_STENCIL_BIT || PlaneAspect(VK_IMAGE_ASPECT_DEPTH_BIT, 0) != VK_IMAGE_ASPECT_DEPTH_BIT ||
+        PlaneAspect(VK_IMAGE_ASPECT_COLOR_BIT, 0) != VK_IMAGE_ASPECT_COLOR_BIT || PlaneAspect(VK_IMAGE_ASPECT_COLOR_BIT, 1) || PlaneAspect(VK_IMAGE_ASPECT_DEPTH_BIT, 1)) return Fail("plane aspects");
     const D3D12_BOX outside{0, 0, 0, 200, 10, 1};
     if (FootprintRegion(array, 3, VK_IMAGE_ASPECT_COLOR_BIT, 0, mip0, 0, 0, 0, &outside, error) || error.find("outside the footprint") == std::string::npos) return Fail("box outside");
     std::puts("PASS commands selftest");
@@ -2107,6 +2110,186 @@ int IndirectGpu(bool validate) {
     return status;
 }
 
+int PlanesGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const DeviceFunctions& vk = device->Vk();
+    struct Owned {
+        TextureRef ref;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+    };
+    std::vector<Owned> owned;
+    owned.reserve(4);
+    const auto make = [&](const D3D12_RESOURCE_DESC& desc, bool depthView) -> Owned* {
+        const std::optional<TextureImage> image = TranslateTextureDesc(desc, error);
+        if (!image) return nullptr;
+        Owned texture;
+        texture.ref.desc = desc;
+        texture.ref.layout = *image;
+        if (vk.createImage(device->Handle(), &image->info, nullptr, &texture.ref.image) != VK_SUCCESS) return nullptr;
+        VkMemoryRequirements needs{};
+        vk.getImageMemoryRequirements(device->Handle(), texture.ref.image, &needs);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = needs.size;
+        allocate.memoryTypeIndex = device->MemoryType(needs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT).value_or(0);
+        if (vk.allocateMemory(device->Handle(), &allocate, nullptr, &texture.memory) != VK_SUCCESS || vk.bindImageMemory(device->Handle(), texture.ref.image, texture.memory, 0) != VK_SUCCESS) return nullptr;
+        std::optional<ImageView> view = depthView ? DepthStencilView(desc, nullptr, error) : RenderTargetView(desc, nullptr, error);
+        if (!view) return nullptr;
+        view->info.image = texture.ref.image;
+        if (vk.createImageView(device->Handle(), &view->info, nullptr, &texture.view) != VK_SUCCESS) return nullptr;
+        owned.push_back(texture);
+        return &owned.back();
+    };
+    const D3D12_RESOURCE_FLAGS depthFlags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    Owned* depth = make(TextureDesc2D(DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 16, 16, 1, 1, depthFlags), true);
+    Owned* copy = make(TextureDesc2D(DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 16, 16, 1, 1, depthFlags), true);
+    Owned* color = make(TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), false);
+    if (!depth || !copy || !color) return Fail("textures: " + error);
+    const VkShaderModuleCreateInfo cornerInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, sizeof(kCornerVertex), kCornerVertex};
+    const VkShaderModuleCreateInfo fragmentInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, sizeof(kGraphicsFloat), kGraphicsFloat};
+    VkShaderModule corner = VK_NULL_HANDLE;
+    VkShaderModule fragment = VK_NULL_HANDLE;
+    if (vk.createShaderModule(device->Handle(), &cornerInfo, nullptr, &corner) != VK_SUCCESS || vk.createShaderModule(device->Handle(), &fragmentInfo, nullptr, &fragment) != VK_SUCCESS) return Fail("modules");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = DefaultGraphics();
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    const std::optional<GraphicsPipelineState> passing = TranslateGraphicsState(desc, error);
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+    const std::optional<GraphicsPipelineState> failing = TranslateGraphicsState(desc, error);
+    VkPipeline passes = VK_NULL_HANDLE;
+    VkPipeline fails = VK_NULL_HANDLE;
+    if (!passing || !failing ||
+        CreateGraphicsPipeline(*device, VK_NULL_HANDLE, *passing, {{VK_SHADER_STAGE_VERTEX_BIT, corner, 0}, {VK_SHADER_STAGE_FRAGMENT_BIT, fragment, 0}}, {}, 0, &passes, error) != VK_SUCCESS ||
+        CreateGraphicsPipeline(*device, VK_NULL_HANDLE, *failing, {{VK_SHADER_STAGE_VERTEX_BIT, corner, 0}, {VK_SHADER_STAGE_FRAGMENT_BIT, fragment, 0}}, {}, 0, &fails, error) != VK_SUCCESS) {
+        return Fail("pipelines: " + error);
+    }
+    DeviceBuffer host;
+    const VkDeviceSize hostBytes = 1u << 20;
+    if (!CreateHostBuffer(*device, hostBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, host, error)) return Fail("host buffer: " + error);
+    std::uint8_t* const bytes = static_cast<std::uint8_t*>(host.mapped);
+    std::fill(bytes, bytes + hostBytes, std::uint8_t{0xEE});
+    const BufferRef hostRef{host.buffer, 0, hostBytes};
+    const auto footprint = [](UINT64 offset, DXGI_FORMAT format, UINT width) {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT print{};
+        print.Offset = offset;
+        print.Footprint = {format, width, 16, 1, 256};
+        return print;
+    };
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT depthPlane = footprint(0x0000, DXGI_FORMAT_R32_TYPELESS, 16);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT stencilPlane = footprint(0x2000, DXGI_FORMAT_R8_TYPELESS, 16);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT copiedStencil = footprint(0x4000, DXGI_FORMAT_R8_TYPELESS, 16);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT passed = footprint(0x6000, DXGI_FORMAT_R8G8B8A8_UNORM, 16);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT failed = footprint(0x8000, DXGI_FORMAT_R8G8B8A8_UNORM, 16);
+    const AttachmentRef depthTarget{depth->view, {16, 16}, 1, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT};
+    const AttachmentRef copyTarget{copy->view, {16, 16}, 1, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT};
+    const AttachmentRef readOnlyDepth{depth->view, {16, 16}, 1, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                                      static_cast<D3D12_DSV_FLAGS>(D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL)};
+    const AttachmentRef halfReadOnly{depth->view, {16, 16}, 1, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, D3D12_DSV_FLAG_READ_ONLY_DEPTH};
+    const AttachmentRef colorTarget{color->view, {16, 16}, 1, VK_IMAGE_ASPECT_COLOR_BIT};
+    bool recorded = true;
+    std::string step;
+    const bool submitted = device->Submit(
+        [&](VkCommandBuffer commands) {
+            CommandRecorder recorder(*device, commands);
+            const auto check = [&](bool ok, const char* name) {
+                if (!ok && recorded) {
+                    recorded = false;
+                    step = name;
+                }
+            };
+            const float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            check(recorder.InitializeTexture(depth->ref, D3D12_RESOURCE_STATE_DEPTH_WRITE, error), "initialize depth");
+            check(recorder.InitializeTexture(copy->ref, D3D12_RESOURCE_STATE_DEPTH_WRITE, error), "initialize copy");
+            check(recorder.InitializeTexture(color->ref, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "initialize color");
+            check(recorder.ClearDepthStencil(depthTarget, static_cast<D3D12_CLEAR_FLAGS>(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL), 0.5f, 0x5A, {}, error), "clear both");
+            check(recorder.ClearDepthStencil(depthTarget, D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0x33, {{0, 0, 4, 4}}, error), "clear stencil rect");
+            check(recorder.ClearDepthStencil(copyTarget, static_cast<D3D12_CLEAR_FLAGS>(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL), 1.0f, 0x00, {}, error), "clear copy");
+            check(recorder.Transition(depth->ref, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "depth to copy source");
+            check(recorder.Transition(copy->ref, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_DEST, error), "copy to copy dest");
+            check(recorder.CopyTextureToBuffer(hostRef, depthPlane, depth->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read depth plane");
+            check(recorder.CopyTextureToBuffer(hostRef, stencilPlane, depth->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 1, nullptr, error), "read stencil plane");
+            check(recorder.CopyTexture(copy->ref, D3D12_RESOURCE_STATE_COPY_DEST, 1, 0, 0, 0, depth->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 1, nullptr, error), "copy stencil plane");
+            check(!recorder.CopyTexture(copy->ref, D3D12_RESOURCE_STATE_COPY_DEST, 0, 0, 0, 0, depth->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 1, nullptr, error), "mixed planes refused");
+            check(!recorder.CopyTextureToBuffer(hostRef, depthPlane, depth->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 1, nullptr, error), "4-byte stencil footprint refused");
+            check(recorder.Transition(copy->ref, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "copy to copy source");
+            check(recorder.CopyTextureToBuffer(hostRef, copiedStencil, copy->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 1, nullptr, error), "read copied stencil");
+            check(recorder.Transition(depth->ref, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                      static_cast<D3D12_RESOURCE_STATES>(D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE), error), "depth to read");
+            const auto draw = [&](VkPipeline pipeline, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& print) {
+                check(recorder.ClearRenderTarget(colorTarget, blue, {}, error), "clear color");
+                check(recorder.BeginRendering({colorTarget}, &readOnlyDepth, {16, 16}, 1, error), "read-only pass");
+                check(recorder.SetViewports({{0.0f, 0.0f, 16.0f, 16.0f, 0.0f, 1.0f}}, error), "viewport");
+                check(recorder.SetScissors({{0, 0, 16, 16}}, error), "scissor");
+                check(recorder.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, false, error), "topology");
+                recorder.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                recorder.Draw(3, 1, 0, 0);
+                recorder.EndRendering();
+                check(recorder.Transition(color->ref, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "color to copy source");
+                check(recorder.CopyTextureToBuffer(hostRef, print, color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read color");
+                check(recorder.Transition(color->ref, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "color to render target");
+            };
+            draw(passes, passed);
+            draw(fails, failed);
+            check(!recorder.BeginRendering({colorTarget}, &halfReadOnly, {16, 16}, 1, error), "half read-only refused");
+            VkMemoryBarrier2 hostBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            hostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+            hostBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            hostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            hostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers = &hostBarrier;
+            vk.cmdPipelineBarrier2(commands, &dependency);
+        },
+        error);
+    int status = 0;
+    if (!submitted || !recorded) status = Fail("recording '" + step + "': " + error);
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    if (status == 0) {
+        float depthValue = 0.0f;
+        std::memcpy(&depthValue, bytes + depthPlane.Offset + 8 * 256 + 8 * 4, sizeof(depthValue));
+        expect(depthValue == 0.5f, "depth plane read back as " + std::to_string(depthValue));
+        expect(bytes[stencilPlane.Offset + 1 * 256 + 1] == 0x33 && bytes[stencilPlane.Offset + 8 * 256 + 8] == 0x5A, "stencil plane read back with the rectangle");
+        expect(bytes[copiedStencil.Offset + 2 * 256 + 2] == 0x33 && bytes[copiedStencil.Offset + 12 * 256 + 12] == 0x5A, "stencil plane copied between textures");
+        const auto rgb = [&](const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& print, UINT x, UINT y) {
+            const std::uint8_t* p = bytes + print.Offset + y * 256 + x * 4;
+            return static_cast<std::uint32_t>(p[0]) << 16 | static_cast<std::uint32_t>(p[1]) << 8 | p[2];
+        };
+        expect(rgb(passed, 2, 2) == 0xFF0000u && rgb(passed, 14, 14) == 0x0000FFu, "a read-only pass draws where depth 0 <= 0.5");
+        expect(rgb(failed, 2, 2) == 0x0000FFu, "a read-only pass draws nothing where depth 0 > 0.5 fails");
+    }
+    std::printf("planes: %zu read-back checks\n", checks);
+    for (Owned& texture : owned) {
+        vk.destroyImageView(device->Handle(), texture.view, nullptr);
+        vk.destroyImage(device->Handle(), texture.ref.image, nullptr);
+        vk.freeMemory(device->Handle(), texture.memory, nullptr);
+    }
+    DestroyBuffer(*device, host);
+    vk.destroyPipeline(device->Handle(), passes, nullptr);
+    vk.destroyPipeline(device->Handle(), fails, nullptr);
+    vk.destroyShaderModule(device->Handle(), corner, nullptr);
+    vk.destroyShaderModule(device->Handle(), fragment, nullptr);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS planes gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -2122,6 +2305,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "commands-selftest") == 0) return CommandsSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "draw-selftest") == 0) return DrawSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "indirect-selftest") == 0) return IndirectSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "commands-gpu") == 0) return CommandsGpu(HasFlag(argc, argv, "--validate"));
@@ -2130,6 +2314,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate]");
     return 2;
 }
