@@ -57,3 +57,4 @@ Start `<out>\game.exe`. When the title stops, `anybox-report.json` beside it say
 | `ANYBOX_NO_REPORT=1` | write no run report |
 | `ANYBOX_LOG_FILE=<path>` | append AnyBox's log lines to this file as well as stderr |
 | `ANYBOX_TRACE=<library>[,<library>...]` | log every call into the listed AnyBox libraries (`xmem`, `d3d12_x`, ...; `all` for every library) with its arguments and result; case and spaces are ignored. Libraries that trace so far: `xmem`, `d3d12_x` |
+| `ANYBOX_SHADER_STORE=<folder>` | load the shader store from this folder instead of `shaders` beside the executable ([GAME_TESTING](../dev/GAME_TESTING.md#shader-store)) |

@@ -68,3 +68,14 @@ Part tags that are not standard DXBC parts point at console-specific data. Each 
 | `unknown` | the header does not parse |
 
 In an RPF9 archive (file magic `9FPR`) the scan also reads entries stored as raw deflate, which the table of contents is not needed for: `<name> 00 <u8> <u32 stored> <u32> <u32 stored> <u32 size>` followed by `stored` bytes that inflate to a `size`-byte container. Those containers have `stored: deflate` and their `name`, and their `offset` is the entry header's. Shaders in other compressed archives are not found. Post the summary line in the issue; the JSON holds names, offsets and part tags only, never shader bytes.
+
+## Shader store
+
+A title's native shaders cannot be handed to a desktop driver, so AnyBox looks each one up in a shader store: SPIR-V modules translated ahead of time by a separate tool, keyed by the SHA-256 of the whole DXBC container (the container's own `HASH` part is not unique enough: different containers share it). AnyBox does not contain a translator. Build the store from a translated shader set laid out as a folder of carved `.dxbc` containers with an `index.json` list (`name`, `file`) and a folder of `<name>.spv` modules with an `index.json` map from name to details that include `stage`:
+
+```
+python tools/shader_store.py build <carved folder> <translated folder> <out>\shaders
+python tools/shader_store.py lookup <out>\shaders <container.dxbc>
+```
+
+`build` writes `modules.txt` (one `<sha256> <stage> <path>` line per module, tab-separated, paths relative to the store) and `modules.json` (the translator's details per module). Byte-identical containers share a module; a hash whose copies translate to different modules or stages is left out and counted. `d3d12_x` loads `modules.txt` from `ANYBOX_SHADER_STORE`, or from `shaders` beside the executable. The store is built from your own copy and stays on your machine: never commit it or attach it to an issue.

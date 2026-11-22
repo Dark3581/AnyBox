@@ -51,3 +51,14 @@ if(Python3_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/trace_test.py
             --probe $<TARGET_FILE:lib_probe> --libs ${ANYBOX_LIBS_DIR} --work ${CMAKE_CURRENT_BINARY_DIR}/runtime_trace)
 endif()
+
+add_executable(shader_store_probe ShaderStoreProbe.cpp)
+target_link_libraries(shader_store_probe PRIVATE d3d12_x_store)
+target_include_directories(shader_store_probe PRIVATE ${ANYBOX_LIBS_INCLUDE})
+anybox_static_runtime(shader_store_probe)
+
+if(Python3_FOUND)
+    add_test(NAME shader_store
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/shader_store_test.py
+            --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR} --tool ${CMAKE_SOURCE_DIR}/tools/shader_store.py --work ${CMAKE_CURRENT_BINARY_DIR}/shader_store)
+endif()
