@@ -76,6 +76,21 @@ flowchart LR
   - Each library registers itself at load ([`Registration.cpp`](../../core/libs/runtime/src/Registration.cpp)), so the report lists the libraries the title loaded.
 - Libraries link their C++ runtime statically, so the output folder needs no MinGW DLLs.
 
+## Graphics (d3d12_x)
+
+Console shaders carry native GPU code and no DXIL, so `d3d12_x` cannot hand them to a desktop driver. The design is on [#4](https://github.com/Dark3581/AnyBox/issues/4): the title's D3D12.X calls go to Vulkan, and its shaders are SPIR-V modules translated ahead of time by a separate tool.
+
+- **Shader store** ([`store/ShaderStore.cpp`](../../core/libs/xdll/d3d12_x/store/ShaderStore.cpp)): modules keyed by the SHA-256 of each DXBC container, loaded from `ANYBOX_SHADER_STORE` or `shaders` beside the executable. [`tools/build_shaders.py`](../../tools/build_shaders.py) and the `shaders` target build it from a package ([GAME_TESTING](GAME_TESTING.md#building-shaders-with-the-project)).
+- **Device** ([`vulkan/VulkanDevice.cpp`](../../core/libs/xdll/d3d12_x/vulkan/VulkanDevice.cpp)): a Vulkan 1.3 device with exactly the features the store's modules name; [`VulkanBackend.cpp`](../../core/libs/xdll/d3d12_x/vulkan/VulkanBackend.cpp) reports what each GPU offers (`anybox-gpu-report`, `tools/gpu_report.py`).
+- **Layout** ([`vulkan/TitleLayout.cpp`](../../core/libs/xdll/d3d12_x/vulkan/TitleLayout.cpp)): every pipeline uses one layout, set 0 with twenty bindless bindings and 144 bytes of push constants, the interface the translated modules declare (`tools/spirv_layout.py` checks a store against it).
+- **Pipelines** ([`vulkan/PipelineCompiler.cpp`](../../core/libs/xdll/d3d12_x/vulkan/PipelineCompiler.cpp)): compute pipelines from stored modules, a pipeline cache reused only on the same GPU and driver, and large modules compiled one at a time.
+- **Memory access** in a translated shader takes one of two paths:
+  - images and samplers: the shader looks its T# or S# up in the descriptor hash table at binding 2 ([`vulkan/DescriptorTable.cpp`](../../core/libs/xdll/d3d12_x/vulkan/DescriptorTable.cpp)) and gets a bindless index into set 0 ([`vulkan/BindlessSet.cpp`](../../core/libs/xdll/d3d12_x/vulkan/BindlessSet.cpp)), with fallbacks at index 0;
+  - buffers and scalar loads: the shader adds the heap base to the console address it read, so a title's buffers and descriptor tables have to sit in one buffer-device-address range, below 4 GB for descriptor tables ([`vulkan/TitleBufferWindow.cpp`](../../core/libs/xdll/d3d12_x/vulkan/TitleBufferWindow.cpp)).
+- `anybox-pipeline-probe` drives each piece on the GPU (`selftest`, `validation`, `bindless`, `window`, `compile`).
+
+Not built yet, because they follow from a title's own calls: `D3D12XboxCreateDevice` and the device's methods, command queues and lists, resources and descriptor heaps, graphics pipeline state, presentation, and which allocations go to the buffer window. Each open point is in [debt/d3d12_x.md](debt/d3d12_x.md).
+
 ## Run report
 
 `anybox-report.json`, schema [docs/run-report.schema.json](../run-report.schema.json), fixtures in [docs/run-report-fixtures](../run-report-fixtures). A value the runtime cannot know is `null`, never a guess.
