@@ -26,6 +26,10 @@ Outputs:
 - `build/libs/ab_*.dll`, including `ab_runtime.dll`
 - `build/libs/anybox-libs.map`, the DLL routing table
 
+## Shaders (optional)
+
+With `-DANYBOX_GAME_PACKAGE` and `-DANYBOX_SHADER_TRANSLATOR`, the build gets `shaders` and `shader_pipelines` targets that build a title's shader set from your own package into `build/shaders`, and tests labelled `shaders` that check it. See [Building shaders with the project](GAME_TESTING.md#building-shaders-with-the-project).
+
 ## Relinker only
 
 Builds and tests the converter without the Windows libraries, on Linux, macOS or Windows:

@@ -80,3 +80,40 @@ python tools/shader_store.py lookup <out>\shaders <container.dxbc>
 ```
 
 `build` writes `modules.txt` (one `<sha256> <stage> <path>` line per module, tab-separated, paths relative to the store) and `modules.json` (the translator's details per module). Byte-identical containers share a module; a hash whose copies translate to different modules or stages is left out and counted. `d3d12_x` loads `modules.txt` from `ANYBOX_SHADER_STORE`, or from `shaders` beside the executable. The store is built from your own copy and stays on your machine: never commit it or attach it to an issue.
+
+## Building shaders with the project
+
+The shader set can be built and tested like the rest of the project, from your own package and into the build folder, so nothing of it is ever committed. Point CMake at the package and at a checkout of the external translator (a folder holding `make_game.py`, which takes `--game`, `--work`, `--stages shaders` and `--wave64-emulate` and leaves the carved containers in `<work>/shaders/dxbc` and the modules in `<work>/shaders/spirv`, the layout `shader_store.py build` reads):
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON ^
+  -DANYBOX_GAME_PACKAGE=<package folder> -DANYBOX_SHADER_TRANSLATOR=<translator checkout>
+cmake --build build
+cmake --build build --target shaders
+ctest --test-dir build -L shaders --output-on-failure
+```
+
+| Setting | Meaning |
+|---|---|
+| `ANYBOX_GAME_PACKAGE`, `ANYBOX_SHADER_TRANSLATOR` | Both or neither. Without them none of this is configured, and the normal build and tests are unchanged. |
+| `ANYBOX_PIPELINE_CHECK` | The pipeline checker executable. Default: the translator's `runtime/build/vk_pipeline_check.exe`. |
+| `ANYBOX_SHADER_JOBS` | Workers for the translator and the pipeline check. `0` (default) leaves the choice to them. |
+| `ANYBOX_WAVE64_EMULATE` | The translator's wave64 emulation mode, `auto` (default), `on` or `off`. 32-wide GPUs need it on. |
+
+The translator's own requirements (its disassembler, the Vulkan SDK's `spirv-as` and `spirv-val`) come from your environment, as when you run it by hand.
+
+| Target | What it does |
+|---|---|
+| `shaders` | Runs the translator's shader stage into `build/shaders/work`, then builds the store in `build/shaders/store`. The translator skips the stages whose output is still current, so a second run is quick. |
+| `shader_store` | Rebuilds the store only. |
+| `shader_pipelines` | Creates every pipeline on this PC's GPU from `build/shaders/work/shaders/spirv`, with its cache in `build/shaders/pipeline_cache.bin`. This takes hours and needs a lot of memory for the largest modules; run it when the translation changes, not on every build. |
+
+Each step writes `build/shaders/build.json`: the translator's revision and whether it had local changes, the counts of carved and translated shaders, the store's counts, and the pipeline totals with the name of every failed or skipped pipeline. Logs go to `build/shaders/translate.log` and `pipelines.log`. A new translation drops the store and pipeline results from `build.json`, so the tests never pass on results from an older translation.
+
+| Test (label `shaders`) | Passes when |
+|---|---|
+| `shaders_store` | Every carved shader has a translation, the store has no missing, invalid or conflicting entries, and the C++ store (`d3d12_x`) finds every carved container with the stage the translation gives. |
+| `shaders_gpu` | At least one Vulkan device supports what every stored module needs (`tools/gpu_report.py`). Skipped without Vulkan. |
+| `shaders_pipelines` | The last `shader_pipelines` run completed with no failed module or pipeline. Skipped until it has run. |
+
+`build.json` and the logs name shaders: like the store, they stay on your machine.

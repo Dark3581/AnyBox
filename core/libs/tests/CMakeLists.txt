@@ -63,6 +63,16 @@ if(Python3_FOUND)
             --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR} --tool ${CMAKE_SOURCE_DIR}/tools/shader_store.py --work ${CMAKE_CURRENT_BINARY_DIR}/shader_store)
 endif()
 
+if(ANYBOX_SHADERS_ENABLED)
+    foreach(check IN ITEMS store gpu pipelines)
+        add_test(NAME shaders_${check}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/shader_build_test.py
+                --shaders ${ANYBOX_SHADER_DIR} --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR}
+                --build-dir ${CMAKE_BINARY_DIR} --check ${check})
+        set_tests_properties(shaders_${check} PROPERTIES LABELS shaders TIMEOUT 1800 SKIP_REGULAR_EXPRESSION "SKIP ")
+    endforeach()
+endif()
+
 if(Python3_FOUND)
     add_test(NAME gpu_report COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/gpu_report_test.py --report $<TARGET_FILE:gpu_report>)
 endif()

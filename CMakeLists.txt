@@ -16,6 +16,7 @@ file(MAKE_DIRECTORY ${ANYBOX_GENERATED_DIR} ${ANYBOX_LIBS_DIR})
 
 include(cmake/Version.cmake)
 include(cmake/LibraryMap.cmake)
+include(cmake/Shaders.cmake)
 
 add_subdirectory(core/relinker)
 
