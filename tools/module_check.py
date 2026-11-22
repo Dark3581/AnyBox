@@ -15,7 +15,7 @@ STOPS = {0xAB01: "not-implemented", 0xAB02: "unsupported"}
 
 
 def modules(folder):
-    dlls = sorted(p for p in folder.rglob("*.dll") if not p.name.lower().startswith("ab_"))
+    dlls = sorted(p for p in folder.rglob("*") if p.suffix.lower() == ".dll" and p.is_file() and not p.name.lower().startswith("ab_"))
     converted = [p for p in dlls if p.with_name(p.name + ".registry.json").is_file()]
     return converted or dlls
 
