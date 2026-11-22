@@ -2,16 +2,20 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
 
 FORMAT = "anybox-shader-store"
-VERSION = 2
+VERSION = 3
 INDEX = "modules.txt"
+INPUTS = "inputs.txt"
 DETAILS = "modules.json"
 STAGES = {"vs", "ps", "gs", "hs", "ds", "cs", "ms", "as", "lib"}
 SUBGROUP_SIZES = {None: 0, 32: 32, 64: 64}
+INPUT_TYPES = {"float", "uint", "sint"}
+SEMANTIC = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class StoreError(Exception):
@@ -39,6 +43,23 @@ def digest(path):
     return hasher.hexdigest()
 
 
+def vertex_inputs(details):
+    inputs = details.get("vertex_inputs") or []
+    signature = {element.get("register"): element for element in details.get("input_signature") or [] if not element.get("system_value")}
+    found = []
+    for item in inputs:
+        element = signature.get(item.get("location"))
+        if element is None or item.get("type") not in INPUT_TYPES or not SEMANTIC.match(str(element.get("semantic", ""))):
+            return None
+        index, mask = element.get("semantic_index"), element.get("mask")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0 or not isinstance(mask, int) or isinstance(mask, bool) or not 0 < mask < 16:
+            return None
+        found.append({"location": item["location"], "semantic": element["semantic"], "index": index, "type": item["type"], "mask": mask})
+    if len({item["location"] for item in found}) != len(found) or any(not isinstance(item["location"], int) or not 0 <= item["location"] < 32 for item in found):
+        return None
+    return sorted(found, key=lambda item: item["location"])
+
+
 def load_json(path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -63,7 +84,8 @@ def collect(carved, translated):
             continue
         stage = details.get("stage")
         subgroup = details.get("subgroup_size")
-        if stage not in STAGES or isinstance(subgroup, bool) or subgroup not in SUBGROUP_SIZES:
+        inputs = vertex_inputs(details)
+        if stage not in STAGES or isinstance(subgroup, bool) or subgroup not in SUBGROUP_SIZES or inputs is None:
             problems["invalid"].append(stem)
             continue
         try:
@@ -71,7 +93,7 @@ def collect(carved, translated):
         except (OSError, StoreError):
             problems["invalid"].append(stem)
             continue
-        record = {"name": stem, "stage": stage, "subgroup": SUBGROUP_SIZES[subgroup], "file": module, "sha256": None, "details": details}
+        record = {"name": stem, "stage": stage, "subgroup": SUBGROUP_SIZES[subgroup], "inputs": inputs, "file": module, "sha256": None, "details": details}
         if key in modules:
             duplicates += 1
             first = modules[key]
@@ -91,15 +113,17 @@ def collect(carved, translated):
 def write(store, modules, translated):
     store.mkdir(parents=True, exist_ok=True)
     root = os.path.relpath(translated, store)
-    lines, details = [], {}
+    lines, details, inputs = [], {}, []
     for key in sorted(modules):
         module = modules[key]
         path = Path(root) / module["file"].name
         if "\t" in str(path) or "\n" in str(path):
             raise StoreError(f"{module['name']}: path holds a tab or newline")
         lines.append(f"{key}\t{module['stage']}\t{module['subgroup']}\t{path.as_posix()}\n")
+        inputs += [f"{key}\t{item['location']}\t{item['semantic']}\t{item['index']}\t{item['type']}\t{item['mask']}\n" for item in module["inputs"]]
         details[key] = {"name": module["name"], "stage": module["stage"], "file": path.as_posix(), "translation": module["details"]}
     (store / INDEX).write_text("".join(lines), encoding="utf-8", newline="\n")
+    (store / INPUTS).write_text("".join(inputs), encoding="utf-8", newline="\n")
     (store / DETAILS).write_text(json.dumps({"format": FORMAT, "version": VERSION, "modules": details}, indent=1) + "\n", encoding="utf-8")
 
 
@@ -141,7 +165,7 @@ def main():
     make = commands.add_parser("build", help="import a translated shader set")
     make.add_argument("carved", type=Path, help="folder of carved .dxbc containers with the carve index.json")
     make.add_argument("translated", type=Path, help="folder of .spv modules with the translation index.json")
-    make.add_argument("store", type=Path, help="folder to write modules.txt and modules.json into")
+    make.add_argument("store", type=Path, help="folder to write modules.txt, inputs.txt and modules.json into")
     find = commands.add_parser("lookup", help="find the module for one container")
     find.add_argument("store", type=Path)
     find.add_argument("container", type=Path)

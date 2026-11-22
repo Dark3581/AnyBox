@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace abx::d3d12x {
 
@@ -15,11 +16,22 @@ std::optional<Sha256> Sha256Of(const void* data, std::size_t size);
 std::string Hex(const Sha256& digest);
 std::optional<std::size_t> ContainerSize(const void* data, std::size_t length);
 
+enum class InputType { Float, Uint, Sint };
+
+struct ShaderInput {
+    std::uint32_t location = 0;
+    std::string semantic;
+    std::uint32_t index = 0;
+    InputType type = InputType::Float;
+    std::uint32_t mask = 0;
+};
+
 struct ShaderModule {
     std::string key;
     std::string stage;
     std::uint32_t subgroupSize = 0;
     std::wstring path;
+    std::vector<ShaderInput> inputs;
 };
 
 class ShaderStore {

@@ -94,7 +94,11 @@ int Find(const char* folder, int count, char** containers) {
         }
         std::string path;
         for (const wchar_t c : module->path) path += static_cast<char>(c);
-        std::printf("%s\t%s\t%u\t%s\t%s\n", containers[index], module->stage.c_str(), module->subgroupSize, path.c_str(), module->key.c_str());
+        std::string inputs;
+        for (const abx::d3d12x::ShaderInput& input : module->inputs) {
+            inputs += (inputs.empty() ? "" : ",") + std::to_string(input.location) + ":" + input.semantic + std::to_string(input.index);
+        }
+        std::printf("%s\t%s\t%u\t%s\t%s\t%s\n", containers[index], module->stage.c_str(), module->subgroupSize, path.c_str(), module->key.c_str(), inputs.empty() ? "-" : inputs.c_str());
     }
     return 0;
 }

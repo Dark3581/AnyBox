@@ -46,6 +46,58 @@ std::optional<std::uint32_t> SubgroupSize(const std::string& text) {
     return std::nullopt;
 }
 
+std::vector<std::string> SplitTabs(const std::string& line) {
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t tab = line.find('\t', start);
+        fields.push_back(line.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+        if (tab == std::string::npos) {
+            return fields;
+        }
+        start = tab + 1;
+    }
+}
+
+std::optional<std::uint32_t> SmallNumber(const std::string& text, std::uint32_t limit) {
+    if (text.empty() || text.size() > 3) {
+        return std::nullopt;
+    }
+    std::uint32_t value = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        value = value * 10 + static_cast<std::uint32_t>(c - '0');
+    }
+    return value < limit ? std::optional<std::uint32_t>(value) : std::nullopt;
+}
+
+std::optional<InputType> ParseInputType(const std::string& text) {
+    if (text == "float") {
+        return InputType::Float;
+    }
+    if (text == "uint") {
+        return InputType::Uint;
+    }
+    if (text == "sint") {
+        return InputType::Sint;
+    }
+    return std::nullopt;
+}
+
+bool IsSemantic(const std::string& text) {
+    if (text.empty() || (text[0] >= '0' && text[0] <= '9')) {
+        return false;
+    }
+    for (const char c : text) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool IsDigest(const std::string& text) {
     if (text.size() != 64) {
         return false;
@@ -162,7 +214,38 @@ bool ShaderStore::Load(const std::wstring& folder, std::string& error) {
                 c = L'\\';
             }
         }
-        modules_[digest] = ShaderModule{digest, stage, *subgroup, folder + L"\\" + path};
+        modules_[digest] = ShaderModule{digest, stage, *subgroup, folder + L"\\" + path, {}};
+    }
+    std::ifstream inputs(std::filesystem::path(folder) / L"inputs.txt", std::ios::binary);
+    if (!inputs) {
+        error = "inputs.txt not found: rebuild the store";
+        modules_.clear();
+        return false;
+    }
+    number = 0;
+    while (std::getline(inputs, line)) {
+        ++number;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const std::vector<std::string> fields = SplitTabs(line);
+        const auto module = fields.size() == 6 ? modules_.find(fields[0]) : modules_.end();
+        const std::optional<std::uint32_t> location = fields.size() == 6 ? SmallNumber(fields[1], 32) : std::nullopt;
+        const std::optional<std::uint32_t> index = fields.size() == 6 ? SmallNumber(fields[3], 1000) : std::nullopt;
+        const std::optional<InputType> type = fields.size() == 6 ? ParseInputType(fields[4]) : std::nullopt;
+        const std::optional<std::uint32_t> mask = fields.size() == 6 ? SmallNumber(fields[5], 16) : std::nullopt;
+        bool duplicate = false;
+        if (module != modules_.end() && location) {
+            for (const ShaderInput& input : module->second.inputs) {
+                duplicate = duplicate || input.location == *location;
+            }
+        }
+        if (module == modules_.end() || module->second.stage != "vs" || !location || !IsSemantic(fields[2]) || !index || !type || !mask || *mask == 0 || duplicate) {
+            error = "inputs.txt line " + std::to_string(number) + " is not <sha256 of a vertex shader> <location> <semantic> <index> <type> <mask>";
+            modules_.clear();
+            return false;
+        }
+        module->second.inputs.push_back(ShaderInput{*location, fields[2], *index, *type, *mask});
     }
     return true;
 }

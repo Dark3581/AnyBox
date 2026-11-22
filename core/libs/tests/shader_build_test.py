@@ -15,6 +15,7 @@ COMMAND_LINE = 30000
 COMPUTE_SAMPLE = 60
 COMPUTE_SAMPLE_BYTES = 1 << 20
 PSO_SAMPLE = 12
+PSO_VERTEX_SAMPLE = 8
 
 
 def batches(paths, fixed):
@@ -42,7 +43,10 @@ def check_lookups(args, layout, translation, store):
         assert len(rows) == len(batch), (len(rows), len(batch))
         for container, row in zip(batch, rows):
             stem = container.stem
-            assert len(row) == 5, f"{stem}: not in the store"
+            assert len(row) == 6, f"{stem}: not in the store"
+            declared = translation[stem].get("vertex_inputs") or []
+            stored = [] if row[5] == "-" else row[5].split(",")
+            assert len(stored) == len(declared), f"{stem}: {len(stored)} stored vertex inputs, the translation declares {len(declared)}"
             expected = translation[stem]["stage"]
             assert row[1] == expected, f"{stem}: stage {row[1]}, translation says {expected}"
             subgroup = translation[stem].get("subgroup_size") or 0
@@ -131,6 +135,29 @@ def pso_rows(output):
     return found
 
 
+def check_vertex_shaders(args, layout, env):
+    vertex = sorted(((module["name"], module) for _, module in store_modules(layout) if module["stage"] == "vs" and module["translation"].get("vertex_inputs")), key=lambda item: item[0])
+    assert vertex, "the store has no vertex shader with vertex inputs"
+    step = max(1, len(vertex) // PSO_VERTEX_SAMPLE)
+    sample = vertex[::step][:PSO_VERTEX_SAMPLE]
+    created = 0
+    for name, module in sample:
+        command = [str(args.pso_probe), "graphics-title", str(layout["store"]), str(layout["carved"] / f"{name}.dxbc")]
+        features = module["translation"].get("features") or []
+        if features:
+            command += ["--features", ",".join(features)]
+        if module["translation"].get("needs_maintenance8"):
+            command.append("--maintenance8")
+        run = subprocess.run(command, capture_output=True, text=True, env=env, timeout=600)
+        if run.returncode == 3:
+            print(f"SKIP vertex shaders: {run.stdout.strip()}")
+            return
+        assert run.returncode == 0, (name, run.stdout[-2000:], run.stderr[-2000:])
+        print(f"  vertex shader {name}: {run.stdout.strip().split(': ', 1)[-1]}")
+        created += 1
+    print(f"pso: {created} of {len(sample)} sampled vertex shaders with vertex inputs (of {len(vertex)}) became graphics pipelines through the store, an input layout and the render state")
+
+
 def check_pso(args, layout, summary):
     compute = sorted(((path.stat().st_size, path, module) for path, module in store_modules(layout) if module["stage"] == "cs"), key=lambda item: (item[0], item[2]["name"]))
     assert compute, "the store has no compute module"
@@ -166,6 +193,7 @@ def check_pso(args, layout, summary):
         print(f"  empty cache: {Path(row['container']).stem} {row['origin']} {row['seconds']:.3f}s {row['error']}")
     assert all(row["origin"] in ("ready", "compiled") for row in found[:-1]), "a sampled compute pipeline failed through the shader store"
     assert found[-1]["origin"] in ("ready", "refused"), f"the largest module was {found[-1]['origin']} although it is over the run-time compile limit"
+    check_vertex_shaders(args, layout, env)
     cache = layout["cache"]
     if not cache.is_file():
         print(f"no offline cache at {cache}: run the shader_pipelines target to fill it")

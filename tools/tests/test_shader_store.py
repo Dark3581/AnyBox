@@ -74,7 +74,7 @@ class ShaderStoreTest(unittest.TestCase):
                 self.assertTrue((store / entry["file"]).is_file())
                 self.assertEqual(entry["file"].split("/")[0], "..")
             details = json.loads((store / "modules.json").read_text(encoding="utf-8"))
-            self.assertEqual((details["format"], details["version"]), ("anybox-shader-store", 2))
+            self.assertEqual((details["format"], details["version"]), ("anybox-shader-store", 3))
             self.assertEqual(sorted(d["name"] for d in details["modules"].values()), ["a", "b c"])
 
     def test_subgroup_sizes(self):
@@ -88,6 +88,33 @@ class ShaderStoreTest(unittest.TestCase):
             self.assertEqual(sorted(problems["invalid"]), ["flag", "odd"])
             self.assertEqual(problems["conflicts"], [hashlib.sha256(container(1)).hexdigest()])
             self.assertEqual(duplicates, 1)
+
+    def test_vertex_inputs(self):
+        signature = [{"register": 0, "semantic": "POSITION", "semantic_index": 0, "mask": 7, "system_value": 0},
+                     {"register": 1, "semantic": "TEXCOORD", "semantic_index": 2, "mask": 3, "system_value": 0},
+                     {"register": 2, "semantic": "SV_VertexID", "semantic_index": 0, "mask": 1, "system_value": 6}]
+        details = {"input_signature": signature, "vertex_inputs": [{"location": 1, "type": "float"}, {"location": 0, "type": "float"}]}
+        self.assertEqual(shader_store.vertex_inputs(details), [
+            {"location": 0, "semantic": "POSITION", "index": 0, "type": "float", "mask": 7},
+            {"location": 1, "semantic": "TEXCOORD", "index": 2, "type": "float", "mask": 3}])
+        self.assertEqual(shader_store.vertex_inputs({"input_signature": signature}), [])
+        for broken in ([{"location": 2, "type": "uint"}], [{"location": 5, "type": "float"}], [{"location": 0, "type": "half"}],
+                       [{"location": 0, "type": "float"}, {"location": 0, "type": "float"}]):
+            self.assertIsNone(shader_store.vertex_inputs({"input_signature": signature, "vertex_inputs": broken}), broken)
+        odd = [dict(signature[0], semantic="POS ITION")]
+        self.assertIsNone(shader_store.vertex_inputs({"input_signature": odd, "vertex_inputs": [{"location": 0, "type": "float"}]}))
+        with helpers.temp_root() as root:
+            root = Path(root)
+            carved, translated = shader_set(root, [("vs", container(1), "vs", b"A"), ("cs", container(2), "cs", b"B")])
+            index = json.loads((translated / "index.json").read_text(encoding="utf-8"))
+            index["vs"].update(details)
+            (translated / "index.json").write_text(json.dumps(index), encoding="utf-8")
+            modules, _, problems = shader_store.collect(carved, translated)
+            store = root / "store"
+            shader_store.write(store, modules, translated)
+            lines = (store / "inputs.txt").read_text(encoding="utf-8").splitlines()
+            key = hashlib.sha256(container(1)).hexdigest()
+            self.assertEqual(lines, [f"{key}\t0\tPOSITION\t0\tfloat\t7", f"{key}\t1\tTEXCOORD\t2\tfloat\t3"])
 
     def test_read_index_rejects_bad_lines(self):
         with helpers.temp_root() as root:

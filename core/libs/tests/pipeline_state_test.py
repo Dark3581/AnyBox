@@ -97,6 +97,7 @@ def main():
     assert resolve(carved / "cs_a.dxbc", "--node", "1")[0] == "ok"
 
     assert "PASS graphics selftest" in run([args.probe, "graphics-selftest"], env)
+    assert "PASS input selftest" in run([args.probe, "input-selftest"], env)
     graphics = subprocess.run([str(args.probe), "graphics-gpu", "--validate"], capture_output=True, text=True, env=env, timeout=600)
     if graphics.returncode == 4:
         print("validation layer not installed: creating graphics pipelines without it")

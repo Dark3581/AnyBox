@@ -4,6 +4,7 @@
 #include "PipelineLibrary.hpp"
 #include "PipelineState.hpp"
 #include "ShaderStore.hpp"
+#include "VertexInput.hpp"
 #include "VulkanDevice.hpp"
 
 #include <windows.h>
@@ -136,6 +137,101 @@ const GraphicsCase kGraphicsCases[] = {
          d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
      }},
 };
+
+const std::uint32_t kGraphicsInputs[] = {
+#include "shaders/graphics_inputs.inc"
+};
+
+const std::vector<ShaderInput>& TestShaderInputs() {
+    static const std::vector<ShaderInput> inputs{
+        {0, "POSITION", 0, InputType::Float, 7},
+        {1, "COLOR", 0, InputType::Float, 15},
+        {3, "BLENDINDICES", 0, InputType::Uint, 15},
+    };
+    return inputs;
+}
+
+const D3D12_INPUT_ELEMENT_DESC kTestLayout[] = {
+    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"color", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 0, DXGI_FORMAT_R16G16_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 2, 4, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+};
+
+int InputSelfTest() {
+    std::string error;
+    const D3D12_INPUT_LAYOUT_DESC layout{kTestLayout, 4};
+    const std::optional<VertexInput> input = TranslateInputLayout(layout, TestShaderInputs(), error);
+    if (!input) return Fail("test layout: " + error);
+    if (input->attributes.size() != 3 || input->bindings.size() != 2) return Fail("test layout counts");
+    const VkVertexInputAttributeDescription& position = input->attributes[0];
+    const VkVertexInputAttributeDescription& color = input->attributes[1];
+    const VkVertexInputAttributeDescription& bones = input->attributes[2];
+    if (position.location != 0 || position.binding != 0 || position.format != VK_FORMAT_R32G32B32_SFLOAT || position.offset != 0) return Fail("position");
+    if (color.location != 1 || color.binding != 0 || color.format != VK_FORMAT_R8G8B8A8_UNORM || color.offset != 12) return Fail("append aligned colour");
+    if (bones.location != 3 || bones.binding != 2 || bones.format != VK_FORMAT_R8G8B8A8_UINT || bones.offset != 4) return Fail("instance element");
+    if (input->bindings[0].binding != 0 || input->bindings[0].inputRate != VK_VERTEX_INPUT_RATE_VERTEX || input->bindings[1].binding != 2 ||
+        input->bindings[1].inputRate != VK_VERTEX_INPUT_RATE_INSTANCE) return Fail("bindings");
+    const D3D12_INPUT_ELEMENT_DESC packed[] = {
+        {"A", 0, DXGI_FORMAT_R8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"B", 0, DXGI_FORMAT_R16_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"C", 0, DXGI_FORMAT_R8_UINT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"D", 0, DXGI_FORMAT_R32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    const std::vector<ShaderInput> packedInputs{{0, "A", 0, InputType::Float, 1}, {1, "B", 0, InputType::Float, 1}, {2, "C", 0, InputType::Uint, 1}, {3, "D", 0, InputType::Float, 1}};
+    const std::optional<VertexInput> packedInput = TranslateInputLayout({packed, 4}, packedInputs, error);
+    if (!packedInput || packedInput->attributes[1].offset != 2 || packedInput->attributes[2].offset != 4 || packedInput->attributes[3].offset != 8) return Fail("append aligned packing: " + error);
+    const std::optional<VertexInput> empty = TranslateInputLayout({nullptr, 0}, {}, error);
+    if (!empty || !empty->attributes.empty() || !empty->bindings.empty()) return Fail("empty layout");
+    if (VertexFormatBytes(DXGI_FORMAT_R16G16B16A16_SNORM) != 8u || VertexFormatBytes(DXGI_FORMAT_R11G11B10_FLOAT) != 4u || VertexFormatBytes(DXGI_FORMAT_BC1_UNORM)) return Fail("format sizes");
+    if (VertexFormatType(DXGI_FORMAT_R16G16_SINT) != InputType::Sint || VertexFormatType(DXGI_FORMAT_R10G10B10A2_UINT) != InputType::Uint ||
+        VertexFormatType(DXGI_FORMAT_R8G8B8A8_SNORM) != InputType::Float) return Fail("format types");
+
+    struct Refusal {
+        void (*edit)(std::vector<D3D12_INPUT_ELEMENT_DESC>&);
+        const char* expected;
+    };
+    const Refusal refusals[] = {
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e.erase(e.begin() + 1); }, "no element for COLOR0, which the vertex shader reads"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[3].Format = DXGI_FORMAT_R8G8B8A8_UNORM; }, "reads BLENDINDICES0 as uint, but the input layout gives it format 28"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[3].InstanceDataStepRate = 2; }, "instance step rate 2, and only 1 is supported"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[0].InstanceDataStepRate = 1; }, "per-vertex input element POSITION0 has instance step rate 1"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[3].InputSlot = 0; }, "slot 0 mixes per-vertex and per-instance elements"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[0].InputSlot = 32; }, "uses slot 32"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[0].Format = DXGI_FORMAT_BC1_UNORM; }, "has format 71, which has no Vulkan vertex mapping"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[2] = e[1]; }, "names color0 twice"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[0].SemanticName = nullptr; }, "input element 0 has no semantic name"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[0].AlignedByteOffset = 4096; }, "starts at byte 4096"},
+        {[](std::vector<D3D12_INPUT_ELEMENT_DESC>& e) { e[0].InputSlotClass = static_cast<D3D12_INPUT_CLASSIFICATION>(5); }, "has classification 5"},
+    };
+    for (const Refusal& refusal : refusals) {
+        std::vector<D3D12_INPUT_ELEMENT_DESC> elements(std::begin(kTestLayout), std::end(kTestLayout));
+        refusal.edit(elements);
+        error.clear();
+        if (TranslateInputLayout({elements.data(), static_cast<UINT>(elements.size())}, TestShaderInputs(), error) || error.find(refusal.expected) == std::string::npos) {
+            return Fail(std::string("refusal '") + refusal.expected + "' gave '" + error + "'");
+        }
+    }
+    std::vector<D3D12_INPUT_ELEMENT_DESC> many(33, kTestLayout[0]);
+    if (TranslateInputLayout({many.data(), 33}, {}, error) || error.find("33 input elements") == std::string::npos) return Fail("too many elements");
+    if (TranslateInputLayout({nullptr, 2}, {}, error) || error.find("no element array") == std::string::npos) return Fail("missing element array");
+    std::puts("PASS input selftest");
+    return 0;
+}
+
+D3D12_INPUT_ELEMENT_DESC SynthesizedElement(const ShaderInput& input) {
+    unsigned components = 1;
+    for (unsigned bit = 0; bit < 4; ++bit) {
+        if ((input.mask >> bit) & 1u) components = bit + 1;
+    }
+    static const DXGI_FORMAT formats[3][4] = {
+        {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT},
+        {DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32B32_UINT, DXGI_FORMAT_R32G32B32A32_UINT},
+        {DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32G32_SINT, DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32A32_SINT},
+    };
+    const int type = input.type == InputType::Float ? 0 : input.type == InputType::Uint ? 1 : 2;
+    return {input.semantic.c_str(), input.index, formats[type][components - 1], 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+}
 
 int GraphicsSelfTest() {
     if (VulkanFormat(DXGI_FORMAT_R8G8B8A8_UNORM) != VK_FORMAT_R8G8B8A8_UNORM) return Fail("RGBA8");
@@ -295,6 +391,24 @@ int GraphicsGpu(bool validate) {
         vk.destroyPipeline(device->Handle(), pipeline, nullptr);
         ++created;
     }
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = DefaultGraphics();
+        const std::optional<GraphicsPipelineState> state = TranslateGraphicsState(desc, error);
+        const D3D12_INPUT_LAYOUT_DESC layout{kTestLayout, 4};
+        const std::optional<VertexInput> input = state ? TranslateInputLayout(layout, TestShaderInputs(), error) : std::nullopt;
+        const VkShaderModule inputVertex = makeModule(kGraphicsInputs, sizeof(kGraphicsInputs));
+        VkPipeline inputPipeline = VK_NULL_HANDLE;
+        if (!input || inputVertex == VK_NULL_HANDLE ||
+            CreateGraphicsPipeline(*device, cache.Handle(), *state, {{VK_SHADER_STAGE_VERTEX_BIT, inputVertex, 0}, {VK_SHADER_STAGE_FRAGMENT_BIT, floatFragment, 0}}, *input, 0,
+                                   &inputPipeline, error) != VK_SUCCESS) {
+            status = Fail("vertex-input: " + error);
+        } else {
+            std::puts("OK vertex-input");
+            vk.destroyPipeline(device->Handle(), inputPipeline, nullptr);
+            ++created;
+        }
+        if (inputVertex != VK_NULL_HANDLE) vk.destroyShaderModule(device->Handle(), inputVertex, nullptr);
+    }
     GraphicsPipelineState noVertex;
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (CreateGraphicsPipeline(*device, cache.Handle(), noVertex, {{VK_SHADER_STAGE_FRAGMENT_BIT, floatFragment, 0}}, {}, 0, &pipeline, error) == VK_SUCCESS ||
@@ -314,6 +428,7 @@ int GraphicsGpu(bool validate) {
     if (status == 0) std::puts("PASS graphics gpu");
     return status;
 }
+
 
 std::filesystem::path Utf8Path(const std::string& text) {
     return std::filesystem::path(std::u8string(text.begin(), text.end()));
@@ -467,13 +582,64 @@ int Compute(int argc, char** argv) {
     return 0;
 }
 
+int GraphicsTitle(int argc, char** argv) {
+    ShaderStore store;
+    if (!LoadStore(argv[2], store)) return 1;
+    const std::vector<unsigned char> bytecode = ReadBytes(Utf8Path(argv[3]));
+    const ShaderModule* module = store.Find(bytecode.data(), bytecode.size());
+    if (module == nullptr || module->stage != "vs") return Fail("the container is not a vertex shader in the store");
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    for (const ShaderInput& input : module->inputs) elements.push_back(SynthesizedElement(input));
+    std::string error;
+    const std::optional<VertexInput> input = TranslateInputLayout({elements.empty() ? nullptr : elements.data(), static_cast<UINT>(elements.size())}, module->inputs, error);
+    if (!input) return Fail("input layout: " + error);
+    const std::optional<GraphicsPipelineState> state = TranslateGraphicsState(DefaultGraphics(), error);
+    if (!state) return Fail("state: " + error);
+    DeviceRequirements requirements;
+    std::istringstream features(FindOption(argc, argv, "--features", ""));
+    for (std::string feature; std::getline(features, feature, ',');) {
+        if (!feature.empty()) requirements.features.insert(feature);
+    }
+    requirements.maintenance8 = HasFlag(argc, argv, "--maintenance8");
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return kNoDevice;
+    }
+    const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(std::filesystem::path(module->path), error);
+    if (!words) return Fail(error);
+    const DeviceFunctions& vk = device->Vk();
+    const auto makeModule = [&](const std::uint32_t* code, std::size_t bytes) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = bytes;
+        info.pCode = code;
+        VkShaderModule handle = VK_NULL_HANDLE;
+        return vk.createShaderModule(device->Handle(), &info, nullptr, &handle) == VK_SUCCESS ? handle : VK_NULL_HANDLE;
+    };
+    const VkShaderModule vertex = makeModule(words->data(), words->size() * sizeof(std::uint32_t));
+    const VkShaderModule fragment = makeModule(kGraphicsFloat, sizeof(kGraphicsFloat));
+    if (vertex == VK_NULL_HANDLE || fragment == VK_NULL_HANDLE) return Fail("shader modules");
+    PipelineCache cache(*device, {});
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = CreateGraphicsPipeline(*device, cache.Handle(), *state, {{VK_SHADER_STAGE_VERTEX_BIT, vertex, module->subgroupSize}, {VK_SHADER_STAGE_FRAGMENT_BIT, fragment, 0}},
+                                                   *input, 0, &pipeline, error);
+    vk.destroyShaderModule(device->Handle(), vertex, nullptr);
+    vk.destroyShaderModule(device->Handle(), fragment, nullptr);
+    if (result != VK_SUCCESS) return Fail("pipeline: " + error);
+    vk.destroyPipeline(device->Handle(), pipeline, nullptr);
+    std::printf("OK %s: %zu vertex inputs, %zu bindings\n", module->key.c_str(), input->attributes.size(), input->bindings.size());
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     if (argc >= 4 && std::strcmp(argv[1], "resolve") == 0) return Resolve(argc, argv);
     if (argc >= 4 && std::strcmp(argv[1], "compute") == 0) return Compute(argc, argv);
     if (argc == 2 && std::strcmp(argv[1], "graphics-selftest") == 0) return GraphicsSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "input-selftest") == 0) return InputSelfTest();
+    if (argc >= 4 && std::strcmp(argv[1], "graphics-title") == 0) return GraphicsTitle(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8]");
     return 2;
 }
