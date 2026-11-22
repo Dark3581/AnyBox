@@ -7,6 +7,7 @@
 #include "ShaderStore.hpp"
 #include "TextureDesc.hpp"
 #include "VertexInput.hpp"
+#include "ViewDesc.hpp"
 #include "VulkanDevice.hpp"
 
 #include <windows.h>
@@ -1043,6 +1044,325 @@ int TexturesGpu(bool validate) {
     return status;
 }
 
+D3D12_RESOURCE_DESC ViewTexture(DXGI_FORMAT format, UINT16 layers, UINT16 mips, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+    D3D12_RESOURCE_DESC desc = TextureDesc2D(format, 64, dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : 64, layers, mips, flags);
+    desc.Dimension = dimension;
+    return desc;
+}
+
+struct ViewCase {
+    const char* name;
+    D3D12_RESOURCE_DESC resource;
+    char kind;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav;
+    D3D12_RENDER_TARGET_VIEW_DESC rtv;
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv;
+    bool useDefault;
+};
+
+std::vector<ViewCase> ViewCases() {
+    const D3D12_RESOURCE_FLAGS rtUav = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const D3D12_RESOURCE_DESC colorArray = ViewTexture(DXGI_FORMAT_R8G8B8A8_TYPELESS, 4, 0, rtUav);
+    const D3D12_RESOURCE_DESC depth = ViewTexture(DXGI_FORMAT_R32G8X24_TYPELESS, 2, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    const D3D12_RESOURCE_DESC cubes = ViewTexture(DXGI_FORMAT_BC7_UNORM, 12, 0, D3D12_RESOURCE_FLAG_NONE);
+    D3D12_RESOURCE_DESC volume = ViewTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, 16, 0, rtUav, D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+    const D3D12_RESOURCE_DESC bgrx = ViewTexture(DXGI_FORMAT_B8G8R8X8_UNORM, 1, 1, D3D12_RESOURCE_FLAG_NONE);
+    const D3D12_RESOURCE_DESC line = ViewTexture(DXGI_FORMAT_R32_FLOAT, 3, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_DIMENSION_TEXTURE1D);
+    D3D12_RESOURCE_DESC msaa = ViewTexture(DXGI_FORMAT_R8G8B8A8_UNORM, 2, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    msaa.SampleDesc = {4, 0};
+    std::vector<ViewCase> cases;
+    const auto add = [&cases](const char* name, const D3D12_RESOURCE_DESC& resource, char kind) -> ViewCase& {
+        cases.push_back(ViewCase{name, resource, kind, {}, {}, {}, {}, false});
+        return cases.back();
+    };
+    ViewCase& srgb = add("srgb 2D array view of mips 1-2", colorArray, 's');
+    srgb.srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    srgb.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    srgb.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srgb.srv.Texture2DArray = {1, 2, 1, 3, 0, 0.0f};
+    ViewCase& swizzle = add("uint 2D view with swizzle", colorArray, 's');
+    swizzle.srv.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    swizzle.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    swizzle.srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
+    swizzle.srv.Texture2D = {0, static_cast<UINT>(-1), 0, 0.0f};
+    add("uav of mip 3, array", colorArray, 'u').uav = {DXGI_FORMAT_R8G8B8A8_UINT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY, {}};
+    cases.back().uav.Texture2DArray = {3, 0, 4, 0};
+    add("rtv of layer 2", colorArray, 'r').rtv = {DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RTV_DIMENSION_TEXTURE2DARRAY, {}};
+    cases.back().rtv.Texture2DArray = {0, 2, 1, 0};
+    ViewCase& depthRead = add("depth plane of d32s8", depth, 's');
+    depthRead.srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    depthRead.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    depthRead.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depthRead.srv.Texture2DArray = {0, 1, 0, 2, 0, 0.0f};
+    ViewCase& stencilRead = add("stencil plane of d32s8", depth, 's');
+    stencilRead.srv.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    stencilRead.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    stencilRead.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    stencilRead.srv.Texture2D = {0, 1, 1, 0.0f};
+    add("dsv of layer 1", depth, 'd').dsv = {DXGI_FORMAT_D32_FLOAT_S8X24_UINT, D3D12_DSV_DIMENSION_TEXTURE2DARRAY, D3D12_DSV_FLAG_READ_ONLY_STENCIL, {}};
+    cases.back().dsv.Texture2DArray = {0, 1, 1};
+    ViewCase& cube = add("cube array of two", cubes, 's');
+    cube.srv.Format = DXGI_FORMAT_BC7_UNORM;
+    cube.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+    cube.srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    cube.srv.TextureCubeArray = {0, static_cast<UINT>(-1), 0, 2, 0.0f};
+    ViewCase& oneCube = add("cube", cubes, 's');
+    oneCube.srv = cube.srv;
+    oneCube.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    oneCube.srv.TextureCube = {1, 2, 0.0f};
+    add("default srv of a volume", volume, 's').useDefault = true;
+    add("default uav of a volume", volume, 'u').useDefault = true;
+    add("rtv of volume slices 4-11", volume, 'r').rtv = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RTV_DIMENSION_TEXTURE3D, {}};
+    cases.back().rtv.Texture3D = {0, 4, 8};
+    add("default srv of bgrx", bgrx, 's').useDefault = true;
+    add("default uav of a 1D array", line, 'u').useDefault = true;
+    add("default srv of a 1D array", line, 's').useDefault = true;
+    add("default srv of msaa array", msaa, 's').useDefault = true;
+    add("default rtv of msaa array", msaa, 'r').useDefault = true;
+    return cases;
+}
+
+std::optional<ImageView> MakeView(const ViewCase& test, std::string& error) {
+    switch (test.kind) {
+    case 's': return ShaderResourceView(test.resource, test.useDefault ? nullptr : &test.srv, error);
+    case 'u': return UnorderedAccessView(test.resource, test.useDefault ? nullptr : &test.uav, error);
+    case 'r': return RenderTargetView(test.resource, test.useDefault ? nullptr : &test.rtv, error);
+    default: return DepthStencilView(test.resource, test.useDefault ? nullptr : &test.dsv, error);
+    }
+}
+
+std::vector<D3D12_SAMPLER_DESC> SamplerCases() {
+    std::vector<D3D12_SAMPLER_DESC> cases;
+    D3D12_SAMPLER_DESC base{D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, 0.0f, 1,
+                            D3D12_COMPARISON_FUNC_NEVER, {0, 0, 0, 0}, 0.0f, D3D12_FLOAT32_MAX};
+    cases.push_back(base);
+    D3D12_SAMPLER_DESC aniso = base;
+    aniso.Filter = D3D12_FILTER_ANISOTROPIC;
+    aniso.MaxAnisotropy = 16;
+    aniso.MipLODBias = -0.5f;
+    cases.push_back(aniso);
+    D3D12_SAMPLER_DESC shadow = base;
+    shadow.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    shadow.ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    shadow.AddressU = shadow.AddressV = shadow.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    shadow.BorderColor[0] = shadow.BorderColor[1] = shadow.BorderColor[2] = shadow.BorderColor[3] = 1.0f;
+    cases.push_back(shadow);
+    D3D12_SAMPLER_DESC point = base;
+    point.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    point.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    point.AddressV = D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    point.AddressW = D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    point.MinLOD = 1.0f;
+    point.MaxLOD = 4.0f;
+    cases.push_back(point);
+    D3D12_SAMPLER_DESC maximum = base;
+    maximum.Filter = D3D12_FILTER_MAXIMUM_MIN_MAG_MIP_LINEAR;
+    maximum.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    maximum.BorderColor[3] = 1.0f;
+    cases.push_back(maximum);
+    return cases;
+}
+
+int ViewsSelfTest() {
+    std::string error;
+    const std::optional<VkComponentMapping> identity = ComponentMapping(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, false);
+    if (!identity || identity->r != VK_COMPONENT_SWIZZLE_R || identity->a != VK_COMPONENT_SWIZZLE_A) return Fail("identity mapping");
+    const std::optional<VkComponentMapping> forced = ComponentMapping(D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0, 0, 3), true);
+    if (!forced || forced->r != VK_COMPONENT_SWIZZLE_ONE || forced->g != VK_COMPONENT_SWIZZLE_ZERO || forced->b != VK_COMPONENT_SWIZZLE_R || forced->a != VK_COMPONENT_SWIZZLE_ONE) return Fail("forced mapping");
+    if (ComponentMapping(0x688, false) || ComponentMapping(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING | 0x2000, false) ||
+        ComponentMapping(D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(6, 1, 2, 3), false)) return Fail("invalid mappings");
+    const std::vector<ViewCase> cases = ViewCases();
+    for (const ViewCase& test : cases) {
+        if (!MakeView(test, error)) return Fail(std::string(test.name) + ": " + error);
+    }
+    const auto view = [&](std::size_t index) { return *MakeView(cases[index], error); };
+    const ImageView srgb = view(0);
+    if (srgb.info.format != VK_FORMAT_R8G8B8A8_SRGB || srgb.info.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY || srgb.info.subresourceRange.baseMipLevel != 1 ||
+        srgb.info.subresourceRange.levelCount != 2 || srgb.info.subresourceRange.baseArrayLayer != 1 || srgb.info.subresourceRange.layerCount != 3) return Fail("srgb view");
+    const ImageView swizzled = view(1);
+    if (swizzled.info.components.r != VK_COMPONENT_SWIZZLE_B || swizzled.info.components.a != VK_COMPONENT_SWIZZLE_ONE || swizzled.info.subresourceRange.levelCount != 7) return Fail("swizzle view");
+    if (view(4).info.subresourceRange.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT || view(4).info.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return Fail("depth plane");
+    if (view(5).info.subresourceRange.aspectMask != VK_IMAGE_ASPECT_STENCIL_BIT) return Fail("stencil plane");
+    if (view(6).info.subresourceRange.aspectMask != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) || view(6).info.subresourceRange.baseArrayLayer != 1) return Fail("dsv");
+    const ImageView cubeArray = view(7);
+    if (cubeArray.info.viewType != VK_IMAGE_VIEW_TYPE_CUBE_ARRAY || cubeArray.info.subresourceRange.layerCount != 12 || !cubeArray.features.count("imageCubeArray")) return Fail("cube array");
+    if (view(8).info.subresourceRange.layerCount != 6 || view(8).info.subresourceRange.baseMipLevel != 1) return Fail("cube");
+    if (view(9).info.viewType != VK_IMAGE_VIEW_TYPE_3D || view(9).info.subresourceRange.levelCount != 7) return Fail("volume srv");
+    const ImageView slices = view(11);
+    if (slices.info.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY || slices.info.subresourceRange.baseArrayLayer != 4 || slices.info.subresourceRange.layerCount != 8) return Fail("volume slices");
+    if (view(12).info.components.a != VK_COMPONENT_SWIZZLE_ONE || view(12).info.format != VK_FORMAT_B8G8R8A8_UNORM) return Fail("bgrx alpha");
+    if (view(13).info.viewType != VK_IMAGE_VIEW_TYPE_1D_ARRAY || view(13).info.subresourceRange.layerCount != 3) return Fail("1D array");
+    if (view(15).info.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY || view(16).info.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return Fail("msaa arrays");
+
+    struct Refusal {
+        std::size_t base;
+        void (*edit)(ViewCase&);
+        const char* expected;
+    };
+    const Refusal refusals[] = {
+        {0, [](ViewCase& v) { v.srv.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS; }, "is typeless"},
+        {0, [](ViewCase& v) { v.srv.Format = DXGI_FORMAT_R32_FLOAT; }, "view format 41 is not in the format family of the texture's 27"},
+        {0, [](ViewCase& v) { v.srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; }, "is not in the format family"},
+        {12, [](ViewCase& v) { v.useDefault = false; v.srv = {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}}; v.srv.Texture2D = {0, 1, 0, 0.0f}; }, "differs from a texture that is not typeless"},
+        {0, [](ViewCase& v) { v.srv.Texture2DArray.MostDetailedMip = 7; }, "mip range 7+2"},
+        {0, [](ViewCase& v) { v.srv.Texture2DArray.ArraySize = 4; }, "array range 1+4"},
+        {0, [](ViewCase& v) { v.srv.Texture2DArray.ResourceMinLODClamp = 1.0f; }, "minimum LOD clamp"},
+        {0, [](ViewCase& v) { v.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; }, "does not match the texture's dimension"},
+        {0, [](ViewCase& v) { v.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; }, "dimension 1 is not a texture view"},
+        {0, [](ViewCase& v) { v.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE; }, "not a square array of six"},
+        {0, [](ViewCase& v) { v.srv.Shader4ComponentMapping = 0; }, "component mapping 0"},
+        {5, [](ViewCase& v) { v.srv.Texture2D.PlaneSlice = 0; }, "plane slice 0 does not match"},
+        {4, [](ViewCase& v) { v.srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM; }, "does not read a depth-stencil texture"},
+        {6, [](ViewCase& v) { v.dsv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; }, "is not a depth format"},
+        {6, [](ViewCase& v) { v.dsv.Flags = static_cast<D3D12_DSV_FLAGS>(4); }, "flags 4 are unknown"},
+        {7, [](ViewCase& v) { v.srv.TextureCubeArray.NumCubes = 3; }, "do not fit"},
+        {10, [](ViewCase& v) { v.useDefault = false; v.uav = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE3D, {}}; v.uav.Texture3D = {0, 2, 4}; }, "part of a 3D texture's depth"},
+        {11, [](ViewCase& v) { v.rtv.Texture3D = {0, 10, 8}; }, "array range 10+8"},
+        {12, [](ViewCase& v) { v.kind = 'u'; }, "without ALLOW_UNORDERED_ACCESS"},
+        {12, [](ViewCase& v) { v.kind = 'r'; }, "without ALLOW_RENDER_TARGET"},
+        {12, [](ViewCase& v) { v.kind = 'd'; }, "without ALLOW_DEPTH_STENCIL"},
+        {2, [](ViewCase& v) { v.uav.ViewDimension = static_cast<D3D12_UAV_DIMENSION>(9); }, "dimension 9 is not a supported texture view"},
+    };
+    for (const Refusal& refusal : refusals) {
+        ViewCase test = cases[refusal.base];
+        refusal.edit(test);
+        error.clear();
+        if (MakeView(test, error) || error.find(refusal.expected) == std::string::npos) return Fail(std::string("refusal '") + refusal.expected + "' gave '" + error + "'");
+    }
+    D3D12_RESOURCE_DESC denied = ViewTexture(DXGI_FORMAT_D32_FLOAT, 1, 1, static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE));
+    if (ShaderResourceView(denied, nullptr, error) || error.find("denies shader resources") == std::string::npos) return Fail("denied srv");
+
+    const std::vector<D3D12_SAMPLER_DESC> samplers = SamplerCases();
+    std::vector<Sampler> translated;
+    for (const D3D12_SAMPLER_DESC& desc : samplers) {
+        std::optional<Sampler> sampler = TranslateSampler(desc, error);
+        if (!sampler) return Fail("sampler: " + error);
+        translated.push_back(*sampler);
+    }
+    if (translated[0].info.minFilter != VK_FILTER_LINEAR || translated[0].info.mipmapMode != VK_SAMPLER_MIPMAP_MODE_LINEAR || translated[0].info.maxLod != VK_LOD_CLAMP_NONE ||
+        translated[0].info.anisotropyEnable) return Fail("linear sampler");
+    if (!translated[1].info.anisotropyEnable || translated[1].info.maxAnisotropy != 16.0f || translated[1].info.mipLodBias != -0.5f || !translated[1].features.count("samplerAnisotropy")) return Fail("anisotropic");
+    if (!translated[2].info.compareEnable || translated[2].info.compareOp != VK_COMPARE_OP_LESS_OR_EQUAL || translated[2].info.borderColor != VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE ||
+        translated[2].info.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST || translated[2].info.addressModeU != VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) return Fail("shadow sampler");
+    if (translated[3].info.minFilter != VK_FILTER_NEAREST || translated[3].info.addressModeV != VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT ||
+        translated[3].info.addressModeW != VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE || translated[3].info.minLod != 1.0f || translated[3].info.maxLod != 4.0f) return Fail("point sampler");
+    if (!translated[4].usesReduction || translated[4].reduction.reductionMode != VK_SAMPLER_REDUCTION_MODE_MAX || translated[4].info.borderColor != VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK) return Fail("max sampler");
+    const std::pair<void (*)(D3D12_SAMPLER_DESC&), const char*> samplerRefusals[] = {
+        {[](D3D12_SAMPLER_DESC& d) { d.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER; d.BorderColor[0] = 0.5f; }, "border color other than"},
+        {[](D3D12_SAMPLER_DESC& d) { d.Filter = D3D12_FILTER_ANISOTROPIC; d.MaxAnisotropy = 17; }, "anisotropy 17"},
+        {[](D3D12_SAMPLER_DESC& d) { d.Filter = static_cast<D3D12_FILTER>(0x2); }, "filter 2 is unknown"},
+        {[](D3D12_SAMPLER_DESC& d) { d.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(9); }, "address mode 9"},
+        {[](D3D12_SAMPLER_DESC& d) { d.Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT; d.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(0); }, "comparison 0"},
+        {[](D3D12_SAMPLER_DESC& d) { d.MinLOD = 5.0f; d.MaxLOD = 1.0f; }, "LOD bias or range"},
+    };
+    for (const auto& [edit, expected] : samplerRefusals) {
+        D3D12_SAMPLER_DESC desc = samplers[0];
+        edit(desc);
+        error.clear();
+        if (TranslateSampler(desc, error) || error.find(expected) == std::string::npos) return Fail(std::string("sampler refusal '") + expected + "' gave '" + error + "'");
+    }
+    std::puts("PASS views selftest");
+    return 0;
+}
+
+int ViewsGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const DeviceFunctions& vk = device->Vk();
+    std::size_t created = 0;
+    std::size_t skipped = 0;
+    int status = 0;
+    for (const ViewCase& test : ViewCases()) {
+        const std::optional<TextureImage> image = TranslateTextureDesc(test.resource, error);
+        const std::optional<ImageView> view = image ? MakeView(test, error) : std::nullopt;
+        if (!image || !view) {
+            status = Fail(std::string(test.name) + ": " + error);
+            continue;
+        }
+        std::string missing;
+        for (const std::string& feature : image->features) {
+            if (!device->HasFeature(feature)) missing += feature + " ";
+        }
+        for (const std::string& feature : view->features) {
+            if (!device->HasFeature(feature)) missing += feature + " ";
+        }
+        if (!missing.empty()) {
+            std::printf("SKIPPED %s: the device lacks %s\n", test.name, missing.c_str());
+            ++skipped;
+            continue;
+        }
+        VkImage handle = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView viewHandle = VK_NULL_HANDLE;
+        bool ok = vk.createImage(device->Handle(), &image->info, nullptr, &handle) == VK_SUCCESS;
+        if (ok) {
+            VkMemoryRequirements needs{};
+            vk.getImageMemoryRequirements(device->Handle(), handle, &needs);
+            const std::optional<std::uint32_t> type = device->MemoryType(needs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocate.allocationSize = needs.size;
+            allocate.memoryTypeIndex = type ? *type : 0;
+            ok = type && vk.allocateMemory(device->Handle(), &allocate, nullptr, &memory) == VK_SUCCESS && vk.bindImageMemory(device->Handle(), handle, memory, 0) == VK_SUCCESS;
+        }
+        if (ok) {
+            VkImageViewCreateInfo info = view->info;
+            info.image = handle;
+            VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+            usage.usage = test.kind == 's' ? VK_IMAGE_USAGE_SAMPLED_BIT : test.kind == 'u' ? VK_IMAGE_USAGE_STORAGE_BIT : test.kind == 'r' ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            info.pNext = &usage;
+            ok = vk.createImageView(device->Handle(), &info, nullptr, &viewHandle) == VK_SUCCESS;
+        }
+        if (viewHandle != VK_NULL_HANDLE) vk.destroyImageView(device->Handle(), viewHandle, nullptr);
+        if (handle != VK_NULL_HANDLE) vk.destroyImage(device->Handle(), handle, nullptr);
+        if (memory != VK_NULL_HANDLE) vk.freeMemory(device->Handle(), memory, nullptr);
+        if (!ok) {
+            status = Fail(std::string(test.name) + ": creating the image or view failed");
+            continue;
+        }
+        std::printf("OK view %s\n", test.name);
+        ++created;
+    }
+    for (const D3D12_SAMPLER_DESC& desc : SamplerCases()) {
+        std::optional<Sampler> sampler = TranslateSampler(desc, error);
+        if (!sampler) {
+            status = Fail("sampler: " + error);
+            continue;
+        }
+        std::string missing;
+        for (const std::string& feature : sampler->features) {
+            if (!device->HasFeature(feature)) missing += feature + " ";
+        }
+        if (!missing.empty()) {
+            std::printf("SKIPPED sampler: the device lacks %s\n", missing.c_str());
+            ++skipped;
+            continue;
+        }
+        if (sampler->usesReduction) sampler->info.pNext = &sampler->reduction;
+        VkSampler handle = VK_NULL_HANDLE;
+        if (vk.createSampler(device->Handle(), &sampler->info, nullptr, &handle) != VK_SUCCESS) {
+            status = Fail("vkCreateSampler failed");
+            continue;
+        }
+        vk.destroySampler(device->Handle(), handle, nullptr);
+        ++created;
+    }
+    std::printf("views and samplers: %zu created, %zu skipped for missing features\n", created, skipped);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS views gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1054,10 +1374,12 @@ int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "dump-test-shaders") == 0) return DumpTestShaders(Utf8Path(argv[2]));
     if (argc == 2 && std::strcmp(argv[1], "states-selftest") == 0) return StatesSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "textures-selftest") == 0) return TexturesSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "views-selftest") == 0) return ViewsSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "views-gpu") == 0) return ViewsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "textures-gpu") == 0) return TexturesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate]");
     return 2;
 }

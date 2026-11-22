@@ -153,7 +153,8 @@ def main():
     assert "PASS input selftest" in run([args.probe, "input-selftest"], env)
     assert "PASS states selftest" in run([args.probe, "states-selftest"], env)
     assert "PASS textures selftest" in run([args.probe, "textures-selftest"], env)
-    for command in ("states-gpu", "textures-gpu"):
+    assert "PASS views selftest" in run([args.probe, "views-selftest"], env)
+    for command in ("states-gpu", "textures-gpu", "views-gpu"):
         checked = subprocess.run([str(args.probe), command, "--validate"], capture_output=True, text=True, env=env, timeout=600)
         if checked.returncode == 4:
             checked = subprocess.run([str(args.probe), command], capture_output=True, text=True, env=env, timeout=600)

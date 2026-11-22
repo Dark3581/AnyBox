@@ -21,7 +21,7 @@ The [progress page](https://dark3581.github.io/AnyBox/progress.html) lists every
 | Library | Serves | State |
 |---|---|---|
 | [xgameruntime](core/libs/xdll/xgameruntime) | `xgameruntime.dll` | XGameRuntime init and options, all of XTaskQueue (composite queues, monitors and waiters included), XAsync, XThread and XGameSave implemented; XUser, XGameSaveFiles, most of XPackage and XSystem stubs |
-| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | uses two back ends: root signature serialization is forwarded to the host's `d3d12.dll`, and everything the device does goes to Vulkan. Built on the Vulkan side: the device, shader store, compute and graphics pipeline state (render state, vertex input, cache first), resource barriers, texture images, bindless descriptors and the buffer window ([Graphics](#graphics-and-shaders)). Device creation still stops the title until its calls show the device's shape |
+| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | uses two back ends: root signature serialization is forwarded to the host's `d3d12.dll`, and everything the device does goes to Vulkan. Built on the Vulkan side: the device, shader store, compute and graphics pipeline state (render state, vertex input, cache first), resource barriers, texture images, views and samplers, bindless descriptors and the buffer window ([Graphics](#graphics-and-shaders)). Device creation still stops the title until its calls show the device's shape |
 | [xaudio2](core/libs/xdll/xaudio2) | `xaudio2_9.dll` | forwarded to the host's XAudio2 |
 | [gameinput](core/libs/xdll/gameinput) | `gameinput.dll` | forwarded to the host's GameInput |
 | [kernelx](core/libs/xdll/kernelx) | `kernelx.dll` | Win32 subset forwarded to `kernel32` |
@@ -36,10 +36,10 @@ Console shaders ship as native GPU code, not DXIL, so no desktop driver can take
 Built and tested on a GPU without the title's executable (each with its own probe and tests):
 
 - **Pipeline state**: compute and graphics descriptions resolve their shaders through the store by the hash of each shader container. Blend, rasterizer, depth-stencil, samples, topology and formats become Vulkan state, and the input layout is matched to the vertex shader's inputs. Each pipeline is created once and taken from the pipeline cache first; one that would need too much memory to compile in the title is refused, not compiled.
-- **Resources**: D3D12 resource states become Vulkan barriers, and texture descriptions become Vulkan images (typeless, depth and block-compressed formats included).
+- **Resources**: D3D12 resource states become Vulkan barriers, texture descriptions become Vulkan images (typeless, depth and block-compressed formats included), and view and sampler descriptions become Vulkan image views and samplers.
 - **Shader resources**: the descriptor hash table and bindless set the translated shaders look their images and samplers up in, and the buffer window below 4 GB their buffer addresses point into.
 
-Still needing the executable: the device object and its methods, command lists that record into Vulkan, descriptor heaps and views, the root signature to shader register mapping, mesh pipelines and presentation.
+Still needing the executable: the device object and its methods, command lists that record into Vulkan, descriptor heaps and the console descriptor words written into them, the root signature to shader register mapping, mesh pipelines and presentation.
 
 The shader set is built on your PC from your own copy, into the build folder, like the rest of the project. It is never committed or shared. With a checkout of the translator:
 

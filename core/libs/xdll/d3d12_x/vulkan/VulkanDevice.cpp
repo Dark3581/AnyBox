@@ -85,6 +85,10 @@ const FeatureEntry kOptionalFeatures[] = {
     {"independentBlend", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.independentBlend; }},
     {"dualSrcBlend", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.dualSrcBlend; }},
     {"textureCompressionBC", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.textureCompressionBC; }},
+    {"imageCubeArray", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.imageCubeArray; }},
+    {"samplerAnisotropy", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.samplerAnisotropy; }},
+    {"samplerFilterMinmax", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.samplerFilterMinmax; }},
+    {"samplerMirrorClampToEdge", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.samplerMirrorClampToEdge; }},
 };
 
 const FeatureEntry* FindFeature(const std::string& name) {
