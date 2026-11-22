@@ -76,6 +76,13 @@ foreach(library IN LISTS ANYBOX_LIBRARY_NAMES)
     add_subdirectory(xdll/${library})
 endforeach()
 
+add_executable(module_probe probe/ModuleProbe.cpp)
+set_target_properties(module_probe PROPERTIES OUTPUT_NAME anybox-module-probe RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+if(MINGW)
+    target_link_options(module_probe PRIVATE -municode)
+endif()
+anybox_static_runtime(module_probe)
+
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

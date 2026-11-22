@@ -28,3 +28,20 @@ foreach(scenario IN ITEMS free_unknown alloc_zero rootsig_version)
     add_test(NAME lib_${scenario} COMMAND lib_probe ${ANYBOX_LIBS_DIR} unsupported ${scenario})
     set_tests_properties(lib_${scenario} PROPERTIES ENVIRONMENT ANYBOX_NO_REPORT=1)
 endforeach()
+
+foreach(variant IN ITEMS ok fail stop crash)
+    add_library(fake_module_${variant} SHARED FakeModule.cpp)
+    set_target_properties(fake_module_${variant} PROPERTIES PREFIX "")
+    string(TOUPPER ${variant} upper)
+    target_compile_definitions(fake_module_${variant} PRIVATE FAKE_MODULE_${upper})
+    anybox_static_runtime(fake_module_${variant})
+endforeach()
+target_link_libraries(fake_module_stop PRIVATE ab_d3d12_x)
+
+if(Python3_FOUND)
+    add_test(NAME module_check
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/module_check_test.py
+            --tool ${CMAKE_SOURCE_DIR}/tools/module_check.py --build-dir ${CMAKE_BINARY_DIR} --libs ${ANYBOX_LIBS_DIR}
+            --work ${CMAKE_CURRENT_BINARY_DIR}/module_check
+            $<TARGET_FILE:fake_module_ok> $<TARGET_FILE:fake_module_fail> $<TARGET_FILE:fake_module_stop> $<TARGET_FILE:fake_module_crash>)
+endif()
