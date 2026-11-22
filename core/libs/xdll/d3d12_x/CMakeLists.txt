@@ -3,4 +3,8 @@ target_include_directories(d3d12_x_store PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/stor
 target_compile_definitions(d3d12_x_store PRIVATE ABX_LIBRARY_NAME="d3d12_x")
 target_link_libraries(d3d12_x_store PUBLIC abx_runtime bcrypt)
 
-anybox_add_xdll(d3d12_x SOURCES Inventory.cpp RootSignature.cpp LINK d3d12_x_store)
+add_library(d3d12_x_vulkan STATIC vulkan/VulkanBackend.cpp)
+target_include_directories(d3d12_x_vulkan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vulkan)
+target_link_libraries(d3d12_x_vulkan PUBLIC Vulkan::Headers)
+
+anybox_add_xdll(d3d12_x SOURCES Inventory.cpp RootSignature.cpp LINK d3d12_x_store d3d12_x_vulkan)

@@ -10,6 +10,8 @@
 
 ## Full build (Windows)
 
+The libraries need the submodules under `3rdparty/` (Vulkan-Headers). Clone with `git clone --recursive`, or run `git submodule update --init` in an existing clone.
+
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build
@@ -19,6 +21,8 @@ ctest --test-dir build --output-on-failure
 Outputs:
 
 - `build/anybox-relinker.exe`
+- `build/anybox-module-probe.exe`, used by `tools/module_check.py`
+- `build/anybox-gpu-report.exe`, used by `tools/gpu_report.py`
 - `build/libs/ab_*.dll`, including `ab_runtime.dll`
 - `build/libs/anybox-libs.map`, the DLL routing table
 

@@ -83,6 +83,11 @@ if(MINGW)
 endif()
 anybox_static_runtime(module_probe)
 
+add_executable(gpu_report probe/GpuReport.cpp)
+set_target_properties(gpu_report PROPERTIES OUTPUT_NAME anybox-gpu-report RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_link_libraries(gpu_report PRIVATE d3d12_x_vulkan)
+anybox_static_runtime(gpu_report)
+
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

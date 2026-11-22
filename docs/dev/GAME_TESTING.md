@@ -8,6 +8,7 @@ Every run is useful, including one that stops at once: the run report names the 
 - Audit the title first: `python tools/import_audit.py <package> --json audit.json`. Keep the summary line for the report.
 - Convert with `--registry` and every folder of title DLLs as `--module-dir` ([USAGE](../user/USAGE.md)).
 - Check that the converted DLLs load: `python tools/module_check.py <out> --build-dir build`. Each DLL with a `.registry.json` beside it (every DLL except AnyBox's `ab_*.dll` when none has one) is loaded by `anybox-module-probe.exe` in its own process, which runs its `DllMain`. A DLL that fails names the Win32 error and, when `DllMain` raised one, the exception code with module and offset; one that calls a stub names the AnyBox function. It needs no executable, so it also works on a package whose executable is missing.
+- Check the GPU against the title's shader store ([Shader store](#shader-store)): `python tools/gpu_report.py --build-dir build --store <out>\shaders`. It lists each Vulkan device and every feature, push constant size, subgroup operation per stage or 64-wide subgroup the store's modules need and the device lacks. Without `--store` it lists the devices only.
 - Run one title at a time.
 
 ## Run

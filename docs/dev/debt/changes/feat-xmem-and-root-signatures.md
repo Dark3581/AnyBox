@@ -18,7 +18,7 @@
 
 ## change [every entry point stops the title]
 
-- [Inventory](../../../core/libs/xdll/d3d12_x/Inventory.cpp) (d3d12_x) - `D3D12XboxCreateDevice`, `D3D12CreateDevice` and `D3D12GetDebugInterface` stop the title. D3D12.X interfaces have console-specific methods and layouts, so they cannot be forwarded to desktop `d3d12.dll`; a translation layer to desktop D3D12 or Vulkan is needed, along with a shader path for console-compiled shaders. `D3D12CreateDevice` and `D3D12GetDebugInterface` are declared with the desktop `d3d12.h` prototypes; the console prototypes are unverified
+- [Inventory](../../../core/libs/xdll/d3d12_x/Inventory.cpp) (d3d12_x) - `D3D12XboxCreateDevice`, `D3D12CreateDevice` and `D3D12GetDebugInterface` stop the title. D3D12.X interfaces have console-specific methods and layouts, so they cannot be forwarded to desktop `d3d12.dll`; the layer goes to Vulkan ([#4](https://github.com/Dark3581/AnyBox/issues/4)), with shaders from the shader store. `D3D12CreateDevice` and `D3D12GetDebugInterface` are declared with the desktop `d3d12.h` prototypes; the console prototypes are unverified
   Closes when: a title draws its first frame
 
 ## add Functional
