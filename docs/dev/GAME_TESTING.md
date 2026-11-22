@@ -100,6 +100,7 @@ ctest --test-dir build -L shaders --output-on-failure
 | `ANYBOX_SHADER_JOBS` | Workers for the translator and the pipeline check. `0` (default) leaves the choice to them. |
 | `ANYBOX_WAVE64_EMULATE` | The translator's wave64 emulation mode, `auto` (default), `on` or `off`. 32-wide GPUs need it on. |
 | `ANYBOX_PIPELINE_CHUNK` | Index entries per pipeline checker process, `500` by default. The GPU driver's compiler keeps its memory until the process exits, so one process for the whole set can run out of memory hours in. `0` runs one process. |
+| `ANYBOX_PIPELINE_MAX_BYTES` | Modules larger than this many bytes are reported as `BIG SKIP` instead of compiled. `0` (default) compiles all. Use it when a few huge modules need more memory than this PC can commit: the rest of their chunk is still checked, and the check reports the skipped modules by name and does not pass. |
 
 The translator's own requirements (its disassembler, the Vulkan SDK's `spirv-as` and `spirv-val`) come from your environment, as when you run it by hand.
 

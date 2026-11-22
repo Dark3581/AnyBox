@@ -128,6 +128,7 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(build_shaders.pipeline_command(Path("check.exe"), paths, 0, 500, 250),
                          ["check.exe", str(paths["translated"]), str(paths["cache"]), "--start", "500", "--count", "250"])
         self.assertEqual(build_shaders.pipeline_command(Path("check.exe"), paths, 6, 0, 1)[-2:], ["--jobs", "6"])
+        self.assertEqual(build_shaders.pipeline_command(Path("check.exe"), paths, 0, 0, 1, 41943040)[-2:], ["--max-bytes", "41943040"])
 
     def test_chunk_ranges(self):
         self.assertEqual(build_shaders.chunk_ranges(1201, 500), [(0, 500), (500, 500), (1000, 201)])
@@ -216,7 +217,7 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(self.summary()["store"]["missing"], 1)
 
     def use_checker(self, mode):
-        build_shaders.pipeline_command = lambda checker, paths, jobs, start, count: [
+        build_shaders.pipeline_command = lambda checker, paths, jobs, start, count, max_bytes=0: [
             sys.executable, str(self.checker), mode, "--start", str(start), "--count", str(count)]
 
     def check(self, *extra):
@@ -277,6 +278,7 @@ class BuildTest(unittest.TestCase):
         finally:
             del os.environ["FAKE_CHECKER_RUNS"]
         self.assertEqual(self.check("--pipeline-chunk", "-1")[0], 1)
+        self.assertEqual(self.check("--pipeline-max-bytes", "-1")[0], 1)
 
     def test_a_new_translation_drops_old_results(self):
         self.assertEqual(self.build()[0], 0)

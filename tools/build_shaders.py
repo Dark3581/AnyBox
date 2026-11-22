@@ -42,9 +42,9 @@ def translator_command(translator, package, paths, jobs, wave64):
     return command + (["--jobs", str(jobs)] if jobs else [])
 
 
-def pipeline_command(checker, paths, jobs, start, count):
+def pipeline_command(checker, paths, jobs, start, count, max_bytes=0):
     command = [str(checker), str(paths["translated"]), str(paths["cache"]), "--start", str(start), "--count", str(count)]
-    return command + (["--jobs", str(jobs)] if jobs else [])
+    return command + (["--jobs", str(jobs)] if jobs else []) + (["--max-bytes", str(max_bytes)] if max_bytes else [])
 
 
 def chunk_ranges(entries, size):
@@ -193,6 +193,8 @@ def main(argv=None):
     parser.add_argument("--pipeline-check", type=Path, help="pipeline checker executable (default: the translator's runtime/build/vk_pipeline_check.exe)")
     parser.add_argument("--pipeline-chunk", type=int, default=DEFAULT_CHUNK,
                         help=f"index entries per pipeline checker process (default {DEFAULT_CHUNK}; 0: one process). The driver's compiler keeps its memory until the process exits.")
+    parser.add_argument("--pipeline-max-bytes", type=int, default=0,
+                        help="report modules larger than this many bytes as BIG SKIP instead of compiling them (default 0: compile all). The check does not pass while any module is skipped.")
     parser.add_argument("--recheck", action="store_true", help="check every chunk again instead of reusing chunks that passed with the same checker")
     args = parser.parse_args(argv)
     paths = layout(args.out.resolve())
@@ -200,8 +202,8 @@ def main(argv=None):
         steps = parse_steps(args.steps)
         if args.jobs < 0:
             raise BuildError("--jobs must be 0 or more")
-        if args.pipeline_chunk < 0:
-            raise BuildError("--pipeline-chunk must be 0 or more")
+        if args.pipeline_chunk < 0 or args.pipeline_max_bytes < 0:
+            raise BuildError("--pipeline-chunk and --pipeline-max-bytes must be 0 or more")
         package, translator = args.package.resolve(), args.translator.resolve()
         summary = read_json(paths["summary"], {}) or {}
         summary.update({"format": FORMAT, "version": VERSION, "package": str(package), "translator": {"path": str(translator), **translator_revision(translator)}})
@@ -250,7 +252,7 @@ def main(argv=None):
                     continue
                 log = chunk_log(paths, start, count)
                 began = time.monotonic()
-                code = run_logged(pipeline_command(checker, paths, args.jobs, start, count), log)
+                code = run_logged(pipeline_command(checker, paths, args.jobs, start, count, args.pipeline_max_bytes), log)
                 chunk = {"start": start, "count": count, **parse_pipelines(log.read_text(encoding="utf-8")), "exit_code": code,
                          "seconds": round(time.monotonic() - began, 1)}
                 chunks.append(chunk)
