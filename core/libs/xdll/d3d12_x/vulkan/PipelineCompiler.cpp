@@ -15,9 +15,11 @@ namespace {
 
 constexpr std::uint32_t kSpirvMagic = 0x07230203;
 
-std::optional<std::vector<char>> ReadFile(const std::filesystem::path& path) {
+}
+
+std::optional<std::vector<char>> ReadWholeFile(const std::filesystem::path& path, std::size_t pieceBytes) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
+    if (!file || pieceBytes == 0) {
         return std::nullopt;
     }
     const std::streamoff size = file.tellg();
@@ -26,16 +28,34 @@ std::optional<std::vector<char>> ReadFile(const std::filesystem::path& path) {
     }
     std::vector<char> data(static_cast<std::size_t>(size));
     file.seekg(0);
-    if (size > 0 && !file.read(data.data(), size)) {
-        return std::nullopt;
+    for (std::size_t done = 0; done < data.size();) {
+        const std::size_t piece = std::min(pieceBytes, data.size() - done);
+        if (!file.read(data.data() + done, static_cast<std::streamsize>(piece)) || file.gcount() != static_cast<std::streamsize>(piece)) {
+            return std::nullopt;
+        }
+        done += piece;
     }
     return data;
 }
 
+bool WriteWholeFile(const std::filesystem::path& path, const std::vector<char>& data, std::size_t pieceBytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out || pieceBytes == 0) {
+        return false;
+    }
+    for (std::size_t done = 0; done < data.size();) {
+        const std::size_t piece = std::min(pieceBytes, data.size() - done);
+        if (!out.write(data.data() + done, static_cast<std::streamsize>(piece))) {
+            return false;
+        }
+        done += piece;
+    }
+    out.close();
+    return static_cast<bool>(out);
 }
 
 std::optional<std::vector<std::uint32_t>> ReadSpirv(const std::filesystem::path& path, std::string& error) {
-    const std::optional<std::vector<char>> data = ReadFile(path);
+    const std::optional<std::vector<char>> data = ReadWholeFile(path);
     if (!data) {
         error = "cannot read " + path.string();
         return std::nullopt;
@@ -68,7 +88,7 @@ PipelineCache::PipelineCache(const VulkanDevice& device, std::filesystem::path f
     if (!file_.empty()) {
         std::error_code ignored;
         if (std::filesystem::exists(file_, ignored)) {
-            const std::optional<std::vector<char>> data = ReadFile(file_);
+            const std::optional<std::vector<char>> data = ReadWholeFile(file_);
             const VkPhysicalDeviceProperties& properties = device_.Properties();
             if (!data) {
                 note_ = "the cache file could not be read; starting empty";
@@ -129,14 +149,9 @@ bool PipelineCache::Save(std::size_t& written, std::string& error) const {
     }
     std::filesystem::path partial = file_;
     partial += L".partial";
-    {
-        std::ofstream out(partial, std::ios::binary | std::ios::trunc);
-        out.write(data.data(), static_cast<std::streamsize>(data.size()));
-        out.close();
-        if (!out) {
-            error = "cannot write " + partial.string();
-            return false;
-        }
+    if (!WriteWholeFile(partial, data)) {
+        error = "cannot write " + partial.string();
+        return false;
     }
     if (MoveFileExW(partial.c_str(), file_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
         error = "cannot replace " + file_.string() + " (error " + std::to_string(GetLastError()) + ")";

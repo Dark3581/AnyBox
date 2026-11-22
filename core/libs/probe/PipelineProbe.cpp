@@ -133,6 +133,18 @@ int SelfTest(const std::filesystem::path& work) {
     std::ofstream(broken, std::ios::binary).write("not spirv", 9);
     std::string readError;
     if (ReadSpirv(broken, readError) || readError.find("whole number") == std::string::npos) return Fail("odd-sized SPIR-V: " + readError);
+    std::vector<char> pieces((std::size_t{1} << 20) + 3);
+    for (std::size_t index = 0; index < pieces.size(); ++index) pieces[index] = static_cast<char>(index * 131 + (index >> 11));
+    const std::filesystem::path piecesFile = work / "pieces.bin";
+    if (!WriteWholeFile(piecesFile, pieces, 4096) || std::filesystem::file_size(piecesFile) != pieces.size()) return Fail("write in pieces");
+    for (const std::size_t piece : {std::size_t{4096}, std::size_t{1000}, pieces.size(), kFilePieceBytes}) {
+        const std::optional<std::vector<char>> back = ReadWholeFile(piecesFile, piece);
+        if (!back || *back != pieces) return Fail("read in pieces of " + std::to_string(piece));
+    }
+    if (ReadWholeFile(piecesFile, 0) || ReadWholeFile(work / "missing.bin") || WriteWholeFile(work / "none" / "x.bin", pieces)) return Fail("file piece errors");
+    std::ofstream(work / "empty.bin", std::ios::binary | std::ios::trunc).close();
+    const std::optional<std::vector<char>> nothing = ReadWholeFile(work / "empty.bin");
+    if (!nothing || !nothing->empty()) return Fail("empty file");
 
     const std::filesystem::path cacheFile = work / "cache.bin";
     std::filesystem::remove(cacheFile);
