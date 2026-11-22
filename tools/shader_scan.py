@@ -2,7 +2,9 @@ import argparse
 import json
 import mmap
 import struct
+import re
 import sys
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -10,6 +12,11 @@ MAGIC = b"DXBC"
 HEADER = 32
 MAX_PARTS = 64
 CODE_PARTS = {"DXIL": "dxil", "SHEX": "dxbc", "SHDR": "dxbc"}
+BITCODE = b"BC\xc0\xde"
+MAX_STORED = 64 << 20
+MAX_INFLATED = 256 << 20
+ENTRY = re.compile(rb"\x00.(?P<stored>.{4}).{4}(?P=stored)(?P<size>.{4})", re.DOTALL)
+NAME = re.compile(rb"[\x21-\x7e]{3,200}\Z")
 
 
 def container_at(data, offset):
@@ -27,8 +34,32 @@ def container_at(data, offset):
         length = struct.unpack_from("<I", data, offset + part + 4)[0]
         if part + 8 + length > size or not all(0x20 <= c < 0x7F for c in fourcc):
             return None
-        parts.append(fourcc.decode("ascii"))
+        parts.append((fourcc.decode("ascii"), offset + part + 8, length))
     return size, parts
+
+
+def dxil_program(data, start, length):
+    if length < 24 or bytes(data[start + 8:start + 12]) != b"DXIL":
+        return "unknown"
+    bitcode_offset, bitcode_size = struct.unpack_from("<II", data, start + 16)
+    begin = start + 8 + bitcode_offset
+    if bitcode_size < 4 or 8 + bitcode_offset + bitcode_size > length:
+        return "unknown"
+    magic = bytes(data[begin:begin + 4])
+    if magic == BITCODE:
+        return "bitcode"
+    if magic == b"NOBC":
+        return "native" if b"XBCH" in data[start:start + length] else "stub"
+    return "unknown"
+
+
+def describe(data, offset, found):
+    size, parts = found
+    entry = {"offset": offset, "size": size, "kind": kind([tag for tag, _, _ in parts]), "parts": [tag for tag, _, _ in parts]}
+    program = next(((start, length) for tag, start, length in parts if tag == "DXIL"), None)
+    if program is not None:
+        entry["program"] = dxil_program(data, *program)
+    return entry
 
 
 def kind(parts):
@@ -49,10 +80,40 @@ def scan_file(path):
         while offset != -1:
             found = container_at(data, offset)
             if found:
-                containers.append({"offset": offset, "size": found[0], "kind": kind(found[1]), "parts": found[1]})
+                containers.append(describe(data, offset, found))
                 offset = data.find(MAGIC, offset + found[0])
             else:
                 offset = data.find(MAGIC, offset + 1)
+        if bytes(data[:4]) == b"9FPR":
+            containers += deflate_entries(data)
+    return containers
+
+
+def deflate_entries(data):
+    containers = []
+    for match in ENTRY.finditer(data):
+        stored = struct.unpack("<I", match.group("stored"))[0]
+        size = struct.unpack("<I", match.group("size"))[0]
+        if not HEADER <= size <= MAX_INFLATED or not 0 < stored <= MAX_STORED:
+            continue
+        start = match.end()
+        if start + stored > len(data):
+            continue
+        try:
+            inflated = zlib.decompressobj(-zlib.MAX_WBITS).decompress(data[start:start + stored], size + 1)
+        except zlib.error:
+            continue
+        if len(inflated) != size or inflated[:4] != MAGIC:
+            continue
+        found = container_at(inflated, 0)
+        if not found or found[0] != size:
+            continue
+        entry = describe(inflated, match.start(), found)
+        entry["stored"] = "deflate"
+        name = NAME.search(data, max(0, match.start() - 200), match.start())
+        if name:
+            entry["name"] = name.group().decode("ascii")
+        containers.append(entry)
     return containers
 
 
@@ -64,12 +125,16 @@ def collect(paths):
 
 
 def summarize(results):
-    kinds, parts = Counter(), Counter()
+    kinds, parts, programs, stored = Counter(), Counter(), Counter(), Counter()
     for containers in results.values():
         for container in containers:
             kinds[container["kind"]] += 1
             parts.update(container["parts"])
-    return {"files": sum(1 for c in results.values() if c), "containers": sum(kinds.values()), "kinds": dict(sorted(kinds.items())), "parts": dict(sorted(parts.items()))}
+            if "program" in container:
+                programs[container["program"]] += 1
+            stored[container.get("stored", "plain")] += 1
+    return {"files": sum(1 for c in results.values() if c), "containers": sum(kinds.values()), "kinds": dict(sorted(kinds.items())),
+            "parts": dict(sorted(parts.items())), "programs": dict(sorted(programs.items())), "stored": dict(sorted(stored.items()))}
 
 
 def main():
@@ -90,7 +155,8 @@ def main():
             print(f"{path}: {', '.join(f'{n} {k}' for k, n in sorted(Counter(c['kind'] for c in containers).items()))}")
 
     summary = summarize(results)
-    print(f"{summary['containers']} containers in {summary['files']} files; kinds: {summary['kinds']}; parts: {summary['parts']}")
+    print(f"{summary['containers']} containers in {summary['files']} files; kinds: {summary['kinds']}; programs: {summary['programs']}; "
+          f"stored: {summary['stored']}; parts: {summary['parts']}")
     if args.json:
         args.json.write_text(json.dumps({"summary": summary, "files": results}, indent=2) + "\n", encoding="utf-8")
     return 0

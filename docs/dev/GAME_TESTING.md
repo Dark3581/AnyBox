@@ -57,4 +57,13 @@ The D3D12.X design ([#4](https://github.com/dark3581/AnyBox/issues/4)) depends o
 python tools/shader_scan.py <decrypted package folder> --json shaders.json
 ```
 
-Part tags that are not standard DXBC parts point at console-specific data. Shaders inside compressed archives are not found. Post the summary line in the issue; the JSON holds names, offsets and part tags only, never shader bytes.
+Part tags that are not standard DXBC parts point at console-specific data. Each container with a `DXIL` part also gets a `program` class, read from the bitcode slot of the DXIL program header:
+
+| `program` | Meaning |
+|---|---|
+| `bitcode` | LLVM bitcode, so the shader is DXIL a desktop driver could take |
+| `native` | the slot holds `NOBC` and the part carries an `XBCH` block: no DXIL, the GPU program is precompiled for the console |
+| `stub` | `NOBC` without an `XBCH` block |
+| `unknown` | the header does not parse |
+
+In an RPF9 archive (file magic `9FPR`) the scan also reads entries stored as raw deflate, which the table of contents is not needed for: `<name> 00 <u8> <u32 stored> <u32> <u32 stored> <u32 size>` followed by `stored` bytes that inflate to a `size`-byte container. Those containers have `stored: deflate` and their `name`, and their `offset` is the entry header's. Shaders in other compressed archives are not found. Post the summary line in the issue; the JSON holds names, offsets and part tags only, never shader bytes.
