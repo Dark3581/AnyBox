@@ -5,6 +5,7 @@
 #include "PipelineState.hpp"
 #include "ResourceState.hpp"
 #include "ShaderStore.hpp"
+#include "TextureDesc.hpp"
 #include "VertexInput.hpp"
 #include "VulkanDevice.hpp"
 
@@ -894,6 +895,154 @@ int StatesGpu(bool validate) {
     return 0;
 }
 
+D3D12_RESOURCE_DESC TextureDesc2D(DXGI_FORMAT format, UINT64 width, UINT height, UINT16 layers, UINT16 mips, D3D12_RESOURCE_FLAGS flags) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = layers;
+    desc.MipLevels = mips;
+    desc.Format = format;
+    desc.SampleDesc = {1, 0};
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = flags;
+    return desc;
+}
+
+struct TextureCase {
+    const char* name;
+    D3D12_RESOURCE_DESC desc;
+};
+
+std::vector<TextureCase> TextureCases() {
+    std::vector<TextureCase> cases;
+    cases.push_back({"rgba8 render target and UAV, full chain", TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 256, 128, 1, 0,
+                                                                                static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))});
+    cases.push_back({"typeless rgba8 render target", TextureDesc2D(DXGI_FORMAT_R8G8B8A8_TYPELESS, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)});
+    cases.push_back({"d32 depth, sampled", TextureDesc2D(DXGI_FORMAT_D32_FLOAT, 512, 512, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)});
+    cases.push_back({"r32 typeless depth", TextureDesc2D(DXGI_FORMAT_R32_TYPELESS, 512, 512, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)});
+    cases.push_back({"d32s8 typeless depth, not sampled", TextureDesc2D(DXGI_FORMAT_R32G8X24_TYPELESS, 128, 128, 2, 1,
+                                                                        static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))});
+    cases.push_back({"bc7 cube", TextureDesc2D(DXGI_FORMAT_BC7_UNORM_SRGB, 128, 128, 6, 0, D3D12_RESOURCE_FLAG_NONE)});
+    cases.push_back({"bc1 typeless array", TextureDesc2D(DXGI_FORMAT_BC1_TYPELESS, 64, 32, 4, 3, D3D12_RESOURCE_FLAG_NONE)});
+    cases.push_back({"r32 typeless color UAV", TextureDesc2D(DXGI_FORMAT_R32_TYPELESS, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)});
+    D3D12_RESOURCE_DESC msaa = TextureDesc2D(DXGI_FORMAT_R16G16B16A16_FLOAT, 320, 180, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    msaa.SampleDesc = {4, 0};
+    cases.push_back({"4x rgba16f render target", msaa});
+    D3D12_RESOURCE_DESC volume = TextureDesc2D(DXGI_FORMAT_R16G16B16A16_FLOAT, 32, 32, 16, 0,
+                                               static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+    volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    cases.push_back({"3d rgba16f UAV and render target", volume});
+    D3D12_RESOURCE_DESC line = TextureDesc2D(DXGI_FORMAT_R32_FLOAT, 1024, 1, 8, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    line.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    cases.push_back({"1d r32f array UAV", line});
+    cases.push_back({"bgrx8 sampled", TextureDesc2D(DXGI_FORMAT_B8G8R8X8_UNORM, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_NONE)});
+    return cases;
+}
+
+int TexturesSelfTest() {
+    std::string error;
+    if (FullMipChain(256, 128, 1) != 9 || FullMipChain(1, 1, 1) != 1 || FullMipChain(1000, 1, 1) != 10 || FullMipChain(4, 4, 64) != 7) return Fail("full mip chain");
+    const std::optional<TextureFormat> depth = TextureStorageFormat(DXGI_FORMAT_R24G8_TYPELESS, true);
+    if (!depth || depth->format != VK_FORMAT_D24_UNORM_S8_UINT || depth->aspects != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) || depth->mutableFormat) return Fail("r24g8 typeless");
+    if (TextureStorageFormat(DXGI_FORMAT_R32_TYPELESS, true)->format != VK_FORMAT_D32_SFLOAT || TextureStorageFormat(DXGI_FORMAT_R32_TYPELESS, false)->format != VK_FORMAT_R32_UINT ||
+        !TextureStorageFormat(DXGI_FORMAT_R32_TYPELESS, false)->mutableFormat) return Fail("r32 typeless");
+    if (TextureStorageFormat(DXGI_FORMAT_BC1_UNORM, false)->format != VK_FORMAT_BC1_RGBA_UNORM_BLOCK || !TextureStorageFormat(DXGI_FORMAT_BC6H_SF16, false)->compressed ||
+        TextureStorageFormat(DXGI_FORMAT_BC6H_TYPELESS, false)->format != VK_FORMAT_BC6H_UFLOAT_BLOCK) return Fail("block formats");
+    if (TextureStorageFormat(DXGI_FORMAT_D16_UNORM, true)->aspects != VK_IMAGE_ASPECT_DEPTH_BIT || TextureStorageFormat(DXGI_FORMAT_R8G8B8A8_UNORM, false)->mutableFormat) return Fail("direct formats");
+    if (TextureStorageFormat(static_cast<DXGI_FORMAT>(200), false) || TextureStorageFormat(DXGI_FORMAT_UNKNOWN, false)) return Fail("unknown formats");
+    const std::vector<TextureCase> cases = TextureCases();
+    for (const TextureCase& test : cases) {
+        if (!TranslateTextureDesc(test.desc, error)) return Fail(std::string(test.name) + ": " + error);
+    }
+    const std::optional<TextureImage> chain = TranslateTextureDesc(cases[0].desc, error);
+    const VkImageUsageFlags rgbaUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    if (chain->info.mipLevels != 9 || chain->info.usage != rgbaUsage || chain->info.flags != 0 || chain->info.imageType != VK_IMAGE_TYPE_2D) return Fail("rgba8 image");
+    const std::optional<TextureImage> typeless = TranslateTextureDesc(cases[1].desc, error);
+    if ((typeless->info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) == 0 || (typeless->info.flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) == 0) return Fail("typeless is mutable");
+    const std::optional<TextureImage> denied = TranslateTextureDesc(cases[4].desc, error);
+    if ((denied->info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0 || (denied->info.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0 || denied->info.arrayLayers != 2) return Fail("denied shader resource");
+    const std::optional<TextureImage> cube = TranslateTextureDesc(cases[5].desc, error);
+    if ((cube->info.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) == 0 || cube->info.mipLevels != 8 || cube->features != std::set<std::string>{"textureCompressionBC"}) return Fail("bc7 cube");
+    const std::optional<TextureImage> volume = TranslateTextureDesc(cases[9].desc, error);
+    if (volume->info.imageType != VK_IMAGE_TYPE_3D || volume->info.extent.depth != 16 || volume->info.arrayLayers != 1 || volume->info.mipLevels != 6 ||
+        (volume->info.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) == 0) return Fail("volume");
+    if (TranslateTextureDesc(cases[8].desc, error)->info.samples != VK_SAMPLE_COUNT_4_BIT) return Fail("msaa samples");
+
+    const std::pair<void (*)(D3D12_RESOURCE_DESC&), const char*> refusals[] = {
+        {[](D3D12_RESOURCE_DESC& d) { d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; }, "resource dimension 1 is not a texture"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; }, "texture layout 1 is not supported"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Format = static_cast<DXGI_FORMAT>(200); }, "texture format 200 has no Vulkan mapping"},
+        {[](D3D12_RESOURCE_DESC& d) { d.MipLevels = 12; }, "12 mip levels are more than the 9 of a full chain"},
+        {[](D3D12_RESOURCE_DESC& d) { d.SampleDesc.Count = 3; }, "sample count 3"},
+        {[](D3D12_RESOURCE_DESC& d) { d.SampleDesc.Count = 4; }, "multisampled texture must be 2D with one mip level and no unordered access"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Width = 0; }, "zero or oversized extent"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Width = 0x100000000ull; }, "zero or oversized extent"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Format = DXGI_FORMAT_D32_FLOAT; }, "depth format 40 without ALLOW_DEPTH_STENCIL"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL; }, "a depth-stencil texture has the color format 28"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Format = DXGI_FORMAT_D32_FLOAT; d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS); }, "cannot also allow"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE; }, "DENY_SHADER_RESOURCE without ALLOW_DEPTH_STENCIL"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Format = DXGI_FORMAT_BC3_UNORM; }, "a block-compressed texture is 1D or allows"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x100); }, "resource flags 256 are not supported"},
+        {[](D3D12_RESOURCE_DESC& d) { d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D; }, "a 1D texture has height 128"},
+    };
+    for (const auto& [edit, expected] : refusals) {
+        D3D12_RESOURCE_DESC desc = cases[0].desc;
+        edit(desc);
+        error.clear();
+        if (TranslateTextureDesc(desc, error) || error.find(expected) == std::string::npos) return Fail(std::string("refusal '") + expected + "' gave '" + error + "'");
+    }
+    std::puts("PASS textures selftest");
+    return 0;
+}
+
+int TexturesGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    std::size_t created = 0;
+    std::size_t skipped = 0;
+    int status = 0;
+    for (const TextureCase& test : TextureCases()) {
+        const std::optional<TextureImage> image = TranslateTextureDesc(test.desc, error);
+        if (!image) {
+            status = Fail(std::string(test.name) + ": " + error);
+            continue;
+        }
+        std::string missing;
+        for (const std::string& feature : image->features) {
+            if (!device->HasFeature(feature)) missing += feature;
+        }
+        if (!missing.empty()) {
+            std::printf("SKIPPED %s: the device lacks %s\n", test.name, missing.c_str());
+            ++skipped;
+            continue;
+        }
+        VkImage handle = VK_NULL_HANDLE;
+        const VkResult result = device->Vk().createImage(device->Handle(), &image->info, nullptr, &handle);
+        if (result != VK_SUCCESS) {
+            status = Fail(std::string(test.name) + ": vkCreateImage failed with " + std::to_string(static_cast<int>(result)));
+            continue;
+        }
+        device->Vk().destroyImage(device->Handle(), handle, nullptr);
+        std::printf("OK %s\n", test.name);
+        ++created;
+    }
+    std::printf("textures: %zu created, %zu skipped for missing features\n", created, skipped);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS textures gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -904,9 +1053,11 @@ int main(int argc, char** argv) {
     if (argc >= 4 && std::strcmp(argv[1], "graphics-title") == 0) return GraphicsTitle(argc, argv);
     if (argc == 3 && std::strcmp(argv[1], "dump-test-shaders") == 0) return DumpTestShaders(Utf8Path(argv[2]));
     if (argc == 2 && std::strcmp(argv[1], "states-selftest") == 0) return StatesSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "textures-selftest") == 0) return TexturesSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "textures-gpu") == 0) return TexturesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate]");
     return 2;
 }

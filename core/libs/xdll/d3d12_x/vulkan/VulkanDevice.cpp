@@ -84,6 +84,7 @@ const FeatureEntry kOptionalFeatures[] = {
     {"depthBiasClamp", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.depthBiasClamp; }},
     {"independentBlend", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.independentBlend; }},
     {"dualSrcBlend", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.dualSrcBlend; }},
+    {"textureCompressionBC", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.textureCompressionBC; }},
 };
 
 const FeatureEntry* FindFeature(const std::string& name) {

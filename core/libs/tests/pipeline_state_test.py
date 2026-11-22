@@ -152,11 +152,13 @@ def main():
     assert "PASS graphics selftest" in run([args.probe, "graphics-selftest"], env)
     assert "PASS input selftest" in run([args.probe, "input-selftest"], env)
     assert "PASS states selftest" in run([args.probe, "states-selftest"], env)
-    states = subprocess.run([str(args.probe), "states-gpu", "--validate"], capture_output=True, text=True, env=env, timeout=600)
-    if states.returncode == 4:
-        states = subprocess.run([str(args.probe), "states-gpu"], capture_output=True, text=True, env=env, timeout=600)
-    print(states.stdout.strip())
-    assert states.returncode in (0, 3), (states.stdout[-3000:], states.stderr[-2000:])
+    assert "PASS textures selftest" in run([args.probe, "textures-selftest"], env)
+    for command in ("states-gpu", "textures-gpu"):
+        checked = subprocess.run([str(args.probe), command, "--validate"], capture_output=True, text=True, env=env, timeout=600)
+        if checked.returncode == 4:
+            checked = subprocess.run([str(args.probe), command], capture_output=True, text=True, env=env, timeout=600)
+        print(checked.stdout.strip())
+        assert checked.returncode in (0, 3), (command, checked.stdout[-3000:], checked.stderr[-2000:])
     graphics = subprocess.run([str(args.probe), "graphics-gpu", "--validate"], capture_output=True, text=True, env=env, timeout=600)
     if graphics.returncode == 4:
         print("validation layer not installed: creating graphics pipelines without it")
