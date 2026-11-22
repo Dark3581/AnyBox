@@ -3,6 +3,7 @@
 #include "ResourceState.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace abx::d3d12x {
 
@@ -36,6 +37,193 @@ UINT64 TexelBytes(const TextureRef& texture) {
     return block ? block->bytes : 0;
 }
 
+}
+
+std::optional<VkPrimitiveTopology> VulkanTopology(D3D_PRIMITIVE_TOPOLOGY topology) {
+    switch (topology) {
+    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    default: return std::nullopt;
+    }
+}
+
+std::optional<VkViewport> VulkanViewport(const D3D12_VIEWPORT& viewport) {
+    const float values[6] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, viewport.MinDepth, viewport.MaxDepth};
+    for (const float value : values) {
+        if (!std::isfinite(value)) {
+            return std::nullopt;
+        }
+    }
+    if (viewport.Width <= 0.0f || viewport.Height <= 0.0f || viewport.MinDepth < 0.0f || viewport.MinDepth > 1.0f || viewport.MaxDepth < 0.0f || viewport.MaxDepth > 1.0f) {
+        return std::nullopt;
+    }
+    return VkViewport{viewport.TopLeftX, viewport.TopLeftY + viewport.Height, viewport.Width, -viewport.Height, viewport.MinDepth, viewport.MaxDepth};
+}
+
+bool CommandRecorder::BeginRendering(const std::vector<AttachmentRef>& colors, const AttachmentRef* depthStencil, VkExtent2D extent, std::uint32_t layers, std::string& error) {
+    if (colors.size() > 8 || extent.width == 0 || extent.height == 0 || layers == 0) {
+        error = "a render pass has more than 8 color targets or an empty area";
+        return false;
+    }
+    std::vector<VkRenderingAttachmentInfo> attachments(colors.size(), VkRenderingAttachmentInfo{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+    for (std::size_t index = 0; index < colors.size(); ++index) {
+        attachments[index].imageView = colors[index].view;
+        attachments[index].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        attachments[index].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments[index].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, extent};
+    rendering.layerCount = layers;
+    rendering.colorAttachmentCount = static_cast<std::uint32_t>(attachments.size());
+    rendering.pColorAttachments = attachments.empty() ? nullptr : attachments.data();
+    if (depthStencil != nullptr) {
+        depth.imageView = depthStencil->view;
+        depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        stencil = depth;
+        if ((depthStencil->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) rendering.pDepthAttachment = &depth;
+        if ((depthStencil->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) rendering.pStencilAttachment = &stencil;
+    }
+    device_.Vk().cmdBeginRendering(commands_, &rendering);
+    return true;
+}
+
+void CommandRecorder::EndRendering() {
+    device_.Vk().cmdEndRendering(commands_);
+}
+
+bool CommandRecorder::SetViewports(const std::vector<D3D12_VIEWPORT>& viewports, std::string& error) {
+    if (viewports.empty() || viewports.size() > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+        error = std::to_string(viewports.size()) + " viewports are not between 1 and 16";
+        return false;
+    }
+    std::vector<VkViewport> converted;
+    for (const D3D12_VIEWPORT& viewport : viewports) {
+        const std::optional<VkViewport> vulkan = VulkanViewport(viewport);
+        if (!vulkan) {
+            error = "a viewport is empty, not finite or has a depth range outside 0 to 1";
+            return false;
+        }
+        converted.push_back(*vulkan);
+    }
+    device_.Vk().cmdSetViewportWithCount(commands_, static_cast<std::uint32_t>(converted.size()), converted.data());
+    return true;
+}
+
+bool CommandRecorder::SetScissors(const std::vector<D3D12_RECT>& rects, std::string& error) {
+    if (rects.empty() || rects.size() > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+        error = std::to_string(rects.size()) + " scissor rectangles are not between 1 and 16";
+        return false;
+    }
+    std::vector<VkRect2D> converted;
+    for (const D3D12_RECT& rect : rects) {
+        const LONG left = (std::max)(rect.left, 0L);
+        const LONG top = (std::max)(rect.top, 0L);
+        const LONG right = (std::max)(rect.right, left);
+        const LONG bottom = (std::max)(rect.bottom, top);
+        converted.push_back({{left, top}, {static_cast<std::uint32_t>(right - left), static_cast<std::uint32_t>(bottom - top)}});
+    }
+    device_.Vk().cmdSetScissorWithCount(commands_, static_cast<std::uint32_t>(converted.size()), converted.data());
+    return true;
+}
+
+bool CommandRecorder::SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY topology, bool stripCut, std::string& error) {
+    const std::optional<VkPrimitiveTopology> vulkan = VulkanTopology(topology);
+    if (!vulkan) {
+        error = "primitive topology " + std::to_string(static_cast<int>(topology)) + " is not supported";
+        return false;
+    }
+    const bool strip = *vulkan == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || *vulkan == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                       *vulkan == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || *vulkan == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    device_.Vk().cmdSetPrimitiveTopology(commands_, *vulkan);
+    device_.Vk().cmdSetPrimitiveRestartEnable(commands_, strip && stripCut ? VK_TRUE : VK_FALSE);
+    return true;
+}
+
+void CommandRecorder::SetBlendFactor(const float factor[4]) {
+    device_.Vk().cmdSetBlendConstants(commands_, factor);
+}
+
+void CommandRecorder::SetStencilReference(UINT reference) {
+    device_.Vk().cmdSetStencilReference(commands_, VK_STENCIL_FACE_FRONT_AND_BACK, reference & 0xFFu);
+}
+
+bool CommandRecorder::SetVertexBuffers(UINT firstSlot, const std::vector<VertexBufferRef>& buffers, std::string& error) {
+    if (firstSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || buffers.size() > D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT - firstSlot) {
+        error = "vertex buffer slots " + std::to_string(firstSlot) + "+" + std::to_string(buffers.size()) + " pass slot 31";
+        return false;
+    }
+    if (buffers.empty()) {
+        return true;
+    }
+    std::vector<VkBuffer> handles;
+    std::vector<VkDeviceSize> offsets;
+    std::vector<VkDeviceSize> sizes;
+    std::vector<VkDeviceSize> strides;
+    for (const VertexBufferRef& view : buffers) {
+        if (view.buffer.buffer == VK_NULL_HANDLE || view.buffer.size == 0) {
+            error = "an empty vertex buffer view is not supported";
+            return false;
+        }
+        handles.push_back(view.buffer.buffer);
+        offsets.push_back(view.buffer.offset);
+        sizes.push_back(view.buffer.size);
+        strides.push_back(view.stride);
+    }
+    device_.Vk().cmdBindVertexBuffers2(commands_, firstSlot, static_cast<std::uint32_t>(handles.size()), handles.data(), offsets.data(), sizes.data(), strides.data());
+    return true;
+}
+
+bool CommandRecorder::SetIndexBuffer(const BufferRef& buffer, DXGI_FORMAT format, std::string& error) {
+    VkIndexType type = VK_INDEX_TYPE_UINT16;
+    if (format == DXGI_FORMAT_R32_UINT) {
+        type = VK_INDEX_TYPE_UINT32;
+    } else if (format != DXGI_FORMAT_R16_UINT) {
+        error = "index format " + std::to_string(static_cast<int>(format)) + " is not R16_UINT or R32_UINT";
+        return false;
+    }
+    if (buffer.buffer == VK_NULL_HANDLE || buffer.offset % (type == VK_INDEX_TYPE_UINT32 ? 4 : 2) != 0) {
+        error = "the index buffer is missing or misaligned";
+        return false;
+    }
+    device_.Vk().cmdBindIndexBuffer(commands_, buffer.buffer, buffer.offset, type);
+    return true;
+}
+
+void CommandRecorder::BindPipeline(VkPipelineBindPoint point, VkPipeline pipeline) {
+    device_.Vk().cmdBindPipeline(commands_, point, pipeline);
+}
+
+bool CommandRecorder::SetPushConstants(const void* data, std::uint32_t bytes, std::string& error) {
+    if (data == nullptr || bytes == 0 || bytes > 144 || bytes % 4 != 0) {
+        error = std::to_string(bytes) + " push constant bytes are not a whole number of words up to 144";
+        return false;
+    }
+    device_.Vk().cmdPushConstants(commands_, device_.TitlePipelineLayout(), VK_SHADER_STAGE_ALL, 0, bytes, data);
+    return true;
+}
+
+void CommandRecorder::Draw(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance) {
+    device_.Vk().cmdDraw(commands_, vertices, instances, firstVertex, firstInstance);
+}
+
+void CommandRecorder::DrawIndexed(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance) {
+    device_.Vk().cmdDrawIndexed(commands_, indices, instances, firstIndex, baseVertex, firstInstance);
+}
+
+void CommandRecorder::Dispatch(UINT x, UINT y, UINT z) {
+    device_.Vk().cmdDispatch(commands_, x, y, z);
 }
 
 bool CommandRecorder::LayoutFor(const TextureRef& texture, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_STATES expected, VkImageLayout& layout, std::string& error) const {

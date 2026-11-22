@@ -1,5 +1,6 @@
 #include "GraphicsPipeline.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace abx::d3d12x {
@@ -159,7 +160,10 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
     colorBlend.logicOp = state.logicOp;
     colorBlend.attachmentCount = static_cast<std::uint32_t>(state.blend.size());
     colorBlend.pAttachments = state.blend.empty() ? nullptr : state.blend.data();
-    const std::vector<VkDynamicState>& dynamicStates = GraphicsDynamicStates();
+    std::vector<VkDynamicState> dynamicStates = GraphicsDynamicStates();
+    if (input.bindings.empty()) {
+        dynamicStates.erase(std::remove(dynamicStates.begin(), dynamicStates.end(), VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE), dynamicStates.end());
+    }
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
     dynamic.pDynamicStates = dynamicStates.data();

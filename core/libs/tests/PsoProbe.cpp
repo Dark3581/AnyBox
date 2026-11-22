@@ -1651,6 +1651,221 @@ int CommandsGpu(bool validate) {
     return status;
 }
 
+const std::uint32_t kCornerVertex[] = {
+#include "shaders/graphics_corner.inc"
+};
+
+const std::uint32_t kDispatchFill[] = {
+#include "shaders/dispatch_fill.inc"
+};
+
+int DrawSelfTest() {
+    if (VulkanTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || VulkanTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ) != VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY ||
+        VulkanTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST) != VK_PRIMITIVE_TOPOLOGY_POINT_LIST || VulkanTopology(D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST) ||
+        VulkanTopology(D3D_PRIMITIVE_TOPOLOGY_UNDEFINED)) return Fail("topologies");
+    const std::optional<VkViewport> viewport = VulkanViewport({10.0f, 20.0f, 300.0f, 200.0f, 0.1f, 0.9f});
+    if (!viewport || viewport->x != 10.0f || viewport->y != 220.0f || viewport->width != 300.0f || viewport->height != -200.0f || viewport->minDepth != 0.1f || viewport->maxDepth != 0.9f) return Fail("viewport flip");
+    if (!VulkanViewport({0.0f, 0.0f, 8.0f, 8.0f, 1.0f, 0.0f})) return Fail("inverted depth range");
+    if (VulkanViewport({0.0f, 0.0f, 0.0f, 8.0f, 0.0f, 1.0f}) || VulkanViewport({0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.5f}) ||
+        VulkanViewport({0.0f, std::numeric_limits<float>::quiet_NaN(), 8.0f, 8.0f, 0.0f, 1.0f})) return Fail("bad viewports");
+    std::puts("PASS draw selftest");
+    return 0;
+}
+
+int DrawGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress", "shaderInt64"};
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const DeviceFunctions& vk = device->Vk();
+    const auto makeModule = [&](const std::uint32_t* words, std::size_t bytes) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = bytes;
+        info.pCode = words;
+        VkShaderModule module = VK_NULL_HANDLE;
+        return vk.createShaderModule(device->Handle(), &info, nullptr, &module) == VK_SUCCESS ? module : VK_NULL_HANDLE;
+    };
+    const VkShaderModule corner = makeModule(kCornerVertex, sizeof(kCornerVertex));
+    const VkShaderModule inputs = makeModule(kGraphicsInputs, sizeof(kGraphicsInputs));
+    const VkShaderModule fragment = makeModule(kGraphicsFloat, sizeof(kGraphicsFloat));
+    const VkShaderModule fill = makeModule(kDispatchFill, sizeof(kDispatchFill));
+    if (!corner || !inputs || !fragment || !fill) return Fail("shader modules");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = DefaultGraphics();
+    desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    const std::optional<GraphicsPipelineState> front = TranslateGraphicsState(desc, error);
+    desc.RasterizerState.FrontCounterClockwise = TRUE;
+    const std::optional<GraphicsPipelineState> flipped = TranslateGraphicsState(desc, error);
+    const std::optional<VertexInput> layout = TranslateInputLayout({kTestLayout, 4}, TestShaderInputs(), error);
+    if (!front || !flipped || !layout) return Fail("states: " + error);
+    VkPipeline drawn = VK_NULL_HANDLE;
+    VkPipeline culled = VK_NULL_HANDLE;
+    VkPipeline buffered = VK_NULL_HANDLE;
+    if (CreateGraphicsPipeline(*device, VK_NULL_HANDLE, *front, {{VK_SHADER_STAGE_VERTEX_BIT, corner, 0}, {VK_SHADER_STAGE_FRAGMENT_BIT, fragment, 0}}, {}, 0, &drawn, error) != VK_SUCCESS ||
+        CreateGraphicsPipeline(*device, VK_NULL_HANDLE, *flipped, {{VK_SHADER_STAGE_VERTEX_BIT, corner, 0}, {VK_SHADER_STAGE_FRAGMENT_BIT, fragment, 0}}, {}, 0, &culled, error) != VK_SUCCESS ||
+        CreateGraphicsPipeline(*device, VK_NULL_HANDLE, *front, {{VK_SHADER_STAGE_VERTEX_BIT, inputs, 0}, {VK_SHADER_STAGE_FRAGMENT_BIT, fragment, 0}}, *layout, 0, &buffered, error) != VK_SUCCESS) {
+        return Fail("graphics pipelines: " + error);
+    }
+    VkComputePipelineCreateInfo computeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    computeInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, fill, "main", nullptr};
+    computeInfo.layout = device->TitlePipelineLayout();
+    VkPipeline compute = VK_NULL_HANDLE;
+    if (vk.createComputePipelines(device->Handle(), VK_NULL_HANDLE, 1, &computeInfo, nullptr, &compute) != VK_SUCCESS) return Fail("compute pipeline");
+
+    const D3D12_RESOURCE_DESC targetDesc = TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    TextureRef target;
+    target.desc = targetDesc;
+    target.layout = *TranslateTextureDesc(targetDesc, error);
+    VkDeviceMemory targetMemory = VK_NULL_HANDLE;
+    if (vk.createImage(device->Handle(), &target.layout.info, nullptr, &target.image) != VK_SUCCESS) return Fail("target image");
+    VkMemoryRequirements needs{};
+    vk.getImageMemoryRequirements(device->Handle(), target.image, &needs);
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = needs.size;
+    allocate.memoryTypeIndex = device->MemoryType(needs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT).value_or(0);
+    if (vk.allocateMemory(device->Handle(), &allocate, nullptr, &targetMemory) != VK_SUCCESS || vk.bindImageMemory(device->Handle(), target.image, targetMemory, 0) != VK_SUCCESS) return Fail("target memory");
+    std::optional<ImageView> rtv = RenderTargetView(targetDesc, nullptr, error);
+    rtv->info.image = target.image;
+    VkImageView targetView = VK_NULL_HANDLE;
+    if (vk.createImageView(device->Handle(), &rtv->info, nullptr, &targetView) != VK_SUCCESS) return Fail("target view");
+    const AttachmentRef attachment{targetView, {64, 64}, 1, VK_IMAGE_ASPECT_COLOR_BIT};
+
+    DeviceBuffer host;
+    const VkDeviceSize hostBytes = 1u << 20;
+    if (!CreateHostBuffer(*device, hostBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, host, error)) return Fail("host buffer: " + error);
+    std::uint8_t* const bytes = static_cast<std::uint8_t*>(host.mapped);
+    std::fill(bytes, bytes + hostBytes, std::uint8_t{0});
+    const BufferRef hostRef{host.buffer, 0, hostBytes};
+    struct Vertex {
+        float position[3];
+        std::uint8_t color[4];
+        std::uint16_t texcoord[2];
+    };
+    static_assert(sizeof(Vertex) == 20);
+    const Vertex vertices[3] = {{{1.0f, -1.0f, 0.0f}, {0, 0, 0, 0}, {0, 0}}, {{-1.0f, -1.0f, 0.0f}, {0, 0, 0, 0}, {0, 0}}, {{1.0f, 1.0f, 0.0f}, {0, 0, 0, 0}, {0, 0}}};
+    const VkDeviceSize vertexOffset = 0x80000;
+    const VkDeviceSize instanceOffset = 0x80100;
+    const VkDeviceSize indexOffset = 0x80200;
+    const VkDeviceSize computeOffset = 0x90000;
+    std::memcpy(bytes + vertexOffset, vertices, sizeof(vertices));
+    const std::uint16_t indices[3] = {0, 1, 2};
+    std::memcpy(bytes + indexOffset, indices, sizeof(indices));
+    VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    addressInfo.buffer = host.buffer;
+    const VkDeviceAddress address = vk.getBufferDeviceAddress(device->Handle(), &addressInfo);
+
+    const std::optional<Footprints> prints = DesktopCopyableFootprints(targetDesc, 1, 0, 1, 0, error);
+    const UINT pitch = prints->layouts[0].Footprint.RowPitch;
+    const UINT64 regionBytes = 0x10000;
+    bool recorded = true;
+    std::string step;
+    const bool submitted = device->Submit(
+        [&](VkCommandBuffer commands) {
+            CommandRecorder recorder(*device, commands);
+            const auto check = [&](bool ok, const char* name) {
+                if (!ok && recorded) {
+                    recorded = false;
+                    step = name;
+                }
+            };
+            const float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            check(recorder.InitializeTexture(target, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "initialize");
+            const auto pass = [&](VkPipeline pipeline, const D3D12_VIEWPORT& viewport, bool indexed, UINT region) {
+                check(recorder.ClearRenderTarget(attachment, blue, {}, error), "clear");
+                check(recorder.BeginRendering({attachment}, nullptr, {64, 64}, 1, error), "begin rendering");
+                check(recorder.SetViewports({viewport}, error), "viewport");
+                check(recorder.SetScissors({{0, 0, 64, 64}}, error), "scissor");
+                check(recorder.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, false, error), "topology");
+                recorder.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                if (indexed) {
+                    check(recorder.SetVertexBuffers(0, {{{host.buffer, vertexOffset, sizeof(vertices)}, sizeof(Vertex)}}, error), "vertex buffer");
+                    check(recorder.SetVertexBuffers(2, {{{host.buffer, instanceOffset, 64}, 8}}, error), "instance buffer");
+                    check(recorder.SetIndexBuffer({host.buffer, indexOffset, sizeof(indices)}, DXGI_FORMAT_R16_UINT, error), "index buffer");
+                    recorder.DrawIndexed(3, 1, 0, 0, 0);
+                } else {
+                    recorder.Draw(3, 1, 0, 0);
+                }
+                recorder.EndRendering();
+                check(recorder.Transition(target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "to copy source");
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = prints->layouts[0];
+                footprint.Offset = region * regionBytes;
+                check(recorder.CopyTextureToBuffer(hostRef, footprint, target, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read back");
+                check(recorder.Transition(target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "to render target");
+            };
+            pass(drawn, {0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f}, false, 0);
+            pass(culled, {0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f}, false, 1);
+            pass(drawn, {32.0f, 0.0f, 32.0f, 64.0f, 0.0f, 1.0f}, false, 2);
+            pass(buffered, {0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f}, true, 3);
+            struct {
+                std::uint64_t address;
+                std::uint32_t base;
+                std::uint32_t count;
+            } constants{address + computeOffset, 1000, 256};
+            recorder.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, compute);
+            check(recorder.SetPushConstants(&constants, sizeof(constants), error), "push constants");
+            check(!recorder.SetPushConstants(&constants, 148, error), "push constants over 144 bytes");
+            recorder.Dispatch(4, 1, 1);
+            VkMemoryBarrier2 hostBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            hostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            hostBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            hostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            hostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers = &hostBarrier;
+            vk.cmdPipelineBarrier2(commands, &dependency);
+        },
+        error);
+    int status = 0;
+    if (!submitted || !recorded) status = Fail("recording '" + step + "': " + error);
+    const auto rgb = [&](UINT region, UINT x, UINT y) {
+        const std::uint8_t* p = bytes + region * regionBytes + y * pitch + x * 4;
+        return static_cast<std::uint32_t>(p[0]) << 16 | static_cast<std::uint32_t>(p[1]) << 8 | p[2];
+    };
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    if (status == 0) {
+        const std::uint32_t red = 0xFF0000u;
+        const std::uint32_t blueRgb = 0x0000FFu;
+        expect(rgb(0, 4, 4) == red && rgb(0, 40, 10) == red && rgb(0, 10, 40) == red, "the clockwise upper-left triangle is drawn");
+        expect(rgb(0, 60, 60) == blueRgb && rgb(0, 40, 40) == blueRgb, "the lower-right half stays clear");
+        expect(rgb(1, 4, 4) == blueRgb && rgb(1, 20, 20) == blueRgb, "the same triangle is culled when counter-clockwise faces are front");
+        expect(rgb(2, 36, 4) == red && rgb(2, 4, 4) == blueRgb && rgb(2, 62, 40) == blueRgb, "the viewport moves the triangle into the right half");
+        expect(rgb(3, 60, 60) == red && rgb(3, 40, 40) == red && rgb(3, 4, 4) == blueRgb && rgb(3, 10, 10) == blueRgb, "the indexed triangle from the vertex buffer covers the lower-right half");
+        const std::uint8_t alpha = bytes[4 * pitch + 4 * 4 + 3];
+        expect(alpha == 0x7F || alpha == 0x80, "pixel shader alpha 0.5 stored as " + std::to_string(alpha));
+        bool filled = true;
+        for (std::uint32_t item = 0; item < 256 && filled; ++item) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, bytes + computeOffset + item * 4, sizeof(value));
+            filled = value == 1000 + item * 3;
+        }
+        expect(filled, "the dispatch filled 256 values through the pushed buffer address");
+    }
+    std::printf("draw: %zu read-back checks\n", checks);
+    vk.destroyImageView(device->Handle(), targetView, nullptr);
+    vk.destroyImage(device->Handle(), target.image, nullptr);
+    vk.freeMemory(device->Handle(), targetMemory, nullptr);
+    DestroyBuffer(*device, host);
+    for (VkPipeline pipeline : {drawn, culled, buffered, compute}) vk.destroyPipeline(device->Handle(), pipeline, nullptr);
+    for (VkShaderModule module : {corner, inputs, fragment, fill}) vk.destroyShaderModule(device->Handle(), module, nullptr);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS draw gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1664,12 +1879,14 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "textures-selftest") == 0) return TexturesSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "views-selftest") == 0) return ViewsSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "commands-selftest") == 0) return CommandsSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "draw-selftest") == 0) return DrawSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "commands-gpu") == 0) return CommandsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "views-gpu") == 0) return ViewsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "textures-gpu") == 0) return TexturesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate]");
     return 2;
 }

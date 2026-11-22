@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint value[];
+};
+
+layout(push_constant) uniform Fill {
+    uint64_t address;
+    uint base;
+    uint count;
+} fill;
+
+void main() {
+    uint item = gl_GlobalInvocationID.x;
+    if (item < fill.count) {
+        Words(fill.address).value[item] = fill.base + item * 3u;
+    }
+}

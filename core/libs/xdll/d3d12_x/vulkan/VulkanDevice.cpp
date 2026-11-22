@@ -503,6 +503,16 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdCopyImageToBuffer = DeviceFunction<PFN_vkCmdCopyImageToBuffer>(getDeviceProcAddr, device_, "vkCmdCopyImageToBuffer");
     vk_.cmdCopyImage = DeviceFunction<PFN_vkCmdCopyImage>(getDeviceProcAddr, device_, "vkCmdCopyImage");
     vk_.cmdResolveImage = DeviceFunction<PFN_vkCmdResolveImage>(getDeviceProcAddr, device_, "vkCmdResolveImage");
+    vk_.cmdSetViewportWithCount = DeviceFunction<PFN_vkCmdSetViewportWithCount>(getDeviceProcAddr, device_, "vkCmdSetViewportWithCount");
+    vk_.cmdSetScissorWithCount = DeviceFunction<PFN_vkCmdSetScissorWithCount>(getDeviceProcAddr, device_, "vkCmdSetScissorWithCount");
+    vk_.cmdSetPrimitiveTopology = DeviceFunction<PFN_vkCmdSetPrimitiveTopology>(getDeviceProcAddr, device_, "vkCmdSetPrimitiveTopology");
+    vk_.cmdSetPrimitiveRestartEnable = DeviceFunction<PFN_vkCmdSetPrimitiveRestartEnable>(getDeviceProcAddr, device_, "vkCmdSetPrimitiveRestartEnable");
+    vk_.cmdSetBlendConstants = DeviceFunction<PFN_vkCmdSetBlendConstants>(getDeviceProcAddr, device_, "vkCmdSetBlendConstants");
+    vk_.cmdSetStencilReference = DeviceFunction<PFN_vkCmdSetStencilReference>(getDeviceProcAddr, device_, "vkCmdSetStencilReference");
+    vk_.cmdBindVertexBuffers2 = DeviceFunction<PFN_vkCmdBindVertexBuffers2>(getDeviceProcAddr, device_, "vkCmdBindVertexBuffers2");
+    vk_.cmdBindIndexBuffer = DeviceFunction<PFN_vkCmdBindIndexBuffer>(getDeviceProcAddr, device_, "vkCmdBindIndexBuffer");
+    vk_.cmdDraw = DeviceFunction<PFN_vkCmdDraw>(getDeviceProcAddr, device_, "vkCmdDraw");
+    vk_.cmdDrawIndexed = DeviceFunction<PFN_vkCmdDrawIndexed>(getDeviceProcAddr, device_, "vkCmdDrawIndexed");
     vk_.queueSubmit = DeviceFunction<PFN_vkQueueSubmit>(getDeviceProcAddr, device_, "vkQueueSubmit");
     vk_.createFence = DeviceFunction<PFN_vkCreateFence>(getDeviceProcAddr, device_, "vkCreateFence");
     vk_.destroyFence = DeviceFunction<PFN_vkDestroyFence>(getDeviceProcAddr, device_, "vkDestroyFence");

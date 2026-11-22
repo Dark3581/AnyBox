@@ -31,6 +31,14 @@ struct AttachmentRef {
     VkImageAspectFlags aspects = VK_IMAGE_ASPECT_COLOR_BIT;
 };
 
+struct VertexBufferRef {
+    BufferRef buffer;
+    UINT stride = 0;
+};
+
+std::optional<VkPrimitiveTopology> VulkanTopology(D3D_PRIMITIVE_TOPOLOGY topology);
+std::optional<VkViewport> VulkanViewport(const D3D12_VIEWPORT& viewport);
+
 class CommandRecorder {
 public:
     CommandRecorder(const VulkanDevice& device, VkCommandBuffer commands) : device_(device), commands_(commands) {}
@@ -50,6 +58,21 @@ public:
                      D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, const D3D12_BOX* box, std::string& error);
     bool ResolveSubresource(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, const TextureRef& source,
                             D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, std::string& error);
+
+    bool BeginRendering(const std::vector<AttachmentRef>& colors, const AttachmentRef* depthStencil, VkExtent2D extent, std::uint32_t layers, std::string& error);
+    void EndRendering();
+    bool SetViewports(const std::vector<D3D12_VIEWPORT>& viewports, std::string& error);
+    bool SetScissors(const std::vector<D3D12_RECT>& rects, std::string& error);
+    bool SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY topology, bool stripCut, std::string& error);
+    void SetBlendFactor(const float factor[4]);
+    void SetStencilReference(UINT reference);
+    bool SetVertexBuffers(UINT firstSlot, const std::vector<VertexBufferRef>& buffers, std::string& error);
+    bool SetIndexBuffer(const BufferRef& buffer, DXGI_FORMAT format, std::string& error);
+    void BindPipeline(VkPipelineBindPoint point, VkPipeline pipeline);
+    bool SetPushConstants(const void* data, std::uint32_t bytes, std::string& error);
+    void Draw(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance);
+    void DrawIndexed(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance);
+    void Dispatch(UINT x, UINT y, UINT z);
 
 private:
     bool LayoutFor(const TextureRef& texture, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_STATES expected, VkImageLayout& layout, std::string& error) const;

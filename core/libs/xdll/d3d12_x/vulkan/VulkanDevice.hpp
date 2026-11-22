@@ -76,6 +76,16 @@ struct DeviceFunctions {
     PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
     PFN_vkCmdCopyImage cmdCopyImage = nullptr;
     PFN_vkCmdResolveImage cmdResolveImage = nullptr;
+    PFN_vkCmdSetViewportWithCount cmdSetViewportWithCount = nullptr;
+    PFN_vkCmdSetScissorWithCount cmdSetScissorWithCount = nullptr;
+    PFN_vkCmdSetPrimitiveTopology cmdSetPrimitiveTopology = nullptr;
+    PFN_vkCmdSetPrimitiveRestartEnable cmdSetPrimitiveRestartEnable = nullptr;
+    PFN_vkCmdSetBlendConstants cmdSetBlendConstants = nullptr;
+    PFN_vkCmdSetStencilReference cmdSetStencilReference = nullptr;
+    PFN_vkCmdBindVertexBuffers2 cmdBindVertexBuffers2 = nullptr;
+    PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer = nullptr;
+    PFN_vkCmdDraw cmdDraw = nullptr;
+    PFN_vkCmdDrawIndexed cmdDrawIndexed = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
     PFN_vkCreateFence createFence = nullptr;
     PFN_vkDestroyFence destroyFence = nullptr;
