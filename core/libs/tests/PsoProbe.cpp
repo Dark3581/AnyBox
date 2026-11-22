@@ -8,6 +8,7 @@
 #include "PipelineLibrary.hpp"
 #include "PipelineState.hpp"
 #include "ResourceState.hpp"
+#include "RootSignatureLayout.hpp"
 #include "ShaderStore.hpp"
 #include "TextureDesc.hpp"
 #include "VertexInput.hpp"
@@ -2416,6 +2417,129 @@ int BuffersSelfTest() {
     return 0;
 }
 
+int RootSignatureSelfTest() {
+    std::string error;
+    const D3D12_DESCRIPTOR_RANGE1 viewRanges[] = {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 10, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 1, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0xFFFFFFFFu, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+    };
+    const D3D12_DESCRIPTOR_RANGE1 samplerRange{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+    D3D12_ROOT_PARAMETER1 parameters[4]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 4};
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[1].Descriptor = {1, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC};
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].DescriptorTable = {3, viewRanges};
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[3].DescriptorTable = {1, &samplerRange};
+    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC statics[2]{};
+    statics[0] = {D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, 0.0f, 1,
+                  D3D12_COMPARISON_FUNC_NEVER, D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, 0.0f, D3D12_FLOAT32_MAX, 0, 1, D3D12_SHADER_VISIBILITY_PIXEL};
+    statics[1] = {D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_BORDER, 0.0f, 1,
+                  D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE, 0.0f, D3D12_FLOAT32_MAX, 1, 1, D3D12_SHADER_VISIBILITY_ALL};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
+    desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    desc.Desc_1_1 = {4, parameters, 2, statics, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    const auto check = [&](const RootSignatureLayout& layout, const char* where) -> bool {
+        if (layout.words != 8 || layout.parameters.size() != 4 || layout.staticSamplers.size() != 2 ||
+            layout.flags != D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT) return Fail(std::string(where) + ": counts") == 0;
+        const RootParameterLayout& constants = layout.parameters[0];
+        const RootParameterLayout& cbv = layout.parameters[1];
+        const RootParameterLayout& table = layout.parameters[2];
+        const RootParameterLayout& samplerTable = layout.parameters[3];
+        if (constants.words != 4 || constants.firstWord != 0 || constants.constants != 4) return Fail(std::string(where) + ": constants") == 0;
+        if (cbv.words != 2 || cbv.firstWord != 4 || cbv.shaderRegister != 1 || cbv.visibility != D3D12_SHADER_VISIBILITY_VERTEX) return Fail(std::string(where) + ": root CBV") == 0;
+        if (table.words != 1 || table.firstWord != 6 || table.ranges.size() != 3 || table.ranges[1].RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_UAV || table.ranges[2].NumDescriptors != 0xFFFFFFFFu ||
+            table.ranges[2].RegisterSpace != 1) return Fail(std::string(where) + ": view table") == 0;
+        if (samplerTable.firstWord != 7 || samplerTable.ranges[0].RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER || samplerTable.ranges[0].NumDescriptors != 4) return Fail(std::string(where) + ": sampler table") == 0;
+        const Sampler& shadow = layout.staticSamplers[1].sampler;
+        if (!shadow.info.compareEnable || shadow.info.borderColor != VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE || layout.staticSamplers[1].desc.ShaderRegister != 1 ||
+            layout.staticSamplers[0].sampler.info.minFilter != VK_FILTER_LINEAR) return Fail(std::string(where) + ": static samplers") == 0;
+        return true;
+    };
+    const std::optional<RootSignatureLayout> built = BuildRootSignatureLayout(desc, error);
+    if (!built) return Fail("build: " + error);
+    if (!check(*built, "built")) return 1;
+
+    const HMODULE host = LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto serialize = host ? reinterpret_cast<PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE>(reinterpret_cast<void*>(GetProcAddress(host, "D3D12SerializeVersionedRootSignature"))) : nullptr;
+    const auto serializeOld = host ? reinterpret_cast<PFN_D3D12_SERIALIZE_ROOT_SIGNATURE>(reinterpret_cast<void*>(GetProcAddress(host, "D3D12SerializeRootSignature"))) : nullptr;
+    if (serialize == nullptr || serializeOld == nullptr) {
+        std::puts("SKIP the host has no d3d12.dll serializer; round trip not checked");
+    } else {
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* messages = nullptr;
+        if (FAILED(serialize(&desc, &blob, &messages))) return Fail(std::string("host serialize 1.1: ") + (messages ? static_cast<const char*>(messages->GetBufferPointer()) : ""));
+        const std::optional<RootSignatureLayout> parsed = DeserializeRootSignature(blob->GetBufferPointer(), blob->GetBufferSize(), error);
+        blob->Release();
+        if (!parsed) return Fail("deserialize 1.1: " + error);
+        if (!check(*parsed, "round trip 1.1")) return 1;
+        const D3D12_DESCRIPTOR_RANGE oldRange{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 3, 2, 0, 0};
+        D3D12_ROOT_PARAMETER oldParameters[2]{};
+        oldParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        oldParameters[0].DescriptorTable = {1, &oldRange};
+        oldParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        oldParameters[1].Descriptor = {5, 2};
+        const D3D12_ROOT_SIGNATURE_DESC old{2, oldParameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (FAILED(serializeOld(&old, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &messages))) return Fail("host serialize 1.0");
+        const std::optional<RootSignatureLayout> converted = DeserializeRootSignature(blob->GetBufferPointer(), blob->GetBufferSize(), error);
+        blob->Release();
+        if (!converted || converted->words != 3 || converted->parameters[0].ranges[0].RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_CBV ||
+            converted->parameters[0].ranges[0].BaseShaderRegister != 2 || converted->parameters[1].shaderRegister != 5 || converted->parameters[1].registerSpace != 2) {
+            return Fail("version 1.0 converted to 1.1: " + error);
+        }
+        const unsigned char junk[16] = {1, 2, 3, 4};
+        if (DeserializeRootSignature(junk, sizeof(junk), error) || error.find("rejected") == std::string::npos) return Fail("junk blob");
+        std::puts("host round trip: 1.1 and 1.0 blobs deserialized");
+    }
+
+    D3D12_DESCRIPTOR_RANGE1 mixed[2] = {viewRanges[0], samplerRange};
+    D3D12_DESCRIPTOR_RANGE1 unboundedFirst[2] = {viewRanges[2], viewRanges[0]};
+    struct Refusal {
+        void (*edit)(D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1*, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*);
+        const char* expected;
+    };
+    const Refusal refusals[] = {
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1* p, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*) { p[0].Constants.Num32BitValues = 61; },
+         "more than 64 32-bit words"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1* p, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1* m, D3D12_DESCRIPTOR_RANGE1*) { p[2].DescriptorTable = {2, m}; },
+         "mixes samplers with other descriptors"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1* p, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1* u) { p[2].DescriptorTable = {2, u}; },
+         "unbounded range before its last range"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1* p, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*) { p[2].DescriptorTable = {0, nullptr}; },
+         "has no ranges"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1* p, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*) { p[0].Constants.Num32BitValues = 0; },
+         "have no values"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1* p, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*) { p[1].ShaderVisibility = static_cast<D3D12_SHADER_VISIBILITY>(9); },
+         "shader visibility 9"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC&, D3D12_ROOT_PARAMETER1*, D3D12_STATIC_SAMPLER_DESC* s, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*) { s[1].BorderColor = static_cast<D3D12_STATIC_BORDER_COLOR>(3); },
+         "static border color 3"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC& d, D3D12_ROOT_PARAMETER1*, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*) { d.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x03000000); },
+         "flags 50331648 are unknown"},
+        {[](D3D12_VERSIONED_ROOT_SIGNATURE_DESC& d, D3D12_ROOT_PARAMETER1*, D3D12_STATIC_SAMPLER_DESC*, D3D12_DESCRIPTOR_RANGE1*, D3D12_DESCRIPTOR_RANGE1*) { d.Version = static_cast<D3D_ROOT_SIGNATURE_VERSION>(5); },
+         "version 5 is not 1.0 or 1.1"},
+    };
+    for (const Refusal& refusal : refusals) {
+        D3D12_ROOT_PARAMETER1 copy[4];
+        std::copy(std::begin(parameters), std::end(parameters), copy);
+        D3D12_STATIC_SAMPLER_DESC staticCopy[2] = {statics[0], statics[1]};
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC edited = desc;
+        edited.Desc_1_1.pParameters = copy;
+        edited.Desc_1_1.pStaticSamplers = staticCopy;
+        refusal.edit(edited, copy, staticCopy, mixed, unboundedFirst);
+        error.clear();
+        if (BuildRootSignatureLayout(edited, error) || error.find(refusal.expected) == std::string::npos) return Fail(std::string("refusal '") + refusal.expected + "' gave '" + error + "'");
+    }
+    std::puts("PASS root signature selftest");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -2432,6 +2556,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "draw-selftest") == 0) return DrawSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "indirect-selftest") == 0) return IndirectSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "buffers-selftest") == 0) return BuffersSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "rootsig-selftest") == 0) return RootSignatureSelfTest();
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
@@ -2441,6 +2566,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest");
     return 2;
 }
