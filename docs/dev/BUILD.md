@@ -33,10 +33,10 @@ With `-DANYBOX_GAME_PACKAGE` and `-DANYBOX_SHADER_TRANSLATOR`, the build gets `s
 
 ## Probe shaders
 
-The probes run a few test shaders, compiled ahead of time so the build needs no shader compiler. Each `core/libs/probe/shaders/<name>.comp` sits next to its compiled `<name>.inc`; after editing one, regenerate it with the Vulkan SDK's `glslc`:
+The probes run a few test shaders, compiled ahead of time so the build needs no shader compiler. Each `core/libs/probe/shaders/<name>.<stage>` (`.comp`, `.vert` or `.frag`) sits next to its compiled `<name>.inc`; after editing one, regenerate it with the Vulkan SDK's `glslc`:
 
 ```
-glslc --target-env=vulkan1.3 -O -mfmt=num core/libs/probe/shaders/<name>.comp -o core/libs/probe/shaders/<name>.inc
+glslc --target-env=vulkan1.3 -O -mfmt=num core/libs/probe/shaders/<name>.<stage> -o core/libs/probe/shaders/<name>.inc
 ```
 
 ## Relinker only

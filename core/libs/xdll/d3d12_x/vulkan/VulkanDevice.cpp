@@ -70,12 +70,19 @@ const FeatureEntry kLayoutFeatures[] = {
     {"descriptorBindingPartiallyBound", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingPartiallyBound; }},
     {"descriptorBindingSampledImageUpdateAfterBind", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingSampledImageUpdateAfterBind; }},
     {"descriptorBindingStorageImageUpdateAfterBind", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingStorageImageUpdateAfterBind; }},
+    {"dynamicRendering", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.dynamicRendering; }},
 };
 
 const FeatureEntry kOptionalFeatures[] = {
     {"subgroupSizeControl", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.subgroupSizeControl; }},
     {"computeFullSubgroups", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.computeFullSubgroups; }},
     {"pipelineCreationCacheControl", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.pipelineCreationCacheControl; }},
+    {"fillModeNonSolid", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.fillModeNonSolid; }},
+    {"logicOp", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.logicOp; }},
+    {"depthClamp", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.depthClamp; }},
+    {"depthBiasClamp", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.depthBiasClamp; }},
+    {"independentBlend", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.independentBlend; }},
+    {"dualSrcBlend", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.dualSrcBlend; }},
 };
 
 const FeatureEntry* FindFeature(const std::string& name) {
@@ -441,6 +448,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.createShaderModule = DeviceFunction<PFN_vkCreateShaderModule>(getDeviceProcAddr, device_, "vkCreateShaderModule");
     vk_.destroyShaderModule = DeviceFunction<PFN_vkDestroyShaderModule>(getDeviceProcAddr, device_, "vkDestroyShaderModule");
     vk_.createComputePipelines = DeviceFunction<PFN_vkCreateComputePipelines>(getDeviceProcAddr, device_, "vkCreateComputePipelines");
+    vk_.createGraphicsPipelines = DeviceFunction<PFN_vkCreateGraphicsPipelines>(getDeviceProcAddr, device_, "vkCreateGraphicsPipelines");
     vk_.destroyPipeline = DeviceFunction<PFN_vkDestroyPipeline>(getDeviceProcAddr, device_, "vkDestroyPipeline");
     vk_.createPipelineCache = DeviceFunction<PFN_vkCreatePipelineCache>(getDeviceProcAddr, device_, "vkCreatePipelineCache");
     vk_.destroyPipelineCache = DeviceFunction<PFN_vkDestroyPipelineCache>(getDeviceProcAddr, device_, "vkDestroyPipelineCache");
@@ -630,6 +638,10 @@ bool VulkanDevice::Submit(const std::function<void(VkCommandBuffer)>& record, st
         return false;
     }
     return true;
+}
+
+bool VulkanDevice::HasFeature(const std::string& name) const {
+    return std::find(enabled_.begin(), enabled_.end(), name) != enabled_.end();
 }
 
 bool VulkanDevice::CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const {

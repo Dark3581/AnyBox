@@ -96,6 +96,14 @@ def main():
     assert resolve(carved / "cs_a.dxbc", "--node", "2")[1] == "node mask 0x2 names a GPU node other than the first"
     assert resolve(carved / "cs_a.dxbc", "--node", "1")[0] == "ok"
 
+    assert "PASS graphics selftest" in run([args.probe, "graphics-selftest"], env)
+    graphics = subprocess.run([str(args.probe), "graphics-gpu", "--validate"], capture_output=True, text=True, env=env, timeout=600)
+    if graphics.returncode == 4:
+        print("validation layer not installed: creating graphics pipelines without it")
+        graphics = subprocess.run([str(args.probe), "graphics-gpu"], capture_output=True, text=True, env=env, timeout=600)
+    print(graphics.stdout.strip())
+    assert graphics.returncode in (0, 3), (graphics.stdout[-3000:], graphics.stderr[-2000:])
+
     names = [carved / "cs_a.dxbc", carved / "cs_b.dxbc", carved / "cs_a.dxbc", carved / "ps_x.dxbc", carved / "cs_a.dxbc", carved / "cs_b.dxbc"]
     listing = args.work / "containers.txt"
     listing.write_text("".join(f"{name}\n" for name in names), encoding="utf-8")

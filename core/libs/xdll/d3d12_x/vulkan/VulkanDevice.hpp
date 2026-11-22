@@ -27,6 +27,7 @@ struct DeviceFunctions {
     PFN_vkCreateShaderModule createShaderModule = nullptr;
     PFN_vkDestroyShaderModule destroyShaderModule = nullptr;
     PFN_vkCreateComputePipelines createComputePipelines = nullptr;
+    PFN_vkCreateGraphicsPipelines createGraphicsPipelines = nullptr;
     PFN_vkDestroyPipeline destroyPipeline = nullptr;
     PFN_vkCreatePipelineCache createPipelineCache = nullptr;
     PFN_vkDestroyPipelineCache destroyPipelineCache = nullptr;
@@ -96,6 +97,7 @@ public:
     std::optional<std::uint32_t> MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
     bool Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
+    bool HasFeature(const std::string& name) const;
     const std::vector<std::string>& EnabledExtensions() const { return extensions_; }
     bool CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const;
     bool PipelineCacheControl() const { return pipelineCacheControl_; }

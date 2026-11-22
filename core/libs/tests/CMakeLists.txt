@@ -65,7 +65,7 @@ endif()
 
 add_executable(pso_probe PsoProbe.cpp)
 target_link_libraries(pso_probe PRIVATE d3d12_x_pso)
-target_include_directories(pso_probe PRIVATE ${ANYBOX_LIBS_INCLUDE})
+target_include_directories(pso_probe PRIVATE ${ANYBOX_LIBS_INCLUDE} ${CMAKE_SOURCE_DIR}/core/libs/probe)
 anybox_static_runtime(pso_probe)
 
 if(Python3_FOUND)
