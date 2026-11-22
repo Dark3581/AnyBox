@@ -21,13 +21,47 @@ The [progress page](https://dark3581.github.io/AnyBox/progress.html) lists every
 | Library | Serves | State |
 |---|---|---|
 | [xgameruntime](core/libs/xdll/xgameruntime) | `xgameruntime.dll` | XGameRuntime init and options, XTaskQueue, XAsync, XThread and XGameSave implemented; XUser, XGameSaveFiles, most of XPackage and XSystem stubs |
-| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | entry points declared, all stubs: needs a D3D12.X → desktop D3D12/Vulkan layer |
+| [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | root signature serialization forwarded to the host; the Vulkan side is built (device, title layout, shader store, compute pipelines, bindless descriptors, buffer window, see [Shaders](#shaders)), but the device entry points are stubs until a title's calls show their shape |
 | [xaudio2](core/libs/xdll/xaudio2) | `xaudio2_9.dll` | forwarded to the host's XAudio2 |
 | [gameinput](core/libs/xdll/gameinput) | `gameinput.dll` | forwarded to the host's GameInput |
 | [kernelx](core/libs/xdll/kernelx) | `kernelx.dll` | Win32 subset forwarded to `kernel32` |
 | [xmem](core/libs/xdll/xmem) | `xmem.dll` | entry points declared, all stubs: needs the `XALLOC_ATTRIBUTES` layout |
 
 Unsupported or unexpected states stop the process with a [run report](docs/run-report.schema.json) (`anybox-report.json`) that names the library and function. Nothing returns a made-up success.
+
+## Shaders
+
+Console shaders ship as native GPU code, not DXIL, so no desktop driver can take them as they are. AnyBox's graphics library ([d3d12_x](core/libs/xdll/d3d12_x)) runs a title's D3D12.X calls on Vulkan, with the title's shaders translated to SPIR-V ahead of time by an external translator. The [design is on #4](https://github.com/Dark3581/AnyBox/issues/4) and the pieces are in [Architecture](docs/dev/ARCHITECTURE.md#graphics-d3d12_x).
+
+The shader set is built on your PC from your own copy, into the build folder, like the rest of the project. It is never committed or shared. With a checkout of the translator:
+
+```
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON ^
+  -DANYBOX_GAME_PACKAGE=<package folder> -DANYBOX_SHADER_TRANSLATOR=<translator checkout>
+cmake --build build
+cmake --build build --target shaders            # translate and build the shader store (about an hour)
+cmake --build build --target shader_pipelines   # create every pipeline on your GPU (hours; resumes if stopped)
+ctest --test-dir build -L shaders --output-on-failure
+```
+
+The settings (worker count, wave64 emulation for 32-wide GPUs, pipeline chunk size, the size limit for modules too large for your PC's memory) and what each test checks are in [Building shaders with the project](docs/dev/GAME_TESTING.md#building-shaders-with-the-project).
+
+### How far along
+
+Measured on one title's package (26,503 shaders) with an RTX 3070 Ti and 32 GB of RAM:
+
+| Step | State |
+|---|---|
+| Translate to SPIR-V | ✅ 26,503 of 26,503 (72 minutes) |
+| Shader store | ✅ 25,889 modules (614 containers are byte-identical copies), none missing, invalid or conflicting; the C++ store finds all 26,503 containers |
+| GPU support | ✅ the GPU supports every feature the modules need |
+| Title layout | ✅ every module fits the one descriptor layout and the 144-byte push constants |
+| Compute sample through AnyBox's own pipeline code | ✅ 60 of 60, no validation errors |
+| Bindless descriptors and buffer access on the GPU | ✅ 3,701 of 3,701 descriptor lookups; buffer windows below 4 GB of up to 2 GiB |
+| Every pipeline created by the driver | 🔄 in progress: no failures so far. Two compute modules of 43 MiB each need about 75 GB of memory to compile, more than this PC can commit, so they are skipped by size here |
+| Shaders running in a title | ❌ needs the title's executable: device creation, command lists, root signatures and presentation follow from its calls |
+
+What is not proven yet: that any translated shader computes the right values inside the title, and how the title binds its resources at run time. Both need the executable.
 
 ## Compatibility
 
