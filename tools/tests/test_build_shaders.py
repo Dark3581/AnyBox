@@ -41,17 +41,25 @@ print(f"translated {len(shaders)} shaders for {args.game} jobs={args.jobs}")
 '''
 
 FAKE_CHECKER = r'''
-import sys
-print("checking 3 shaders [0, 3) (stage=all) on 2 threads")
-if sys.argv[-1] == "fail":
+import os, sys
+args = sys.argv[1:]
+mode = args[0]
+start, count = int(args[args.index("--start") + 1]), int(args[args.index("--count") + 1])
+if os.environ.get("FAKE_CHECKER_RUNS"):
+    with open(os.environ["FAKE_CHECKER_RUNS"], "a", encoding="utf-8") as handle:
+        handle.write(f"{start}\n")
+print(f"checking {count} shaders [{start}, {start + count}) (stage=all) on 2 threads")
+if mode == "crash" and start > 0:
+    print("  still compiling big_cs after 62s")
+    sys.exit(7)
+ps = count
+if mode == "fail" and start == 0:
+    ps -= 1
     print("PIPELINE FAIL cs_b (cs w32, -3)")
     print("cs: 1 modules ok, 0 failed")
     print("cs pipelines: 0 ok, 1 failed, 0 skipped")
-else:
-    print("cs: 1 modules ok, 0 failed")
-    print("cs pipelines: 1 ok, 0 failed, 0 skipped")
-print("ps: 2 modules ok, 0 failed")
-print("ps pipelines: 2 ok, 0 failed, 0 skipped")
+print(f"ps: {ps} modules ok, 0 failed")
+print(f"ps pipelines: {ps} ok, 0 failed, 0 skipped")
 print("wall time: 1.0s on 2 threads")
 '''
 
@@ -117,7 +125,39 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(command[command.index("--wave64-emulate") + 1], "on")
         self.assertEqual(command[-2:], ["--jobs", "4"])
         self.assertNotIn("--jobs", build_shaders.translator_command(Path("tr"), Path("pkg"), paths, 0, "auto"))
-        self.assertEqual(build_shaders.pipeline_command(Path("check.exe"), paths, 0), ["check.exe", str(paths["translated"]), str(paths["cache"])])
+        self.assertEqual(build_shaders.pipeline_command(Path("check.exe"), paths, 0, 500, 250),
+                         ["check.exe", str(paths["translated"]), str(paths["cache"]), "--start", "500", "--count", "250"])
+        self.assertEqual(build_shaders.pipeline_command(Path("check.exe"), paths, 6, 0, 1)[-2:], ["--jobs", "6"])
+
+    def test_chunk_ranges(self):
+        self.assertEqual(build_shaders.chunk_ranges(1201, 500), [(0, 500), (500, 500), (1000, 201)])
+        self.assertEqual(build_shaders.chunk_ranges(1000, 500), [(0, 500), (500, 500)])
+        self.assertEqual(build_shaders.chunk_ranges(1201, 0), [(0, 1201)])
+        self.assertEqual(build_shaders.chunk_ranges(3, 500), [(0, 3)])
+        self.assertEqual(build_shaders.chunk_ranges(0, 500), [])
+
+    def test_a_crash_names_the_last_compile(self):
+        result = build_shaders.parse_pipelines("  still compiling small after 61s\n  still compiling huge_cs after 422s\n")
+        self.assertEqual(result["last_compiling"], "huge_cs")
+        self.assertIsNone(build_shaders.parse_pipelines(SUMMARY)["last_compiling"])
+
+    def test_combined_chunks(self):
+        def chunk(start, count, text, code=0):
+            return {"start": start, "count": count, **build_shaders.parse_pipelines(text), "exit_code": code}
+        good = "ps: 2 modules ok, 0 failed\nps pipelines: 2 ok, 0 failed, 0 skipped\nwall time: 1s on 1 threads\n"
+        crashed = "  still compiling huge_cs after 422s\n"
+        result = build_shaders.combine_chunks([chunk(0, 2, good), chunk(2, 2, good)], 4)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["totals"]["pipelines_ok"], 4)
+        self.assertEqual(result["failed_chunks"], [])
+        self.assertTrue(build_shaders.pipelines_passed(result))
+        self.assertFalse(build_shaders.combine_chunks([chunk(0, 2, good)], 4)["complete"])
+        self.assertFalse(build_shaders.combine_chunks([chunk(0, 2, good), chunk(3, 1, good)], 4)["complete"])
+        result = build_shaders.combine_chunks([chunk(0, 2, good), chunk(2, 2, crashed, 3221225477)], 4)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["exit_code"], 3221225477)
+        self.assertEqual(result["failed_chunks"], [{"start": 2, "count": 2, "exit_code": 3221225477, "last_compiling": "huge_cs"}])
+        self.assertFalse(build_shaders.pipelines_passed(result))
 
 
 class BuildTest(unittest.TestCase):
@@ -175,25 +215,73 @@ class BuildTest(unittest.TestCase):
         self.assertIn("store is incomplete", errors)
         self.assertEqual(self.summary()["store"]["missing"], 1)
 
+    def use_checker(self, mode):
+        build_shaders.pipeline_command = lambda checker, paths, jobs, start, count: [
+            sys.executable, str(self.checker), mode, "--start", str(start), "--count", str(count)]
+
+    def check(self, *extra):
+        return self.build("--steps", "pipelines", "--pipeline-check", str(self.checker), *extra)
+
+    def runs(self, log):
+        return [int(line) for line in log.read_text(encoding="utf-8").split()] if log.exists() else []
+
     def test_pipelines_step(self):
         self.assertEqual(self.build()[0], 0)
-        build_shaders.pipeline_command = lambda checker, paths, jobs: [sys.executable, str(self.checker), "pass"]
-        code, output, errors = self.build("--steps", "pipelines", "--pipeline-check", str(self.checker))
+        self.use_checker("pass")
+        code, output, errors = self.check()
         self.assertEqual(code, 0, errors)
         summary = self.summary()
         self.assertEqual(summary["store"]["modules"], 2)
         self.assertEqual(summary["pipelines"]["totals"]["pipelines_ok"], 3)
         self.assertEqual(summary["pipelines"]["exit_code"], 0)
-        build_shaders.pipeline_command = lambda checker, paths, jobs: [sys.executable, str(self.checker), "fail"]
-        code, _, errors = self.build("--steps", "pipelines", "--pipeline-check", str(self.checker))
+        self.assertEqual(len(summary["pipelines"]["chunks"]), 1)
+        self.use_checker("fail")
+        code, _, errors = self.check("--recheck")
         self.assertEqual(code, 1)
         self.assertIn("did not pass", errors)
         self.assertEqual(self.summary()["pipelines"]["problems"], [{"kind": "pipeline_fail", "name": "cs_b"}])
 
+    def test_chunks_resume_and_recheck(self):
+        self.assertEqual(self.build()[0], 0)
+        runs = Path(self.directory.name) / "runs.txt"
+        os.environ["FAKE_CHECKER_RUNS"] = str(runs)
+        try:
+            self.use_checker("crash")
+            code, output, errors = self.check("--pipeline-chunk", "2")
+            self.assertEqual(code, 1)
+            self.assertIn("last named compile big_cs", output)
+            pipelines = self.summary()["pipelines"]
+            self.assertEqual(self.runs(runs), [0, 2])
+            self.assertFalse(pipelines["complete"])
+            self.assertEqual(pipelines["failed_chunks"], [{"start": 2, "count": 1, "exit_code": 7, "last_compiling": "big_cs"}])
+            self.assertTrue((self.out / "pipelines" / "000002-000003.log").is_file())
+
+            self.use_checker("pass")
+            code, output, errors = self.check("--pipeline-chunk", "2")
+            self.assertEqual(code, 0, errors)
+            self.assertEqual(self.runs(runs), [0, 2, 2])
+            self.assertIn("[0, 2) passed with this checker before; reused", output)
+            pipelines = self.summary()["pipelines"]
+            self.assertTrue(pipelines["complete"])
+            self.assertEqual(pipelines["totals"]["pipelines_ok"], 3)
+
+            self.assertEqual(self.check("--pipeline-chunk", "2")[0], 0)
+            self.assertEqual(self.runs(runs), [0, 2, 2])
+            self.assertEqual(self.check("--pipeline-chunk", "2", "--recheck")[0], 0)
+            self.assertEqual(self.runs(runs), [0, 2, 2, 0, 2])
+            self.assertEqual(self.check("--pipeline-chunk", "0")[0], 0)
+            self.assertEqual(self.runs(runs), [0, 2, 2, 0, 2, 0])
+            self.checker.write_text(FAKE_CHECKER + "\n", encoding="utf-8")
+            self.assertEqual(self.check("--pipeline-chunk", "0")[0], 0)
+            self.assertEqual(self.runs(runs), [0, 2, 2, 0, 2, 0, 0])
+        finally:
+            del os.environ["FAKE_CHECKER_RUNS"]
+        self.assertEqual(self.check("--pipeline-chunk", "-1")[0], 1)
+
     def test_a_new_translation_drops_old_results(self):
         self.assertEqual(self.build()[0], 0)
-        build_shaders.pipeline_command = lambda checker, paths, jobs: [sys.executable, str(self.checker), "pass"]
-        self.assertEqual(self.build("--steps", "pipelines", "--pipeline-check", str(self.checker))[0], 0)
+        self.use_checker("pass")
+        self.assertEqual(self.check()[0], 0)
         self.assertIn("pipelines", self.summary())
         self.assertEqual(self.build("--steps", "translate")[0], 0)
         self.assertNotIn("pipelines", self.summary())

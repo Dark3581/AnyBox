@@ -160,6 +160,8 @@ def main():
         print(f"pipelines: {totals}, exit {pipelines.get('exit_code')}, complete {pipelines['complete']}")
         for problem in pipelines["problems"][:20]:
             print(f"  {problem['kind']} {problem['name']}")
+        for failed in pipelines.get("failed_chunks", []):
+            print(f"  chunk [{failed['start']}, {failed['start'] + failed['count']}) exit {failed['exit_code']}, last named compile {failed['last_compiling']}")
         assert build_shaders.pipelines_passed(pipelines), "the last pipeline check did not pass"
     print(f"PASS shaders_{args.check}")
 

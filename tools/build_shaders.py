@@ -20,7 +20,9 @@ WAVE64_MODES = ("auto", "on", "off")
 STAGE_MODULES = re.compile(r"^(\w+): (\d+) modules ok, (\d+) failed$")
 STAGE_PIPELINES = re.compile(r"^(\w+) pipelines: (\d+) ok, (\d+) failed, (\d+) skipped$")
 PROBLEM = re.compile(r"^(PIPELINE FAIL|MODULE FAIL|BIG SKIP|SKIPPED) (\S+)")
+STILL_COMPILING = re.compile(r"^\s*still compiling (\S+) after")
 TOTALS = ("modules_ok", "modules_failed", "pipelines_ok", "pipelines_failed", "pipelines_skipped")
+DEFAULT_CHUNK = 500
 
 
 class BuildError(Exception):
@@ -31,7 +33,7 @@ def layout(out):
     work = out / "work"
     return {"work": work, "carved": work / "shaders" / "dxbc", "translated": work / "shaders" / "spirv", "store": out / "store",
             "cache": out / "pipeline_cache.bin", "summary": out / SUMMARY, "translate_log": out / "translate.log",
-            "pipelines_log": out / "pipelines.log"}
+            "pipelines_logs": out / "pipelines"}
 
 
 def translator_command(translator, package, paths, jobs, wave64):
@@ -40,12 +42,48 @@ def translator_command(translator, package, paths, jobs, wave64):
     return command + (["--jobs", str(jobs)] if jobs else [])
 
 
-def pipeline_command(checker, paths, jobs):
-    return [str(checker), str(paths["translated"]), str(paths["cache"])] + (["--jobs", str(jobs)] if jobs else [])
+def pipeline_command(checker, paths, jobs, start, count):
+    command = [str(checker), str(paths["translated"]), str(paths["cache"]), "--start", str(start), "--count", str(count)]
+    return command + (["--jobs", str(jobs)] if jobs else [])
+
+
+def chunk_ranges(entries, size):
+    if entries <= 0:
+        return []
+    if size <= 0:
+        return [(0, entries)]
+    return [(start, min(size, entries - start)) for start in range(0, entries, size)]
+
+
+def chunk_log(paths, start, count):
+    return paths["pipelines_logs"] / f"{start:06d}-{start + count:06d}.log"
+
+
+def checker_identity(checker):
+    status = checker.stat()
+    return {"path": str(checker), "size": status.st_size, "mtime_ns": status.st_mtime_ns}
+
+
+def combine_chunks(chunks, entries):
+    stages, problems, covered = {}, [], 0
+    for chunk in sorted(chunks, key=lambda chunk: chunk["start"]):
+        if chunk["start"] == covered:
+            covered += chunk["count"]
+        for name, counts in chunk["stages"].items():
+            stage = stages.setdefault(name, {})
+            for key, value in counts.items():
+                stage[key] = stage.get(key, 0) + value
+        problems.extend(chunk["problems"])
+    failed = [{"start": chunk["start"], "count": chunk["count"], "exit_code": chunk["exit_code"], "last_compiling": chunk["last_compiling"]}
+              for chunk in chunks if not pipelines_passed(chunk)]
+    exit_codes = [chunk["exit_code"] for chunk in chunks if chunk["exit_code"] != 0]
+    totals = {key: sum(stage.get(key, 0) for stage in stages.values()) for key in TOTALS}
+    return {"complete": covered == entries and all(chunk["complete"] for chunk in chunks), "stages": stages, "totals": totals,
+            "problems": problems, "exit_code": exit_codes[0] if exit_codes else 0, "entries": entries, "failed_chunks": failed}
 
 
 def parse_pipelines(text):
-    stages, problems, complete = {}, [], False
+    stages, problems, complete, last_compiling = {}, [], False, None
     for line in text.splitlines():
         line = line.rstrip()
         if match := STAGE_MODULES.match(line):
@@ -56,10 +94,12 @@ def parse_pipelines(text):
             stage["pipelines_ok"], stage["pipelines_failed"], stage["pipelines_skipped"] = int(match[2]), int(match[3]), int(match[4])
         elif match := PROBLEM.match(line):
             problems.append({"kind": match[1].lower().replace(" ", "_"), "name": match[2]})
+        elif match := STILL_COMPILING.match(line):
+            last_compiling = match[1]
         elif line.startswith("wall time:"):
             complete = True
     totals = {key: sum(stage.get(key, 0) for stage in stages.values()) for key in TOTALS}
-    return {"complete": complete, "stages": stages, "totals": totals, "problems": problems}
+    return {"complete": complete, "stages": stages, "totals": totals, "problems": problems, "last_compiling": last_compiling}
 
 
 def pipelines_passed(result):
@@ -151,12 +191,17 @@ def main(argv=None):
     parser.add_argument("--jobs", type=int, default=0, help="worker count passed to the translator and the pipeline check (default: theirs)")
     parser.add_argument("--wave64-emulate", choices=WAVE64_MODES, default="auto", help="the translator's wave64 emulation mode (default auto)")
     parser.add_argument("--pipeline-check", type=Path, help="pipeline checker executable (default: the translator's runtime/build/vk_pipeline_check.exe)")
+    parser.add_argument("--pipeline-chunk", type=int, default=DEFAULT_CHUNK,
+                        help=f"index entries per pipeline checker process (default {DEFAULT_CHUNK}; 0: one process). The driver's compiler keeps its memory until the process exits.")
+    parser.add_argument("--recheck", action="store_true", help="check every chunk again instead of reusing chunks that passed with the same checker")
     args = parser.parse_args(argv)
     paths = layout(args.out.resolve())
     try:
         steps = parse_steps(args.steps)
         if args.jobs < 0:
             raise BuildError("--jobs must be 0 or more")
+        if args.pipeline_chunk < 0:
+            raise BuildError("--pipeline-chunk must be 0 or more")
         package, translator = args.package.resolve(), args.translator.resolve()
         summary = read_json(paths["summary"], {}) or {}
         summary.update({"format": FORMAT, "version": VERSION, "package": str(package), "translator": {"path": str(translator), **translator_revision(translator)}})
@@ -189,16 +234,42 @@ def main(argv=None):
                 raise BuildError(f"{checker} not found; build the translator's pipeline checker or pass --pipeline-check")
             if not (paths["translated"] / "index.json").is_file():
                 raise BuildError("no translated shaders yet: run the translate step first")
-            code = run_logged(pipeline_command(checker, paths, args.jobs), paths["pipelines_log"])
-            result = parse_pipelines(paths["pipelines_log"].read_text(encoding="utf-8"))
-            result["exit_code"] = code
+            index = read_json(paths["translated"] / "index.json")
+            if not isinstance(index, dict) or not index:
+                raise BuildError("the translation index.json is not a non-empty map")
+            identity = checker_identity(checker)
+            previous = summary.get("pipelines") or {}
+            reusable = {}
+            if not args.recheck and previous.get("checker") == identity:
+                reusable = {(chunk["start"], chunk["count"]): chunk for chunk in previous.get("chunks", []) if pipelines_passed(chunk)}
+            chunks = []
+            for start, count in chunk_ranges(len(index), args.pipeline_chunk):
+                if (start, count) in reusable:
+                    chunks.append(reusable[(start, count)])
+                    print(f"build_shaders: pipelines [{start}, {start + count}) passed with this checker before; reused", flush=True)
+                    continue
+                log = chunk_log(paths, start, count)
+                began = time.monotonic()
+                code = run_logged(pipeline_command(checker, paths, args.jobs, start, count), log)
+                chunk = {"start": start, "count": count, **parse_pipelines(log.read_text(encoding="utf-8")), "exit_code": code,
+                         "seconds": round(time.monotonic() - began, 1)}
+                chunks.append(chunk)
+                totals = chunk["totals"]
+                print(f"build_shaders: pipelines [{start}, {start + count}): {totals['pipelines_ok']} ok, {totals['pipelines_failed']} failed, "
+                      f"{totals['pipelines_skipped']} skipped; exit {code}" + ("" if pipelines_passed(chunk) else f"; FAILED, see {log}"), flush=True)
+                summary["pipelines"] = {**combine_chunks(chunks, len(index)), "checker": identity, "chunk": args.pipeline_chunk, "chunks": chunks}
+                save(paths, summary)
+            result = {**combine_chunks(chunks, len(index)), "checker": identity, "chunk": args.pipeline_chunk, "chunks": chunks}
             summary["pipelines"] = result
             save(paths, summary)
             totals = result["totals"]
             print(f"build_shaders: pipelines {totals['pipelines_ok']} ok, {totals['pipelines_failed']} failed, {totals['pipelines_skipped']} skipped; "
-                  f"modules {totals['modules_failed']} failed; exit {code}", flush=True)
+                  f"modules {totals['modules_failed']} failed; {len(result['failed_chunks'])} of {len(chunks)} chunks failed", flush=True)
+            for failed in result["failed_chunks"]:
+                print(f"build_shaders:   [{failed['start']}, {failed['start'] + failed['count']}) exit {failed['exit_code']}, "
+                      f"last named compile {failed['last_compiling']}", flush=True)
             if not pipelines_passed(result):
-                raise BuildError(f"the pipeline check did not pass; see {paths['pipelines_log']}")
+                raise BuildError(f"the pipeline check did not pass; chunk logs are in {paths['pipelines_logs']}")
     except (BuildError, shader_store.StoreError) as error:
         print(f"build_shaders: {error}", file=sys.stderr)
         return 1

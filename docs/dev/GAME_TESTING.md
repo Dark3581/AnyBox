@@ -99,6 +99,7 @@ ctest --test-dir build -L shaders --output-on-failure
 | `ANYBOX_PIPELINE_CHECK` | The pipeline checker executable. Default: the translator's `runtime/build/vk_pipeline_check.exe`. |
 | `ANYBOX_SHADER_JOBS` | Workers for the translator and the pipeline check. `0` (default) leaves the choice to them. |
 | `ANYBOX_WAVE64_EMULATE` | The translator's wave64 emulation mode, `auto` (default), `on` or `off`. 32-wide GPUs need it on. |
+| `ANYBOX_PIPELINE_CHUNK` | Index entries per pipeline checker process, `500` by default. The GPU driver's compiler keeps its memory until the process exits, so one process for the whole set can run out of memory hours in. `0` runs one process. |
 
 The translator's own requirements (its disassembler, the Vulkan SDK's `spirv-as` and `spirv-val`) come from your environment, as when you run it by hand.
 
@@ -106,9 +107,9 @@ The translator's own requirements (its disassembler, the Vulkan SDK's `spirv-as`
 |---|---|
 | `shaders` | Runs the translator's shader stage into `build/shaders/work`, then builds the store in `build/shaders/store`. The translator skips the stages whose output is still current, so a second run is quick. |
 | `shader_store` | Rebuilds the store only. |
-| `shader_pipelines` | Creates every pipeline on this PC's GPU from `build/shaders/work/shaders/spirv`, with its cache in `build/shaders/pipeline_cache.bin`. This takes hours and needs a lot of memory for the largest modules; run it when the translation changes, not on every build. |
+| `shader_pipelines` | Creates every pipeline on this PC's GPU from `build/shaders/work/shaders/spirv`, with its cache in `build/shaders/pipeline_cache.bin`. It runs the checker once per chunk of `ANYBOX_PIPELINE_CHUNK` entries, and every chunk seeds from and saves to that cache. This takes hours and needs a lot of memory for the largest modules; run it when the translation changes, not on every build. A run that stops or fails part way picks up where it left off: chunks that passed with the same checker executable are reused, and the cache makes the pipelines of an interrupted chunk quick to create again. Pass `--recheck` to `tools/build_shaders.py` to check every chunk again. |
 
-Each step writes `build/shaders/build.json`: the translator's revision and whether it had local changes, the counts of carved and translated shaders, the store's counts, and the pipeline totals with the name of every failed or skipped pipeline. Logs go to `build/shaders/translate.log` and `pipelines.log`. A new translation drops the store and pipeline results from `build.json`, so the tests never pass on results from an older translation.
+Each step writes `build/shaders/build.json`: the translator's revision and whether it had local changes, the counts of carved and translated shaders, the store's counts, and the pipeline totals with the name of every failed or skipped pipeline. For each chunk that failed it also records the checker's exit code and the last compile the checker named as still running, which is the likely culprit when the checker crashed. Logs go to `build/shaders/translate.log` and one log per chunk in `build/shaders/pipelines/`. A new translation drops the store and pipeline results from `build.json`, so the tests never pass on results from an older translation.
 
 | Test (label `shaders`) | Passes when |
 |---|---|
@@ -116,6 +117,6 @@ Each step writes `build/shaders/build.json`: the translator's revision and wheth
 | `shaders_gpu` | At least one Vulkan device supports what every stored module needs (`tools/gpu_report.py`). Skipped without Vulkan. |
 | `shaders_layout` | Every stored module's descriptor bindings (read from its SPIR-V by `tools/spirv_layout.py`) and push constant size fit the title layout `d3d12_x` creates pipelines with (`anybox-pipeline-probe layout`). |
 | `shaders_compute` | An evenly spaced sample of 60 compute modules up to 1 MiB compiles through `d3d12_x`'s own device and pipeline code, under the Khronos validation layer when it is installed (any validation error fails the test). Skipped without a usable Vulkan device. |
-| `shaders_pipelines` | The last `shader_pipelines` run completed with no failed module or pipeline. Skipped until it has run. |
+| `shaders_pipelines` | The last `shader_pipelines` run covered every entry, every chunk completed, and no module or pipeline failed. Skipped until it has run. |
 
 `build.json` and the logs name shaders: like the store, they stay on your machine.
