@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CopyLayout.hpp"
+#include "IndirectCommands.hpp"
 #include "TextureDesc.hpp"
 #include "VulkanDevice.hpp"
 
@@ -73,6 +74,8 @@ public:
     void Draw(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance);
     void DrawIndexed(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance);
     void Dispatch(UINT x, UINT y, UINT z);
+    bool ExecuteIndirect(const IndirectSignature& signature, UINT maxCount, const BufferRef& arguments, UINT64 argumentOffset, const BufferRef* count, UINT64 countOffset,
+                         std::string& error);
 
 private:
     bool LayoutFor(const TextureRef& texture, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_STATES expected, VkImageLayout& layout, std::string& error) const;

@@ -89,6 +89,8 @@ const FeatureEntry kOptionalFeatures[] = {
     {"samplerAnisotropy", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.samplerAnisotropy; }},
     {"samplerFilterMinmax", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.samplerFilterMinmax; }},
     {"samplerMirrorClampToEdge", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.samplerMirrorClampToEdge; }},
+    {"multiDrawIndirect", nullptr, [](FeatureChain& c) -> VkBool32& { return c.core.features.multiDrawIndirect; }},
+    {"drawIndirectCount", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.drawIndirectCount; }},
 };
 
 const FeatureEntry* FindFeature(const std::string& name) {
@@ -513,6 +515,11 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdBindIndexBuffer = DeviceFunction<PFN_vkCmdBindIndexBuffer>(getDeviceProcAddr, device_, "vkCmdBindIndexBuffer");
     vk_.cmdDraw = DeviceFunction<PFN_vkCmdDraw>(getDeviceProcAddr, device_, "vkCmdDraw");
     vk_.cmdDrawIndexed = DeviceFunction<PFN_vkCmdDrawIndexed>(getDeviceProcAddr, device_, "vkCmdDrawIndexed");
+    vk_.cmdDrawIndirect = DeviceFunction<PFN_vkCmdDrawIndirect>(getDeviceProcAddr, device_, "vkCmdDrawIndirect");
+    vk_.cmdDrawIndexedIndirect = DeviceFunction<PFN_vkCmdDrawIndexedIndirect>(getDeviceProcAddr, device_, "vkCmdDrawIndexedIndirect");
+    vk_.cmdDrawIndirectCount = DeviceFunction<PFN_vkCmdDrawIndirectCount>(getDeviceProcAddr, device_, "vkCmdDrawIndirectCount");
+    vk_.cmdDrawIndexedIndirectCount = DeviceFunction<PFN_vkCmdDrawIndexedIndirectCount>(getDeviceProcAddr, device_, "vkCmdDrawIndexedIndirectCount");
+    vk_.cmdDispatchIndirect = DeviceFunction<PFN_vkCmdDispatchIndirect>(getDeviceProcAddr, device_, "vkCmdDispatchIndirect");
     vk_.queueSubmit = DeviceFunction<PFN_vkQueueSubmit>(getDeviceProcAddr, device_, "vkQueueSubmit");
     vk_.createFence = DeviceFunction<PFN_vkCreateFence>(getDeviceProcAddr, device_, "vkCreateFence");
     vk_.destroyFence = DeviceFunction<PFN_vkDestroyFence>(getDeviceProcAddr, device_, "vkDestroyFence");

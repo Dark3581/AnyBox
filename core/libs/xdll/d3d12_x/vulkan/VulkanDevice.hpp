@@ -86,6 +86,11 @@ struct DeviceFunctions {
     PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer = nullptr;
     PFN_vkCmdDraw cmdDraw = nullptr;
     PFN_vkCmdDrawIndexed cmdDrawIndexed = nullptr;
+    PFN_vkCmdDrawIndirect cmdDrawIndirect = nullptr;
+    PFN_vkCmdDrawIndexedIndirect cmdDrawIndexedIndirect = nullptr;
+    PFN_vkCmdDrawIndirectCount cmdDrawIndirectCount = nullptr;
+    PFN_vkCmdDrawIndexedIndirectCount cmdDrawIndexedIndirectCount = nullptr;
+    PFN_vkCmdDispatchIndirect cmdDispatchIndirect = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
     PFN_vkCreateFence createFence = nullptr;
     PFN_vkDestroyFence destroyFence = nullptr;

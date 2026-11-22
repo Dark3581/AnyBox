@@ -226,6 +226,60 @@ void CommandRecorder::Dispatch(UINT x, UINT y, UINT z) {
     device_.Vk().cmdDispatch(commands_, x, y, z);
 }
 
+bool CommandRecorder::ExecuteIndirect(const IndirectSignature& signature, UINT maxCount, const BufferRef& arguments, UINT64 argumentOffset, const BufferRef* count,
+                                      UINT64 countOffset, std::string& error) {
+    if (maxCount == 0) {
+        return true;
+    }
+    const std::uint64_t span = static_cast<std::uint64_t>(signature.stride) * (maxCount - 1) + IndirectArgumentBytes(signature.kind);
+    if (argumentOffset % 4 != 0 || argumentOffset > arguments.size || span > arguments.size - argumentOffset) {
+        error = "the indirect arguments are misaligned or run past their buffer";
+        return false;
+    }
+    if (count != nullptr && (countOffset % 4 != 0 || countOffset > count->size || count->size - countOffset < 4)) {
+        error = "the indirect count is misaligned or outside its buffer";
+        return false;
+    }
+    const DeviceFunctions& vk = device_.Vk();
+    const VkDeviceSize offset = arguments.offset + argumentOffset;
+    if (signature.kind == IndirectKind::Dispatch) {
+        if (count != nullptr) {
+            error = "an indirect dispatch with a count buffer is not supported";
+            return false;
+        }
+        for (UINT index = 0; index < maxCount; ++index) {
+            vk.cmdDispatchIndirect(commands_, arguments.buffer, offset + static_cast<VkDeviceSize>(index) * signature.stride);
+        }
+        return true;
+    }
+    const bool indexed = signature.kind == IndirectKind::DrawIndexed;
+    if (count != nullptr) {
+        if (!device_.HasFeature("drawIndirectCount")) {
+            error = "an indirect draw with a count buffer needs drawIndirectCount, which the device does not offer";
+            return false;
+        }
+        const VkDeviceSize countAt = count->offset + countOffset;
+        if (indexed) {
+            vk.cmdDrawIndexedIndirectCount(commands_, arguments.buffer, offset, count->buffer, countAt, maxCount, signature.stride);
+        } else {
+            vk.cmdDrawIndirectCount(commands_, arguments.buffer, offset, count->buffer, countAt, maxCount, signature.stride);
+        }
+        return true;
+    }
+    const bool multiDraw = device_.HasFeature("multiDrawIndirect");
+    const UINT calls = multiDraw ? 1 : maxCount;
+    const UINT perCall = multiDraw ? maxCount : 1;
+    for (UINT index = 0; index < calls; ++index) {
+        const VkDeviceSize at = offset + static_cast<VkDeviceSize>(index) * signature.stride;
+        if (indexed) {
+            vk.cmdDrawIndexedIndirect(commands_, arguments.buffer, at, perCall, signature.stride);
+        } else {
+            vk.cmdDrawIndirect(commands_, arguments.buffer, at, perCall, signature.stride);
+        }
+    }
+    return true;
+}
+
 bool CommandRecorder::LayoutFor(const TextureRef& texture, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_STATES expected, VkImageLayout& layout, std::string& error) const {
     if (state != D3D12_RESOURCE_STATE_COMMON && (static_cast<UINT>(state) & static_cast<UINT>(expected)) == 0) {
         error = "the texture is in state " + std::to_string(static_cast<UINT>(state)) + ", not in state " + std::to_string(static_cast<UINT>(expected)) + " or COMMON";

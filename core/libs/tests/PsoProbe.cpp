@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1866,6 +1867,246 @@ int DrawGpu(bool validate) {
     return status;
 }
 
+const std::uint32_t kQuadrantVertex[] = {
+#include "shaders/graphics_quadrant.inc"
+};
+
+int IndirectSelfTest() {
+    std::string error;
+    if (IndirectArgumentBytes(IndirectKind::Draw) != 16 || IndirectArgumentBytes(IndirectKind::DrawIndexed) != 20 || IndirectArgumentBytes(IndirectKind::Dispatch) != 12) return Fail("argument sizes");
+    static_assert(sizeof(D3D12_DRAW_ARGUMENTS) == sizeof(VkDrawIndirectCommand));
+    static_assert(sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) == sizeof(VkDrawIndexedIndirectCommand));
+    static_assert(sizeof(D3D12_DISPATCH_ARGUMENTS) == sizeof(VkDispatchIndirectCommand));
+    static_assert(offsetof(D3D12_DRAW_INDEXED_ARGUMENTS, BaseVertexLocation) == offsetof(VkDrawIndexedIndirectCommand, vertexOffset));
+    D3D12_INDIRECT_ARGUMENT_DESC draw{};
+    draw.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_INDIRECT_ARGUMENT_DESC indexed{};
+    indexed.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+    D3D12_INDIRECT_ARGUMENT_DESC dispatch{};
+    dispatch.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_INDIRECT_ARGUMENT_DESC constant{};
+    constant.Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    D3D12_INDIRECT_ARGUMENT_DESC mesh{};
+    mesh.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    std::optional<IndirectSignature> signature = TranslateCommandSignature({32, 1, &draw, 0}, error);
+    if (!signature || signature->kind != IndirectKind::Draw || signature->stride != 32) return Fail("draw signature: " + error);
+    signature = TranslateCommandSignature({20, 1, &indexed, 1}, error);
+    if (!signature || signature->kind != IndirectKind::DrawIndexed) return Fail("indexed signature: " + error);
+    signature = TranslateCommandSignature({12, 1, &dispatch, 0}, error);
+    if (!signature || signature->kind != IndirectKind::Dispatch) return Fail("dispatch signature: " + error);
+    const D3D12_INDIRECT_ARGUMENT_DESC withConstant[] = {constant, draw};
+    const D3D12_INDIRECT_ARGUMENT_DESC drawFirst[] = {draw, constant};
+    const std::pair<D3D12_COMMAND_SIGNATURE_DESC, const char*> refusals[] = {
+        {{16, 2, withConstant, 0}, "argument type 5 (constants, views or buffer bindings changed per command)"},
+        {{16, 2, drawFirst, 0}, "is not the last argument"},
+        {{16, 1, &mesh, 0}, "type 10 as the last argument"},
+        {{12, 1, &draw, 0}, "byte stride 12 is smaller than the 16-byte arguments"},
+        {{18, 1, &draw, 0}, "byte stride 18"},
+        {{16, 0, &draw, 0}, "has no arguments"},
+        {{16, 1, &draw, 2}, "node mask 2"},
+    };
+    for (const auto& [desc, expected] : refusals) {
+        error.clear();
+        if (TranslateCommandSignature(desc, error) || error.find(expected) == std::string::npos) return Fail(std::string("refusal '") + expected + "' gave '" + error + "'");
+    }
+    std::puts("PASS indirect selftest");
+    return 0;
+}
+
+int IndirectGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress", "shaderInt64"};
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const DeviceFunctions& vk = device->Vk();
+    const bool counted = device->HasFeature("drawIndirectCount");
+    std::printf("multiDrawIndirect %s, drawIndirectCount %s\n", device->HasFeature("multiDrawIndirect") ? "yes" : "no", counted ? "yes" : "no");
+    const auto makeModule = [&](const std::uint32_t* words, std::size_t bytes) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = bytes;
+        info.pCode = words;
+        VkShaderModule module = VK_NULL_HANDLE;
+        return vk.createShaderModule(device->Handle(), &info, nullptr, &module) == VK_SUCCESS ? module : VK_NULL_HANDLE;
+    };
+    const VkShaderModule quadrant = makeModule(kQuadrantVertex, sizeof(kQuadrantVertex));
+    const VkShaderModule fragment = makeModule(kGraphicsFloat, sizeof(kGraphicsFloat));
+    const VkShaderModule fill = makeModule(kDispatchFill, sizeof(kDispatchFill));
+    if (!quadrant || !fragment || !fill) return Fail("shader modules");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = DefaultGraphics();
+    desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    const std::optional<GraphicsPipelineState> state = TranslateGraphicsState(desc, error);
+    VkPipeline graphics = VK_NULL_HANDLE;
+    if (!state || CreateGraphicsPipeline(*device, VK_NULL_HANDLE, *state, {{VK_SHADER_STAGE_VERTEX_BIT, quadrant, 0}, {VK_SHADER_STAGE_FRAGMENT_BIT, fragment, 0}}, {}, 0, &graphics, error) != VK_SUCCESS) {
+        return Fail("graphics pipeline: " + error);
+    }
+    VkComputePipelineCreateInfo computeInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    computeInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, fill, "main", nullptr};
+    computeInfo.layout = device->TitlePipelineLayout();
+    VkPipeline compute = VK_NULL_HANDLE;
+    if (vk.createComputePipelines(device->Handle(), VK_NULL_HANDLE, 1, &computeInfo, nullptr, &compute) != VK_SUCCESS) return Fail("compute pipeline");
+
+    const D3D12_RESOURCE_DESC targetDesc = TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    TextureRef target;
+    target.desc = targetDesc;
+    target.layout = *TranslateTextureDesc(targetDesc, error);
+    VkDeviceMemory targetMemory = VK_NULL_HANDLE;
+    if (vk.createImage(device->Handle(), &target.layout.info, nullptr, &target.image) != VK_SUCCESS) return Fail("target image");
+    VkMemoryRequirements needs{};
+    vk.getImageMemoryRequirements(device->Handle(), target.image, &needs);
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = needs.size;
+    allocate.memoryTypeIndex = device->MemoryType(needs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT).value_or(0);
+    if (vk.allocateMemory(device->Handle(), &allocate, nullptr, &targetMemory) != VK_SUCCESS || vk.bindImageMemory(device->Handle(), target.image, targetMemory, 0) != VK_SUCCESS) return Fail("target memory");
+    std::optional<ImageView> rtv = RenderTargetView(targetDesc, nullptr, error);
+    rtv->info.image = target.image;
+    VkImageView targetView = VK_NULL_HANDLE;
+    if (vk.createImageView(device->Handle(), &rtv->info, nullptr, &targetView) != VK_SUCCESS) return Fail("target view");
+    const AttachmentRef attachment{targetView, {64, 64}, 1, VK_IMAGE_ASPECT_COLOR_BIT};
+
+    DeviceBuffer host;
+    const VkDeviceSize hostBytes = 1u << 20;
+    if (!CreateHostBuffer(*device, hostBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, host, error)) return Fail("host buffer: " + error);
+    std::uint8_t* const bytes = static_cast<std::uint8_t*>(host.mapped);
+    std::fill(bytes, bytes + hostBytes, std::uint8_t{0});
+    const BufferRef hostRef{host.buffer, 0, hostBytes};
+    const VkDeviceSize drawArgs = 0x80000;
+    const VkDeviceSize indexedArgs = 0x80100;
+    const VkDeviceSize dispatchArgs = 0x80200;
+    const VkDeviceSize countOne = 0x80300;
+    const VkDeviceSize countZero = 0x80304;
+    const VkDeviceSize indices = 0x80400;
+    const VkDeviceSize fillAt = 0x90000;
+    const D3D12_DRAW_ARGUMENTS draws[2] = {{3, 1, 0, 0}, {3, 1, 3, 0}};
+    std::memcpy(bytes + drawArgs, &draws[0], sizeof(draws[0]));
+    std::memcpy(bytes + drawArgs + 32, &draws[1], sizeof(draws[1]));
+    const D3D12_DRAW_INDEXED_ARGUMENTS indexedDraw{3, 1, 0, 0, 0};
+    std::memcpy(bytes + indexedArgs, &indexedDraw, sizeof(indexedDraw));
+    const D3D12_DISPATCH_ARGUMENTS groups{2, 1, 1};
+    std::memcpy(bytes + dispatchArgs, &groups, sizeof(groups));
+    const std::uint32_t one = 1;
+    std::memcpy(bytes + countOne, &one, sizeof(one));
+    const std::uint16_t lowerRight[3] = {3, 4, 5};
+    std::memcpy(bytes + indices, lowerRight, sizeof(lowerRight));
+    VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    addressInfo.buffer = host.buffer;
+    const VkDeviceAddress address = vk.getBufferDeviceAddress(device->Handle(), &addressInfo);
+    const IndirectSignature drawSignature{IndirectKind::Draw, 32};
+    const IndirectSignature indexedSignature{IndirectKind::DrawIndexed, 20};
+    const IndirectSignature dispatchSignature{IndirectKind::Dispatch, 12};
+
+    const std::optional<Footprints> prints = DesktopCopyableFootprints(targetDesc, 1, 0, 1, 0, error);
+    const UINT pitch = prints->layouts[0].Footprint.RowPitch;
+    const UINT64 regionBytes = 0x10000;
+    bool recorded = true;
+    std::string step;
+    const bool submitted = device->Submit(
+        [&](VkCommandBuffer commands) {
+            CommandRecorder recorder(*device, commands);
+            const auto check = [&](bool ok, const char* name) {
+                if (!ok && recorded) {
+                    recorded = false;
+                    step = name;
+                }
+            };
+            const float blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+            check(recorder.InitializeTexture(target, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "initialize");
+            const auto pass = [&](UINT region, const IndirectSignature& signature, UINT maxCount, VkDeviceSize argumentOffset, const VkDeviceSize* countOffset) {
+                check(recorder.ClearRenderTarget(attachment, blue, {}, error), "clear");
+                check(recorder.BeginRendering({attachment}, nullptr, {64, 64}, 1, error), "begin rendering");
+                check(recorder.SetViewports({{0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f}}, error), "viewport");
+                check(recorder.SetScissors({{0, 0, 64, 64}}, error), "scissor");
+                check(recorder.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, false, error), "topology");
+                recorder.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, graphics);
+                if (signature.kind == IndirectKind::DrawIndexed) check(recorder.SetIndexBuffer({host.buffer, indices, 6}, DXGI_FORMAT_R16_UINT, error), "index buffer");
+                check(recorder.ExecuteIndirect(signature, maxCount, hostRef, argumentOffset, countOffset != nullptr ? &hostRef : nullptr, countOffset != nullptr ? *countOffset : 0, error),
+                      "execute indirect");
+                recorder.EndRendering();
+                check(recorder.Transition(target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE, error), "to copy source");
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = prints->layouts[0];
+                footprint.Offset = region * regionBytes;
+                check(recorder.CopyTextureToBuffer(hostRef, footprint, target, D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error), "read back");
+                check(recorder.Transition(target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, error), "to render target");
+            };
+            pass(0, drawSignature, 2, drawArgs, nullptr);
+            if (counted) {
+                pass(1, drawSignature, 2, drawArgs, &countOne);
+                pass(3, drawSignature, 2, drawArgs, &countZero);
+            }
+            pass(2, indexedSignature, 1, indexedArgs, nullptr);
+            check(!recorder.ExecuteIndirect(dispatchSignature, 1, hostRef, dispatchArgs, &hostRef, countOne, error), "dispatch with a count is refused");
+            check(!recorder.ExecuteIndirect(drawSignature, 2, hostRef, hostBytes - 40, nullptr, 0, error), "arguments past the buffer are refused");
+            check(!recorder.ExecuteIndirect(drawSignature, 1, hostRef, drawArgs + 2, nullptr, 0, error), "misaligned arguments are refused");
+            struct {
+                std::uint64_t address;
+                std::uint32_t base;
+                std::uint32_t count;
+            } constants{address + fillAt, 500, 256};
+            recorder.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, compute);
+            check(recorder.SetPushConstants(&constants, sizeof(constants), error), "push constants");
+            check(recorder.ExecuteIndirect(dispatchSignature, 1, hostRef, dispatchArgs, nullptr, 0, error), "indirect dispatch");
+            VkMemoryBarrier2 hostBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            hostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            hostBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            hostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            hostBarrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers = &hostBarrier;
+            vk.cmdPipelineBarrier2(commands, &dependency);
+        },
+        error);
+    int status = 0;
+    if (!submitted || !recorded) status = Fail("recording '" + step + "': " + error);
+    const auto rgb = [&](UINT region, UINT x, UINT y) {
+        const std::uint8_t* p = bytes + region * regionBytes + y * pitch + x * 4;
+        return static_cast<std::uint32_t>(p[0]) << 16 | static_cast<std::uint32_t>(p[1]) << 8 | p[2];
+    };
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    if (status == 0) {
+        const std::uint32_t red = 0xFF0000u;
+        const std::uint32_t blueRgb = 0x0000FFu;
+        expect(rgb(0, 4, 4) == red && rgb(0, 60, 60) == red, "two indirect draws cover both halves");
+        if (counted) {
+            expect(rgb(1, 4, 4) == red && rgb(1, 60, 60) == blueRgb, "a count of 1 draws only the first command");
+            expect(rgb(3, 4, 4) == blueRgb && rgb(3, 60, 60) == blueRgb, "a count of 0 draws nothing");
+        }
+        expect(rgb(2, 60, 60) == red && rgb(2, 4, 4) == blueRgb, "the indexed indirect draw covers the lower-right half");
+        bool filled = true;
+        for (std::uint32_t item = 0; item < 128 && filled; ++item) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, bytes + fillAt + item * 4, sizeof(value));
+            filled = value == 500 + item * 3;
+        }
+        std::uint32_t beyond = 1;
+        std::memcpy(&beyond, bytes + fillAt + 128 * 4, sizeof(beyond));
+        expect(filled && beyond == 0, "the indirect dispatch ran 2 groups of 64 and no more");
+    }
+    std::printf("indirect: %zu read-back checks\n", checks);
+    vk.destroyImageView(device->Handle(), targetView, nullptr);
+    vk.destroyImage(device->Handle(), target.image, nullptr);
+    vk.freeMemory(device->Handle(), targetMemory, nullptr);
+    DestroyBuffer(*device, host);
+    for (VkPipeline pipeline : {graphics, compute}) vk.destroyPipeline(device->Handle(), pipeline, nullptr);
+    for (VkShaderModule module : {quadrant, fragment, fill}) vk.destroyShaderModule(device->Handle(), module, nullptr);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS indirect gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1880,6 +2121,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "views-selftest") == 0) return ViewsSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "commands-selftest") == 0) return CommandsSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "draw-selftest") == 0) return DrawSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "indirect-selftest") == 0) return IndirectSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "commands-gpu") == 0) return CommandsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "views-gpu") == 0) return ViewsGpu(HasFlag(argc, argv, "--validate"));
@@ -1887,6 +2130,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate]");
     return 2;
 }
