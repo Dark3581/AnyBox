@@ -1,7 +1,9 @@
 #include "BindlessSet.hpp"
 #include "BufferDescriptor.hpp"
+#include "CommandQueue.hpp"
 #include "CommandRecorder.hpp"
 #include "CopyLayout.hpp"
+#include "Fence.hpp"
 #include "GraphicsPipeline.hpp"
 #include "GraphicsState.hpp"
 #include "PipelineCompiler.hpp"
@@ -2552,6 +2554,106 @@ int RootSignatureSelfTest() {
     return 0;
 }
 
+int FenceGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    int status = 0;
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    ID3D12Fence* fence = nullptr;
+    ID3D12Fence* other = nullptr;
+    expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence), error)) && fence != nullptr, "create fence: " + error);
+    expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&other), error)) && other != nullptr, "create second fence");
+    void* nothing = nullptr;
+    expect(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), &nothing, error) == E_INVALIDARG && nothing == nullptr, "shared fence refused");
+    D3D12_COMMAND_QUEUE_DESC directDesc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    D3D12_COMMAND_QUEUE_DESC computeDesc{D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, 0};
+    ID3D12CommandQueue* direct = nullptr;
+    ID3D12CommandQueue* compute = nullptr;
+    expect(SUCCEEDED(CommandQueue::Create(*device, nullptr, directDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&direct), error)) && direct != nullptr, "create direct queue");
+    expect(SUCCEEDED(CommandQueue::Create(*device, nullptr, computeDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&compute), error)) && compute != nullptr, "create compute queue");
+    D3D12_COMMAND_QUEUE_DESC videoDesc{D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    expect(CommandQueue::Create(*device, nullptr, videoDesc, __uuidof(ID3D12CommandQueue), &nothing, error) == E_INVALIDARG, "video queue refused");
+    if (status != 0) return status;
+
+    void* queried = nullptr;
+    for (const IID& iid : {__uuidof(IUnknown), __uuidof(ID3D12Object), __uuidof(ID3D12DeviceChild), __uuidof(ID3D12Pageable), __uuidof(ID3D12Fence), __uuidof(ID3D12Fence1)}) {
+        queried = nullptr;
+        const HRESULT result = fence->QueryInterface(iid, &queried);
+        expect(SUCCEEDED(result) && queried == fence, "fence interface");
+        if (queried != nullptr) static_cast<IUnknown*>(queried)->Release();
+    }
+    expect(fence->QueryInterface(__uuidof(ID3D12CommandQueue), &queried) == E_NOINTERFACE && queried == nullptr, "fence is not a queue");
+    expect(fence->GetDevice(__uuidof(ID3D12Device), &queried) == E_NOINTERFACE, "no parent device");
+    const GUID tag{0x12345678, 0x1234, 0x5678, {1, 2, 3, 4, 5, 6, 7, 8}};
+    const std::uint32_t payload = 0xC0FFEEu;
+    UINT size = 0;
+    expect(fence->GetPrivateData(tag, &size, nullptr) == DXGI_ERROR_NOT_FOUND, "missing private data");
+    expect(SUCCEEDED(fence->SetPrivateData(tag, sizeof(payload), &payload)), "set private data");
+    expect(SUCCEEDED(fence->GetPrivateData(tag, &size, nullptr)) && size == 4, "private data size");
+    std::uint32_t read = 0;
+    size = 2;
+    expect(fence->GetPrivateData(tag, &size, &read) == DXGI_ERROR_MORE_DATA && size == 4, "short private data buffer");
+    size = 4;
+    expect(SUCCEEDED(fence->GetPrivateData(tag, &size, &read)) && read == payload, "private data value");
+    expect(SUCCEEDED(fence->SetPrivateDataInterface(tag, other)), "private interface");
+    IUnknown* stored = nullptr;
+    size = sizeof(stored);
+    expect(SUCCEEDED(fence->GetPrivateData(tag, &size, &stored)) && stored == other, "private interface value");
+    if (stored != nullptr) stored->Release();
+    expect(SUCCEEDED(fence->SetName(L"frame fence")), "set name");
+    ID3D12Fence1* fence1 = nullptr;
+    if (SUCCEEDED(fence->QueryInterface(__uuidof(ID3D12Fence1), reinterpret_cast<void**>(&fence1)))) {
+        expect(fence1->GetCreationFlags() == D3D12_FENCE_FLAG_NONE, "creation flags");
+        fence1->Release();
+    }
+    const D3D12_COMMAND_QUEUE_DESC readBack = compute->GetDesc();
+    expect(readBack.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE && readBack.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, "queue description");
+    UINT64 frequency = 0;
+    expect(SUCCEEDED(direct->GetTimestampFrequency(&frequency)) && frequency > 0, "timestamp frequency");
+    expect(direct->Signal(nullptr, 1) == E_INVALIDARG, "foreign fence refused");
+
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const auto reaches = [&](ID3D12Fence* which, UINT64 value) {
+        ResetEvent(event);
+        return SUCCEEDED(which->SetEventOnCompletion(value, event)) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0 && which->GetCompletedValue() >= value;
+    };
+    expect(SUCCEEDED(direct->Signal(fence, 1)), "queue signal");
+    expect(reaches(fence, 1), "a GPU signal wakes the event");
+    CommandQueue* directQueue = dynamic_cast<CommandQueue*>(direct);
+    expect(SUCCEEDED(direct->Wait(fence, 3)) && SUCCEEDED(direct->Signal(other, 1)), "wait before signal recorded");
+    expect(directQueue->Pending() == 2 && other->GetCompletedValue() == 0, "the wait and what follows are held back until a signal is promised");
+    expect(SUCCEEDED(compute->Signal(fence, 3)), "the other queue signals");
+    expect(reaches(other, 1) && directQueue->Pending() == 0, "the held work runs after the other queue's signal, without a deadlock");
+    expect(SUCCEEDED(direct->Wait(fence, 5)) && SUCCEEDED(direct->Signal(other, 2)) && directQueue->Pending() == 2, "a wait for a CPU signal is held");
+    expect(SUCCEEDED(fence->Signal(5)) && fence->GetCompletedValue() == 5, "CPU signal");
+    expect(reaches(other, 2), "a CPU signal releases the held GPU wait");
+    expect(SUCCEEDED(fence->Signal(5)), "signalling the current value again");
+    expect(SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)), "blocking wait on a reached value");
+    CloseHandle(event);
+    std::printf("fences and queues: %zu checks\n", checks);
+    direct->Release();
+    compute->Release();
+    fence->Release();
+    other->Release();
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS fence gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -2569,6 +2671,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "indirect-selftest") == 0) return IndirectSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "buffers-selftest") == 0) return BuffersSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "rootsig-selftest") == 0) return RootSignatureSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "fence-gpu") == 0) return FenceGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
@@ -2578,6 +2681,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate]");
     return 2;
 }

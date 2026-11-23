@@ -159,7 +159,7 @@ def main():
     assert "PASS indirect selftest" in run([args.probe, "indirect-selftest"], env)
     assert "PASS buffers selftest" in run([args.probe, "buffers-selftest"], env)
     assert "PASS root signature selftest" in run([args.probe, "rootsig-selftest"], env)
-    for command in ("states-gpu", "textures-gpu", "views-gpu", "commands-gpu", "draw-gpu", "indirect-gpu", "planes-gpu"):
+    for command in ("states-gpu", "textures-gpu", "views-gpu", "commands-gpu", "draw-gpu", "indirect-gpu", "planes-gpu", "fence-gpu"):
         checked = subprocess.run([str(args.probe), command, "--validate"], capture_output=True, text=True, env=env, timeout=600)
         if checked.returncode == 4:
             checked = subprocess.run([str(args.probe), command], capture_output=True, text=True, env=env, timeout=600)

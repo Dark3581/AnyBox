@@ -92,6 +92,12 @@ struct DeviceFunctions {
     PFN_vkCmdDrawIndexedIndirectCount cmdDrawIndexedIndirectCount = nullptr;
     PFN_vkCmdDispatchIndirect cmdDispatchIndirect = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
+    PFN_vkCreateSemaphore createSemaphore = nullptr;
+    PFN_vkDestroySemaphore destroySemaphore = nullptr;
+    PFN_vkGetSemaphoreCounterValue getSemaphoreCounterValue = nullptr;
+    PFN_vkSignalSemaphore signalSemaphore = nullptr;
+    PFN_vkWaitSemaphores waitSemaphores = nullptr;
+    PFN_vkQueueSubmit2 queueSubmit2 = nullptr;
     PFN_vkCreateFence createFence = nullptr;
     PFN_vkDestroyFence destroyFence = nullptr;
     PFN_vkWaitForFences waitForFences = nullptr;
@@ -120,6 +126,7 @@ public:
     PFN_vkGetMemoryHostPointerPropertiesEXT HostPointerProperties() const { return hostPointerProperties_; }
     std::optional<std::uint32_t> MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
     bool Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
+    std::mutex& QueueLock() const { return queueLock_; }
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
     bool HasFeature(const std::string& name) const;
     const std::vector<std::string>& EnabledExtensions() const { return extensions_; }
@@ -140,6 +147,7 @@ private:
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
     PFN_vkDestroyDebugUtilsMessengerEXT destroyMessenger_ = nullptr;
     mutable std::mutex messagesLock_;
+    mutable std::mutex queueLock_;
     std::size_t validationErrors_ = 0;
     std::vector<std::string> validationMessages_;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;

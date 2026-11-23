@@ -72,6 +72,7 @@ const FeatureEntry kLayoutFeatures[] = {
     {"descriptorBindingStorageImageUpdateAfterBind", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.descriptorBindingStorageImageUpdateAfterBind; }},
     {"dynamicRendering", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.dynamicRendering; }},
     {"synchronization2", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v13.synchronization2; }},
+    {"timelineSemaphore", nullptr, [](FeatureChain& c) -> VkBool32& { return c.v12.timelineSemaphore; }},
 };
 
 const FeatureEntry kOptionalFeatures[] = {
@@ -521,6 +522,12 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdDrawIndexedIndirectCount = DeviceFunction<PFN_vkCmdDrawIndexedIndirectCount>(getDeviceProcAddr, device_, "vkCmdDrawIndexedIndirectCount");
     vk_.cmdDispatchIndirect = DeviceFunction<PFN_vkCmdDispatchIndirect>(getDeviceProcAddr, device_, "vkCmdDispatchIndirect");
     vk_.queueSubmit = DeviceFunction<PFN_vkQueueSubmit>(getDeviceProcAddr, device_, "vkQueueSubmit");
+    vk_.createSemaphore = DeviceFunction<PFN_vkCreateSemaphore>(getDeviceProcAddr, device_, "vkCreateSemaphore");
+    vk_.destroySemaphore = DeviceFunction<PFN_vkDestroySemaphore>(getDeviceProcAddr, device_, "vkDestroySemaphore");
+    vk_.getSemaphoreCounterValue = DeviceFunction<PFN_vkGetSemaphoreCounterValue>(getDeviceProcAddr, device_, "vkGetSemaphoreCounterValue");
+    vk_.signalSemaphore = DeviceFunction<PFN_vkSignalSemaphore>(getDeviceProcAddr, device_, "vkSignalSemaphore");
+    vk_.waitSemaphores = DeviceFunction<PFN_vkWaitSemaphores>(getDeviceProcAddr, device_, "vkWaitSemaphores");
+    vk_.queueSubmit2 = DeviceFunction<PFN_vkQueueSubmit2>(getDeviceProcAddr, device_, "vkQueueSubmit2");
     vk_.createFence = DeviceFunction<PFN_vkCreateFence>(getDeviceProcAddr, device_, "vkCreateFence");
     vk_.destroyFence = DeviceFunction<PFN_vkDestroyFence>(getDeviceProcAddr, device_, "vkDestroyFence");
     vk_.waitForFences = DeviceFunction<PFN_vkWaitForFences>(getDeviceProcAddr, device_, "vkWaitForFences");
@@ -662,7 +669,11 @@ bool VulkanDevice::Submit(const std::function<void(VkCommandBuffer)>& record, st
         error = "cannot finish a command buffer";
         return false;
     }
-    const VkResult submitted = vk_.queueSubmit(queue_, 1, &submit, fence);
+    VkResult submitted = VK_SUCCESS;
+    {
+        std::lock_guard<std::mutex> guard(queueLock_);
+        submitted = vk_.queueSubmit(queue_, 1, &submit, fence);
+    }
     const VkResult waited = submitted == VK_SUCCESS ? vk_.waitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX) : submitted;
     cleanup();
     if (waited != VK_SUCCESS) {
