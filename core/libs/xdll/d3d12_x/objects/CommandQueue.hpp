@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <vector>
 #include <string>
 
 namespace abx::d3d12x {
@@ -48,6 +49,7 @@ private:
         bool wait = false;
         Fence* fence = nullptr;
         UINT64 value = 0;
+        std::vector<VkCommandBuffer> commands;
     };
 
     CommandQueue(const VulkanDevice& device, IUnknown* parent, const D3D12_COMMAND_QUEUE_DESC& desc) : DeviceChildBase(parent), device_(device), desc_(desc) {}

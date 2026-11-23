@@ -488,6 +488,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.updateDescriptorSets = DeviceFunction<PFN_vkUpdateDescriptorSets>(getDeviceProcAddr, device_, "vkUpdateDescriptorSets");
     vk_.createCommandPool = DeviceFunction<PFN_vkCreateCommandPool>(getDeviceProcAddr, device_, "vkCreateCommandPool");
     vk_.destroyCommandPool = DeviceFunction<PFN_vkDestroyCommandPool>(getDeviceProcAddr, device_, "vkDestroyCommandPool");
+    vk_.resetCommandPool = DeviceFunction<PFN_vkResetCommandPool>(getDeviceProcAddr, device_, "vkResetCommandPool");
     vk_.allocateCommandBuffers = DeviceFunction<PFN_vkAllocateCommandBuffers>(getDeviceProcAddr, device_, "vkAllocateCommandBuffers");
     vk_.beginCommandBuffer = DeviceFunction<PFN_vkBeginCommandBuffer>(getDeviceProcAddr, device_, "vkBeginCommandBuffer");
     vk_.endCommandBuffer = DeviceFunction<PFN_vkEndCommandBuffer>(getDeviceProcAddr, device_, "vkEndCommandBuffer");

@@ -1,6 +1,8 @@
 #include "BindlessSet.hpp"
 #include "BufferArena.hpp"
 #include "BufferDescriptor.hpp"
+#include "CommandAllocator.hpp"
+#include "CommandList.hpp"
 #include "CommandQueue.hpp"
 #include "CommandRecorder.hpp"
 #include "CopyLayout.hpp"
@@ -32,6 +34,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -2819,6 +2822,204 @@ int ResourcesGpu(bool validate) {
     return status;
 }
 
+int CommandListGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress"};
+    requirements.hostMemoryImport = true;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const std::unique_ptr<TitleBufferWindow> window = TitleBufferWindow::Create(*device, 64u << 20, error);
+    if (!window) return Fail("window: " + error);
+    BufferArena arena(window->Start(), window->Size());
+    const ResourceContext context{*device, *window, arena};
+    int status = 0;
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    const auto bufferDesc = [](UINT64 bytes) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = bytes;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc = {1, 0};
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return desc;
+    };
+    const auto create = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
+        const D3D12_HEAP_PROPERTIES heap{type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        ID3D12Resource* resource = nullptr;
+        const HRESULT result = Resource::CreateCommitted(context, nullptr, heap, D3D12_HEAP_FLAG_NONE, desc, state, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource), error);
+        return SUCCEEDED(result) ? resource : nullptr;
+    };
+
+    ID3D12CommandQueue* queue = nullptr;
+    ID3D12Fence* fence = nullptr;
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12CommandAllocator* computeAllocator = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC queueDesc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    expect(SUCCEEDED(CommandQueue::Create(*device, nullptr, queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue), error)), "create queue: " + error);
+    expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence), error)), "create fence: " + error);
+    expect(SUCCEEDED(CommandAllocator::Create(*device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&allocator), error)),
+           "create allocator: " + error);
+    expect(SUCCEEDED(CommandAllocator::Create(*device, nullptr, D3D12_COMMAND_LIST_TYPE_COMPUTE, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&computeAllocator), error)),
+           "create compute allocator: " + error);
+    void* nothing = nullptr;
+    expect(CommandAllocator::Create(*device, nullptr, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, __uuidof(ID3D12CommandAllocator), &nothing, error) == E_INVALIDARG && nothing == nullptr,
+           "video allocator refused");
+    if (status != 0) return status;
+    expect(CommandList::Create(context, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT, computeAllocator, nullptr, __uuidof(ID3D12GraphicsCommandList), &nothing, error) == E_INVALIDARG &&
+               nothing == nullptr,
+           "a list on an allocator of another type refused");
+    expect(SUCCEEDED(CommandList::Create(context, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&list),
+                                         error)) &&
+               list != nullptr,
+           "create list: " + error);
+    if (status != 0) return status;
+    for (const IID& iid : {__uuidof(IUnknown), __uuidof(ID3D12Object), __uuidof(ID3D12DeviceChild), __uuidof(ID3D12CommandList), __uuidof(ID3D12GraphicsCommandList)}) {
+        void* queried = nullptr;
+        expect(SUCCEEDED(list->QueryInterface(iid, &queried)) && queried == list, "list interface");
+        if (queried != nullptr) static_cast<IUnknown*>(queried)->Release();
+    }
+    expect(list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT, "list type");
+    expect(list->Reset(allocator, nullptr) == E_FAIL, "reset of a recording list refused");
+
+    ID3D12Resource* upload = create(D3D12_HEAP_TYPE_UPLOAD, bufferDesc(1u << 20), D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* readback = create(D3D12_HEAP_TYPE_READBACK, bufferDesc(1u << 20), D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* smallUpload = create(D3D12_HEAP_TYPE_UPLOAD, bufferDesc(65536), D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* smallReadback = create(D3D12_HEAP_TYPE_READBACK, bufferDesc(65536), D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_RESOURCE_DESC textureDesc = TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 16, 16, 1, 2, D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* texture = create(D3D12_HEAP_TYPE_DEFAULT, textureDesc, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* twin = create(D3D12_HEAP_TYPE_DEFAULT, textureDesc, D3D12_RESOURCE_STATE_COPY_DEST);
+    expect(upload && readback && smallUpload && smallReadback && texture && twin, "create resources: " + error);
+    if (status != 0) return status;
+
+    std::uint8_t* source = nullptr;
+    upload->Map(0, nullptr, reinterpret_cast<void**>(&source));
+    for (std::uint32_t index = 0; index < 0x20000; ++index) source[index] = static_cast<std::uint8_t>(index * 13 + 5);
+    upload->Unmap(0, nullptr);
+    std::uint8_t* smallSource = nullptr;
+    smallUpload->Map(0, nullptr, reinterpret_cast<void**>(&smallSource));
+    for (std::uint32_t index = 0; index < 65536; ++index) smallSource[index] = static_cast<std::uint8_t>(index * 3 + 11);
+    smallUpload->Unmap(0, nullptr);
+    std::uint8_t* result = nullptr;
+    readback->Map(0, nullptr, reinterpret_cast<void**>(&result));
+    std::fill(result, result + (1u << 20), std::uint8_t{0xAB});
+    std::uint8_t* smallResult = nullptr;
+    smallReadback->Map(0, nullptr, reinterpret_cast<void**>(&smallResult));
+    std::fill(smallResult, smallResult + 65536, std::uint8_t{0xAB});
+
+    const auto footprint = [](UINT64 offset) {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT print{};
+        print.Offset = offset;
+        print.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, 1, 256};
+        return print;
+    };
+    const auto bufferLocation = [&](ID3D12Resource* resource, UINT64 offset) {
+        D3D12_TEXTURE_COPY_LOCATION location{};
+        location.pResource = resource;
+        location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        location.PlacedFootprint = footprint(offset);
+        return location;
+    };
+    const auto textureLocation = [](ID3D12Resource* resource, UINT subresource) {
+        D3D12_TEXTURE_COPY_LOCATION location{};
+        location.pResource = resource;
+        location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        location.SubresourceIndex = subresource;
+        return location;
+    };
+    const auto transition = [](ID3D12Resource* resource, UINT subresource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {resource, subresource, before, after};
+        return barrier;
+    };
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const auto reaches = [&](UINT64 value) {
+        ResetEvent(event);
+        return SUCCEEDED(fence->SetEventOnCompletion(value, event)) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
+    };
+    const auto mipMatches = [&](UINT64 offset) {
+        for (UINT row = 0; row < 8; ++row) {
+            for (UINT byte = 0; byte < 32; ++byte) {
+                if (result[offset + row * 256 + byte] != source[row * 256 + byte]) return false;
+            }
+        }
+        return true;
+    };
+
+    const D3D12_TEXTURE_COPY_LOCATION mip1 = textureLocation(texture, 1);
+    const D3D12_TEXTURE_COPY_LOCATION fromUpload = bufferLocation(upload, 0);
+    list->CopyTextureRegion(&mip1, 0, 0, 0, &fromUpload, nullptr);
+    const D3D12_RESOURCE_BARRIER toSource = transition(texture, 1, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &toSource);
+    const D3D12_TEXTURE_COPY_LOCATION toReadback = bufferLocation(readback, 0x20000);
+    list->CopyTextureRegion(&toReadback, 0, 0, 0, &mip1, nullptr);
+    const D3D12_BOX corner{2, 3, 0, 6, 7, 1};
+    const D3D12_TEXTURE_COPY_LOCATION toCorner = bufferLocation(readback, 0x30000);
+    list->CopyTextureRegion(&toCorner, 1, 1, 0, &mip1, &corner);
+    list->CopyBufferRegion(readback, 0x40000, upload, 0x10000, 4096);
+    expect(SUCCEEDED(list->Close()) && list->Close() == E_FAIL, "close once, refuse a second close");
+    queue->ExecuteCommandLists(0, nullptr);
+    ID3D12CommandList* lists[] = {list};
+    queue->ExecuteCommandLists(1, lists);
+    expect(SUCCEEDED(queue->Signal(fence, 1)) && reaches(1), "the executed list completes");
+    if (status == 0) {
+        expect(mipMatches(0x20000), "a footprint uploaded into mip 1 reads back unchanged after a subresource barrier");
+        bool box = true;
+        for (UINT row = 0; row < 4 && box; ++row) {
+            for (UINT byte = 0; byte < 16 && box; ++byte) box = result[0x30000 + (row + 1) * 256 + 4 + byte] == source[(row + 3) * 256 + 8 + byte];
+        }
+        expect(box && result[0x30000] == 0xAB, "a boxed texture copy lands at the destination offset and leaves the rest untouched");
+        bool bytes = true;
+        for (std::uint32_t index = 0; index < 4096 && bytes; ++index) bytes = result[0x40000 + index] == source[0x10000 + index];
+        expect(bytes && result[0x40000 + 4096] == 0xAB, "a buffer region copy");
+    }
+
+    std::fill(result, result + (1u << 20), std::uint8_t{0xAB});
+    expect(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator, nullptr)), "reset the allocator and the list");
+    list->CopyResource(smallReadback, smallUpload);
+    const D3D12_RESOURCE_BARRIER mip0 = transition(texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &mip0);
+    list->CopyResource(twin, texture);
+    const D3D12_RESOURCE_BARRIER twinSource = transition(twin, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &twinSource);
+    const D3D12_TEXTURE_COPY_LOCATION twinMip1 = textureLocation(twin, 1);
+    list->CopyTextureRegion(&toReadback, 0, 0, 0, &twinMip1, nullptr);
+    expect(SUCCEEDED(list->Close()), "close the reset list");
+    queue->ExecuteCommandLists(1, lists);
+    expect(SUCCEEDED(queue->Signal(fence, 2)) && reaches(2), "the reset list completes");
+    if (status == 0) {
+        expect(std::memcmp(smallResult, smallSource, 65536) == 0, "CopyResource between two buffers");
+        expect(mipMatches(0x20000), "CopyResource between two textures copies every mip");
+    }
+    expect(dynamic_cast<CommandAllocator*>(allocator)->Allocated() == 1, "the allocator reuses its command buffer after a reset");
+    CloseHandle(event);
+    readback->Unmap(0, nullptr);
+    smallReadback->Unmap(0, nullptr);
+    std::printf("command lists: %zu checks\n", checks);
+    for (IUnknown* object : std::initializer_list<IUnknown*>{list, allocator, computeAllocator, queue, fence, upload, readback, smallUpload, smallReadback, texture, twin}) {
+        object->Release();
+    }
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS commandlist gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -2839,6 +3040,7 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "fence-gpu") == 0) return FenceGpu(HasFlag(argc, argv, "--validate"));
     if (argc == 2 && std::strcmp(argv[1], "arena-selftest") == 0) return ArenaSelfTest();
     if (argc >= 2 && std::strcmp(argv[1], "resources-gpu") == 0) return ResourcesGpu(HasFlag(argc, argv, "--validate"));
+    if (argc >= 2 && std::strcmp(argv[1], "commandlist-gpu") == 0) return CommandListGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
@@ -2848,6 +3050,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate]");
     return 2;
 }

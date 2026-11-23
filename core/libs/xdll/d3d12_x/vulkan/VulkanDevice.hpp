@@ -58,6 +58,7 @@ struct DeviceFunctions {
     PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
     PFN_vkCreateCommandPool createCommandPool = nullptr;
     PFN_vkDestroyCommandPool destroyCommandPool = nullptr;
+    PFN_vkResetCommandPool resetCommandPool = nullptr;
     PFN_vkAllocateCommandBuffers allocateCommandBuffers = nullptr;
     PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
     PFN_vkEndCommandBuffer endCommandBuffer = nullptr;

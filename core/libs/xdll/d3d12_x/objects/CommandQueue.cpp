@@ -1,9 +1,11 @@
 #include "CommandQueue.hpp"
 
 #include "AbxApi.hpp"
+#include "CommandList.hpp"
 #include "Fence.hpp"
 
 #include <cmath>
+#include <utility>
 #include <vector>
 
 namespace abx::d3d12x {
@@ -35,7 +37,7 @@ HRESULT CommandQueue::Create(const VulkanDevice& device, IUnknown* parent, const
 
 CommandQueue::~CommandQueue() {
     for (const Operation& operation : pending_) {
-        operation.fence->Release();
+        if (operation.fence != nullptr) operation.fence->Release();
     }
 }
 
@@ -53,10 +55,20 @@ void STDMETHODCALLTYPE CommandQueue::CopyTileMappings(ID3D12Resource*, const D3D
     AbxUnsupported("ID3D12CommandQueue::CopyTileMappings", "reserved resource tile mappings");
 }
 
-void STDMETHODCALLTYPE CommandQueue::ExecuteCommandLists(UINT count, ID3D12CommandList* const*) {
-    if (count != 0) {
-        AbxUnsupported("ID3D12CommandQueue::ExecuteCommandLists", "command lists are not implemented yet");
+void STDMETHODCALLTYPE CommandQueue::ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) {
+    const char* function = "ID3D12CommandQueue::ExecuteCommandLists";
+    if (count == 0) return;
+    if (lists == nullptr) AbxUnsupported(function, "command lists without a list array");
+    Operation operation;
+    operation.commands.reserve(count);
+    for (UINT index = 0; index < count; ++index) {
+        CommandList* list = dynamic_cast<CommandList*>(lists[index]);
+        if (list == nullptr) AbxUnsupported(function, "a command list that AnyBox did not create");
+        if (!list->Closed()) AbxUnsupported(function, "a command list that is still recording");
+        if (list->GetType() != desc_.Type) AbxUnsupported(function, "a command list whose type differs from the queue's");
+        operation.commands.push_back(list->Commands());
     }
+    Enqueue(std::move(operation));
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueue::Signal(ID3D12Fence* fence, UINT64 value) {
@@ -88,7 +100,7 @@ HRESULT STDMETHODCALLTYPE CommandQueue::GetClockCalibration(UINT64*, UINT64*) {
 HRESULT CommandQueue::Enqueue(Operation operation) {
     {
         std::lock_guard<std::mutex> guard(lock_);
-        pending_.push_back(operation);
+        pending_.push_back(std::move(operation));
     }
     Flush();
     return S_OK;
@@ -100,11 +112,24 @@ std::size_t CommandQueue::Pending() const {
 }
 
 bool CommandQueue::Submit(const Operation& operation) {
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    std::vector<VkCommandBufferSubmitInfo> buffers;
+    if (operation.fence == nullptr) {
+        buffers.reserve(operation.commands.size());
+        for (VkCommandBuffer commands : operation.commands) {
+            VkCommandBufferSubmitInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+            info.commandBuffer = commands;
+            buffers.push_back(info);
+        }
+        submit.commandBufferInfoCount = static_cast<std::uint32_t>(buffers.size());
+        submit.pCommandBufferInfos = buffers.data();
+        std::lock_guard<std::mutex> guard(device_.QueueLock());
+        return device_.Vk().queueSubmit2(device_.Queue(), 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS;
+    }
     VkSemaphoreSubmitInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     semaphore.semaphore = operation.fence->Semaphore();
     semaphore.value = operation.value;
     semaphore.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     if (operation.wait) {
         submit.waitSemaphoreInfoCount = 1;
         submit.pWaitSemaphoreInfos = &semaphore;
@@ -128,16 +153,21 @@ void CommandQueue::Flush() {
         do {
             again_ = false;
             while (!pending_.empty()) {
-                const Operation operation = pending_.front();
-                if (operation.wait && operation.fence->Promised() < operation.value && operation.fence->GetCompletedValue() < operation.value) {
-                    operation.fence->WatchFor(this);
-                    if (operation.fence->Promised() < operation.value) break;
+                const Operation& front = pending_.front();
+                if (front.wait && front.fence->Promised() < front.value && front.fence->GetCompletedValue() < front.value) {
+                    front.fence->WatchFor(this);
+                    if (front.fence->Promised() < front.value) break;
                     continue;
                 }
+                const Operation operation = std::move(pending_.front());
                 pending_.pop_front();
                 if (!Submit(operation)) {
-                    AbxUnsupported(operation.wait ? "ID3D12CommandQueue::Wait" : "ID3D12CommandQueue::Signal", "vkQueueSubmit2 failed");
+                    AbxUnsupported(operation.fence == nullptr ? "ID3D12CommandQueue::ExecuteCommandLists"
+                                   : operation.wait          ? "ID3D12CommandQueue::Wait"
+                                                             : "ID3D12CommandQueue::Signal",
+                                   "vkQueueSubmit2 failed");
                 }
+                if (operation.fence == nullptr) continue;
                 if (!operation.wait) promised.emplace_back(operation.fence, operation.value);
                 else operation.fence->Release();
             }
