@@ -93,6 +93,14 @@ std::string DescribeArguments(const void* first, const void* second, const void*
         if (!Readable(argument, kWords * sizeof(std::uint32_t))) continue;
         std::uint32_t words[kWords];
         std::memcpy(words, argument, sizeof(words));
+        const void* table = nullptr;
+        std::memcpy(&table, argument, sizeof(table));
+        {
+            const std::lock_guard guard(RegistryLock());
+            for (const FacadeType* type : Registry()) {
+                if (type->table.data() == table) text += " (console " + type->name + ")";
+            }
+        }
         text += " [";
         for (std::size_t index = 0; index < kWords; ++index) {
             std::snprintf(line, sizeof(line), index == 0 ? "%08x" : " %08x", words[index]);

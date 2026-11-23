@@ -6,6 +6,7 @@
 #include "PipelineObject.hpp"
 #include "Presenter.hpp"
 #include "Resource.hpp"
+#include "RootSignature.hpp"
 #include "CommandQueue.hpp"
 #include "DescriptorHeap.hpp"
 #include "Fence.hpp"
@@ -313,6 +314,55 @@ void STDMETHODCALLTYPE ListBarrier(Facade* self, UINT groupCount, const D3D12_BA
     if (!barriers.empty()) InnerOf<CommandList>(self)->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
 }
 
+void STDMETHODCALLTYPE ListSetPipelineState(Facade* self, void* pipeline) {
+    auto* inner = dynamic_cast<ID3D12PipelineState*>(FacadeInner(pipeline));
+    if (inner == nullptr) AbxUnsupported("D3D12 command list slot 25", "a pipeline argument that is not a pipeline state AnyBox handed out");
+    InnerOf<CommandList>(self)->SetPipelineState(inner);
+}
+
+template <auto Method, typename... Arguments>
+void STDMETHODCALLTYPE ListForward(Facade* self, Arguments... arguments) {
+    (InnerOf<CommandList>(self)->*Method)(arguments...);
+}
+
+void STDMETHODCALLTYPE ListSetComputeRootSignature(Facade* self, void* signature) {
+    auto* inner = dynamic_cast<RootSignature*>(FacadeInner(signature));
+    if (signature != nullptr && inner == nullptr) AbxUnsupported("D3D12 command list slot 33", "a root signature argument that is not a root signature AnyBox handed out");
+    InnerOf<CommandList>(self)->SetComputeRootSignature(inner);
+}
+
+void STDMETHODCALLTYPE ListSetGraphicsRootSignature(Facade* self, void* signature) {
+    auto* inner = dynamic_cast<RootSignature*>(FacadeInner(signature));
+    if (signature != nullptr && inner == nullptr) AbxUnsupported("D3D12 command list slot 34", "a root signature argument that is not a root signature AnyBox handed out");
+    InnerOf<CommandList>(self)->SetGraphicsRootSignature(inner);
+}
+
+void STDMETHODCALLTYPE ListSetPrimitiveTopology(Facade* self, D3D12_PRIMITIVE_TOPOLOGY topology) {
+    InnerOf<CommandList>(self)->IASetPrimitiveTopology(topology);
+}
+
+void STDMETHODCALLTYPE ListSetShadingRate(Facade*, D3D12_SHADING_RATE rate, const D3D12_SHADING_RATE_COMBINER* combiners) {
+    const bool fullRate = rate == D3D12_SHADING_RATE_1X1 &&
+                          (combiners == nullptr || (combiners[0] == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH && combiners[1] == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH));
+    static std::atomic<bool> reported{false};
+    if (!fullRate && !reported.exchange(true)) {
+        AbxLog("d3d12_x", "command list slot 126 (shading rate) asked for rate %u with combiners %u/%u; AnyBox shades every pixel at full rate", static_cast<unsigned>(rate),
+               combiners != nullptr ? static_cast<unsigned>(combiners[0]) : 0u, combiners != nullptr ? static_cast<unsigned>(combiners[1]) : 0u);
+    }
+}
+
+void STDMETHODCALLTYPE ListSetCoverageMask(Facade*, std::uint64_t mask) {
+    static std::atomic<bool> reported{false};
+    if (mask != ~0ull && !reported.exchange(true)) {
+        AbxLog("d3d12_x", "command list slot 142 set the dithered coverage mask 0x%llx (four 16-bit groups); AnyBox draws with full coverage, so faded geometry shows solid",
+               static_cast<unsigned long long>(mask));
+    }
+}
+
+void STDMETHODCALLTYPE ListSetDepthBounds(Facade*, FLOAT minimum, FLOAT maximum) {
+    AbxTrace("console command list slot 70: depth bounds %g..%g; no pipeline AnyBox builds enables the depth bounds test", static_cast<double>(minimum), static_cast<double>(maximum));
+}
+
 void STDMETHODCALLTYPE ListClearRenderTargetView(Facade* self, D3D12_CPU_DESCRIPTOR_HANDLE target, const FLOAT color[4], UINT rectCount, const D3D12_RECT* rects) {
     InnerOf<CommandList>(self)->ClearRenderTargetView(target, color, rectCount, rects);
 }
@@ -352,6 +402,25 @@ const std::atomic<UINT64>* FenceCompletedAddress(Facade* self) {
     mirror->value = fence->GetCompletedValue();
     g_mirrors.push_back(std::move(mirror));
     return &g_mirrors.back()->value;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceMap(Facade* self, UINT subresource, const D3D12_RANGE* range, void** data) {
+    Resource* resource = InnerOf<Resource>(self);
+    if (!resource->IsBuffer()) {
+        const D3D12_GPU_VIRTUAL_ADDRESS address = resource->GetGPUVirtualAddress();
+        if (address == 0 || subresource != 0) {
+            AbxUnsupported("D3D12 resource slot 8", "mapping a texture that has no title memory, or a subresource other than 0");
+        }
+        if (data != nullptr) *data = reinterpret_cast<void*>(address);
+        return S_OK;
+    }
+    return resource->Map(subresource, range, data);
+}
+
+void STDMETHODCALLTYPE ResourceUnmap(Facade* self, UINT subresource, const D3D12_RANGE* range) {
+    Resource* resource = InnerOf<Resource>(self);
+    if (!resource->IsBuffer()) return;
+    resource->Unmap(subresource, range);
 }
 
 D3D12_RESOURCE_DESC* ResourceGetDesc(Facade* self, D3D12_RESOURCE_DESC* desc) {
@@ -397,13 +466,42 @@ const FacadeType& TypeOf(Kind kind) {
     static const FacadeType list = [] {
         FacadeType type = MakeFacadeType("command list", {kCommandListInterface, __uuidof(ID3D12GraphicsCommandList)});
         Map(type, 9, &ListClose);
+        Map(type, 20, &ListSetPrimitiveTopology);
+        Map(type, 21, &ListForward<&CommandList::RSSetViewports, UINT, const D3D12_VIEWPORT*>);
+        Map(type, 22, &ListForward<&CommandList::RSSetScissorRects, UINT, const D3D12_RECT*>);
+        Map(type, 23, &ListForward<&CommandList::OMSetBlendFactor, const FLOAT*>);
+        Map(type, 24, &ListForward<&CommandList::OMSetStencilRef, UINT>);
+        Map(type, 25, &ListSetPipelineState);
         Map(type, 32, &ListSetDescriptorHeaps);
+        Map(type, 33, &ListSetComputeRootSignature);
+        Map(type, 34, &ListSetGraphicsRootSignature);
+        Map(type, 35, &ListForward<&CommandList::SetComputeRootDescriptorTable, UINT, D3D12_GPU_DESCRIPTOR_HANDLE>);
+        Map(type, 36, &ListForward<&CommandList::SetGraphicsRootDescriptorTable, UINT, D3D12_GPU_DESCRIPTOR_HANDLE>);
+        Map(type, 37, &ListForward<&CommandList::SetComputeRoot32BitConstant, UINT, UINT, UINT>);
+        Map(type, 38, &ListForward<&CommandList::SetGraphicsRoot32BitConstant, UINT, UINT, UINT>);
+        Map(type, 39, &ListForward<&CommandList::SetComputeRoot32BitConstants, UINT, UINT, const void*, UINT>);
+        Map(type, 40, &ListForward<&CommandList::SetGraphicsRoot32BitConstants, UINT, UINT, const void*, UINT>);
+        Map(type, 41, &ListForward<&CommandList::SetComputeRootConstantBufferView, UINT, D3D12_GPU_VIRTUAL_ADDRESS>);
+        Map(type, 42, &ListForward<&CommandList::SetGraphicsRootConstantBufferView, UINT, D3D12_GPU_VIRTUAL_ADDRESS>);
+        Map(type, 43, &ListForward<&CommandList::SetComputeRootShaderResourceView, UINT, D3D12_GPU_VIRTUAL_ADDRESS>);
+        Map(type, 44, &ListForward<&CommandList::SetGraphicsRootShaderResourceView, UINT, D3D12_GPU_VIRTUAL_ADDRESS>);
+        Map(type, 45, &ListForward<&CommandList::SetComputeRootUnorderedAccessView, UINT, D3D12_GPU_VIRTUAL_ADDRESS>);
+        Map(type, 46, &ListForward<&CommandList::SetGraphicsRootUnorderedAccessView, UINT, D3D12_GPU_VIRTUAL_ADDRESS>);
+        Map(type, 47, &ListForward<&CommandList::IASetIndexBuffer, const D3D12_INDEX_BUFFER_VIEW*>);
+        Map(type, 48, &ListForward<&CommandList::IASetVertexBuffers, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW*>);
+        Map(type, 49, &ListForward<&CommandList::SOSetTargets, UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*>);
+        Map(type, 50, &ListForward<&CommandList::OMSetRenderTargets, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*>);
+        Map(type, 51, &ListForward<&CommandList::ClearDepthStencilView, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*>);
         Map(type, 52, &ListClearRenderTargetView);
+        Map(type, 70, &ListSetDepthBounds);
         Map(type, 71, &ListWriteValue);
         Map(type, 72, &ListWriteTimestamp);
         Map(type, 74, &ListWriteLabel);
         Map(type, 139, &ListReset);
+        Map(type, 142, &ListSetCoverageMask);
         Map(type, 146, &ListBarrier);
+        Map(type, 126, &ListSetShadingRate);
+        Map(type, 75, &ListRecordedCommand<75>);
         Map(type, 131, &ListRecordedCommand<131>);
         Map(type, 132, &ListRecordedCommand<132>);
         return type;
@@ -421,6 +519,8 @@ const FacadeType& TypeOf(Kind kind) {
     }();
     static const FacadeType resource = [] {
         FacadeType type = MakeFacadeType("resource", {__uuidof(ID3D12Resource)});
+        Map(type, 8, &ResourceMap);
+        Map(type, 9, &ResourceUnmap);
         Map(type, 10, &ResourceGetDesc);
         Map(type, 11, &ResourceGetGpuVirtualAddress);
         return type;

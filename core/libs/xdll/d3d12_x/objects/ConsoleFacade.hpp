@@ -12,11 +12,13 @@
 namespace abx::d3d12x {
 
 constexpr std::size_t kFacadeSlots = 256;
+constexpr std::size_t kFacadeTitleFieldBytes = 0x100;
 
 struct FacadeType;
 
 struct Facade {
     const void* const* table;
+    std::array<unsigned char, kFacadeTitleFieldBytes> titleFields{};
     IUnknown* inner;
     const FacadeType* type;
     std::atomic<ULONG> references{1};

@@ -4,6 +4,7 @@
 #include "CopyLayout.hpp"
 #include "ResourceState.hpp"
 
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <optional>
@@ -152,7 +153,10 @@ void CommandList::SetConstants(RootArguments& arguments, UINT index, UINT count,
 void CommandList::SetRootView(RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address, const char* function) {
     const RootParameterLayout& parameter = Parameter(arguments, index, type, function);
     if (address != 0 && !context_.window.Contains(address, 1)) {
-        AbxUnsupported(function, "a root view address outside the title buffer window");
+        char reason[160];
+        std::snprintf(reason, sizeof(reason), "a root view address 0x%llx outside the title buffer window 0x%llx..0x%llx", static_cast<unsigned long long>(address),
+                      static_cast<unsigned long long>(context_.window.Start()), static_cast<unsigned long long>(context_.window.Start() + context_.window.Size()));
+        AbxUnsupported(function, reason);
     }
     arguments.words[parameter.firstWord] = static_cast<std::uint32_t>(address);
     arguments.words[parameter.firstWord + 1] = static_cast<std::uint32_t>(address >> 32);

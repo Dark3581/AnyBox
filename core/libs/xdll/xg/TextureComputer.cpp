@@ -64,9 +64,57 @@ HRESULT ComputerCopyIntoSubresource(TextureComputer* self, void* base, UINT plan
     return S_OK;
 }
 
+constexpr std::size_t kLayoutPlanes = 0x18;
+constexpr std::size_t kPlaneBytes = 0x6c8;
+constexpr std::size_t kPlaneSliceStride = 0x10;
+constexpr std::size_t kPlaneMips = 0x38;
+constexpr std::size_t kMipBytes = 0x70;
+constexpr std::size_t kMipEntries = 15;
+constexpr std::size_t kMipSize = 0x00;
+constexpr std::size_t kMipOffset = 0x08;
+constexpr std::size_t kMipRows = 0x10;
+constexpr std::size_t kMipRowPitch = 0x1c;
+
+template <typename Value>
+void Store(std::uint8_t* base, std::size_t offset, Value value) {
+    std::memcpy(base + offset, &value, sizeof(value));
+}
+
+HRESULT ComputerGetResourceLayout(TextureComputer* self, std::uint8_t* layout) {
+    if (layout == nullptr) return E_POINTER;
+    const auto& footprints = self->footprints;
+    if (self->mips > kMipEntries) {
+        AbxUnsupported("xg GetResourceLayout", "more than 15 mip levels");
+    }
+    std::memset(layout, 0, kLayoutPlanes + kPlaneBytes);
+    Store<std::uint64_t>(layout, 0x00, footprints.totalBytes);
+    Store<std::uint64_t>(layout, 0x08, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+    Store<std::uint32_t>(layout, 0x10, 1u);
+    Store<std::uint32_t>(layout, 0x14, self->mips);
+    std::uint8_t* plane = layout + kLayoutPlanes;
+    const std::uint64_t sliceStride = footprints.layouts.size() > self->mips ? footprints.layouts[self->mips].Offset : footprints.totalBytes;
+    Store<std::uint64_t>(plane, 0x00, footprints.totalBytes);
+    Store<std::uint64_t>(plane, kPlaneSliceStride, sliceStride);
+    for (std::uint32_t mip = 0; mip < self->mips; ++mip) {
+        std::uint8_t* entry = plane + kPlaneMips + mip * kMipBytes;
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints.layouts[mip];
+        const std::uint64_t rows = footprints.rows[mip];
+        Store<std::uint64_t>(entry, kMipSize, rows * footprint.Footprint.RowPitch * footprint.Footprint.Depth);
+        Store<std::uint64_t>(entry, kMipOffset, footprint.Offset);
+        Store<std::uint64_t>(entry, kMipRows, rows);
+        Store<std::uint32_t>(entry, kMipRowPitch, footprint.Footprint.RowPitch);
+    }
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("xg", "texture computer layouts fill the measured fields (slice stride, per-mip size, offset, rows and row pitch); the rest of the record is zero");
+    }
+    return S_OK;
+}
+
 std::array<const void*, kSlots> ComputerTable() {
     std::array<const void*, kSlots> table = UnmappedTable(std::make_index_sequence<kSlots>{});
     table[1] = reinterpret_cast<const void*>(&ComputerRelease);
+    table[2] = reinterpret_cast<const void*>(&ComputerGetResourceLayout);
     table[8] = reinterpret_cast<const void*>(&ComputerCopyIntoSubresource);
     return table;
 }
