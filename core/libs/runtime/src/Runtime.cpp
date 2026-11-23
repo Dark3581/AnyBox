@@ -1,4 +1,5 @@
 #include "AbxRuntime.hpp"
+#include "Settings.hpp"
 #include "TitleConfig.hpp"
 
 #include <windows.h>
@@ -12,8 +13,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -47,6 +52,10 @@ std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
 std::once_flag g_titleOnce;
 abx::TitleConfig g_title;
+std::once_flag g_settingsOnce;
+abx::Settings g_settings;
+std::mutex g_settingsMutex;
+std::set<std::string> g_settingsLogged;
 
 std::wstring ExecutableDirectory() {
     std::wstring path(MAX_PATH, L'\0');
@@ -555,6 +564,53 @@ ABX_RUNTIME_API void AbxUnsupportedAt [[noreturn]] (const char* library, const c
     if (BreakEnabled()) DebugBreak();
     TerminateProcess(GetCurrentProcess(), AbxExitUnsupported);
     std::abort();
+}
+
+namespace {
+
+std::wstring Widen(const std::string& text) {
+    const int length = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (length <= 0) return {};
+    std::wstring wide(static_cast<std::size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), length);
+    wide.resize(static_cast<std::size_t>(length - 1));
+    return wide;
+}
+
+void LoadSettings() {
+    const std::string configured = Environment("ANYBOX_CONFIG");
+    const std::filesystem::path path = configured.empty() ? std::filesystem::path(ExecutableDirectory() + L"\\anybox.cfg") : std::filesystem::path(Widen(configured));
+    std::vector<std::string> problems;
+    std::ifstream file(path, std::ios::binary);
+    if (file) {
+        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        abx::ParseSettings(text, path.filename().string(), g_settings, problems);
+        Emit(std::format("[anybox] read {} setting(s) from {}\n", g_settings.size(), path.string()));
+    } else if (!configured.empty()) {
+        problems.push_back("ANYBOX_CONFIG names a file that cannot be read: " + configured);
+    }
+    abx::ParseSettingOverrides(Environment("ANYBOX_SET"), g_settings, problems);
+    for (const std::string& problem : problems) Emit(std::format("[anybox] settings: {}\n", problem));
+}
+
+}
+
+ABX_RUNTIME_API const char* AbxSetting(const char* key) {
+    std::call_once(g_settingsOnce, LoadSettings);
+    if (key == nullptr) {
+        return nullptr;
+    }
+    const auto found = g_settings.find(key);
+    if (found == g_settings.end()) {
+        return nullptr;
+    }
+    {
+        std::lock_guard lock(g_settingsMutex);
+        if (g_settingsLogged.insert(found->first).second) {
+            Emit(std::format("[anybox] setting {} = {} (from {})\n", found->first, found->second.value, found->second.source));
+        }
+    }
+    return found->second.value.c_str();
 }
 
 ABX_RUNTIME_API const char* AbxTitleId() {

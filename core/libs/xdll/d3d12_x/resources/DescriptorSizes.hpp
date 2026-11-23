@@ -20,6 +20,8 @@ struct DescriptorSizes {
     std::optional<UINT> depthStencil;
 };
 
+bool ParseDescriptorSize(const char* key, const char* text, std::optional<UINT>& size, std::string& error);
+std::optional<DescriptorSizes> DescriptorSizesFromSettings(std::string& error);
 std::optional<UINT> DescriptorIncrement(const DescriptorSizes& sizes, D3D12_DESCRIPTOR_HEAP_TYPE type, std::string& error);
 std::optional<std::uint64_t> DescriptorHeapBytes(UINT count, UINT increment, std::string& error);
 

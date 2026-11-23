@@ -1,6 +1,44 @@
 #include "DescriptorSizes.hpp"
 
+#include "AbxApi.hpp"
+
+#include <cerrno>
+#include <cstdlib>
+
 namespace abx::d3d12x {
+
+bool ParseDescriptorSize(const char* key, const char* text, std::optional<UINT>& size, std::string& error) {
+    size.reset();
+    if (text == nullptr) {
+        return true;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long value = std::strtoull(text, &end, 0);
+    if (end == text || *end != '\0' || errno != 0 || value == 0 || value > 0xFFFFu || text[0] == '-') {
+        error = std::string("setting ") + key + " = " + text + " is not a descriptor size in bytes";
+        return false;
+    }
+    size = static_cast<UINT>(value);
+    return true;
+}
+
+std::optional<DescriptorSizes> DescriptorSizesFromSettings(std::string& error) {
+    DescriptorSizes sizes;
+    const struct {
+        const char* key;
+        std::optional<UINT>* size;
+    } fields[] = {{"d3d12_x.descriptor_size.shader_resource", &sizes.shaderResource},
+                  {"d3d12_x.descriptor_size.sampler", &sizes.sampler},
+                  {"d3d12_x.descriptor_size.render_target", &sizes.renderTarget},
+                  {"d3d12_x.descriptor_size.depth_stencil", &sizes.depthStencil}};
+    for (const auto& field : fields) {
+        if (!ParseDescriptorSize(field.key, AbxSetting(field.key), *field.size, error)) {
+            return std::nullopt;
+        }
+    }
+    return sizes;
+}
 
 std::optional<UINT> DescriptorIncrement(const DescriptorSizes& sizes, D3D12_DESCRIPTOR_HEAP_TYPE type, std::string& error) {
     const char* name = nullptr;

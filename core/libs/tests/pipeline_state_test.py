@@ -52,6 +52,33 @@ def stats(output):
     return {key: int(value) for key, value in (field.split("=") for field in line.split()[1:])}
 
 
+def check_settings(args, env):
+    config = args.work / "anybox.cfg"
+    config.write_text("# test values, not a console's\n"
+                      "d3d12_x.descriptor_size.shader_resource = 32\n"
+                      "d3d12_x.descriptor_size.sampler=0x10   # hexadecimal\n"
+                      "\n"
+                      "not a setting\n"
+                      "d3d12_x.descriptor_size.render_target = 64\n"
+                      "d3d12_x.descriptor_size.render_target = 128\n", encoding="utf-8")
+    settings_env = dict(env, ANYBOX_CONFIG=str(config), ANYBOX_SET="d3d12_x.descriptor_size.depth_stencil=48; other.key = x")
+    checked = subprocess.run([str(args.probe), "settings-selftest"], capture_output=True, text=True, env=settings_env, timeout=60)
+    assert checked.returncode == 0, (checked.stdout, checked.stderr)
+    assert "sizes 32 16 128 48" in checked.stdout and "other x missing null" in checked.stdout, checked.stdout
+    log = checked.stderr
+    assert "read 3 setting(s) from" in log, log
+    assert "anybox.cfg:5: ignored, not a lower-case key = value" in log, log
+    assert "anybox.cfg:7: d3d12_x.descriptor_size.render_target replaces the value from anybox.cfg:6" in log, log
+    assert "setting d3d12_x.descriptor_size.render_target = 128 (from anybox.cfg:7)" in log, log
+    assert "setting d3d12_x.descriptor_size.depth_stencil = 48 (from ANYBOX_SET)" in log, log
+    assert log.count("setting other.key") == 1, log
+    unset = subprocess.run([str(args.probe), "settings-selftest"], capture_output=True, text=True, env=dict(env, ANYBOX_CONFIG=str(args.work / "missing.cfg")), timeout=60)
+    assert "sizes unset unset unset unset" in unset.stdout and "cannot be read" in unset.stderr, (unset.stdout, unset.stderr)
+    broken = subprocess.run([str(args.probe), "settings-selftest"], capture_output=True, text=True, env=dict(settings_env, ANYBOX_SET="d3d12_x.descriptor_size.sampler=abc"), timeout=60)
+    assert "error\tsetting d3d12_x.descriptor_size.sampler = abc is not a descriptor size in bytes" in broken.stdout, broken.stdout
+    print("settings ok")
+
+
 def check_graphics(args, env):
     shaders = args.work / "test_shaders"
     run([args.probe, "dump-test-shaders", shaders], env)
@@ -171,6 +198,7 @@ def main():
     assert "PASS buffers selftest" in run([args.probe, "buffers-selftest"], env)
     assert "PASS root signature selftest" in run([args.probe, "rootsig-selftest"], env)
     assert "PASS arena selftest" in run([args.probe, "arena-selftest"], env)
+    check_settings(args, env)
     for command in ("states-gpu", "textures-gpu", "views-gpu", "commands-gpu", "draw-gpu", "indirect-gpu", "planes-gpu", "fence-gpu", "resources-gpu", "commandlist-gpu", "descriptors-gpu"):
         checked = subprocess.run([str(args.probe), command, "--validate"], capture_output=True, text=True, env=env, timeout=600)
         if checked.returncode == 4:

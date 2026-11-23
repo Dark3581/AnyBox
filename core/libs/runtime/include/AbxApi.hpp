@@ -24,6 +24,7 @@ ABX_RUNTIME_API bool AbxTraceEnabled(const char* library);
 ABX_RUNTIME_API const char* AbxTitleId();
 ABX_RUNTIME_API const char* AbxTitleName();
 ABX_RUNTIME_API const char* AbxTitleDeviceFamily();
+ABX_RUNTIME_API const char* AbxSetting(const char* key);
 
 #define AbxNotImplemented(name) AbxNotImplementedAt(ABX_LIBRARY_NAME, name, __FILE__, __LINE__)
 #define AbxUnsupported(name, message) AbxUnsupportedAt(ABX_LIBRARY_NAME, name, message, __FILE__, __LINE__)

@@ -57,6 +57,26 @@ To look at the title's state at the stop, run it under a debugger (x64dbg, WinDb
 | `ANYBOX_NO_REPORT=1` | write no run report |
 | `ANYBOX_BREAK=0` | do not break into an attached debugger at a stop |
 | `ANYBOX_WAIT_DEBUGGER=<seconds>` | wait for a debugger at start-up, then break before the title starts |
+| `ANYBOX_CONFIG=<path>` | read settings from that file instead of `anybox.cfg` beside the executable |
+| `ANYBOX_SET=<key>=<value>[;...]` | set or override settings for one run |
+
+## Settings for values found during bring-up
+
+Some values AnyBox needs depend on the console build a title was made for and are not known until someone finds them in that title; until then the feature that needs one stops with a message naming the missing value. Such values are settings, so trying one needs no rebuild. Put them in `anybox.cfg` beside the executable, one `key = value` per line, with a `#` comment saying where each came from:
+
+```
+# <title> <version>: GetDescriptorHandleIncrementSize result, seen at game.exe+0x1a2b30
+d3d12_x.descriptor_size.shader_resource = 32
+```
+
+Each value a library reads is logged with its source (`setting ... = 32 (from anybox.cfg:2)`), and malformed or repeated lines are logged too. `ANYBOX_SET` overrides the file for one run. A setting describes one title's build: report what you found in the title's bring-up thread, and a value only becomes a default in AnyBox once it is confirmed and its source recorded.
+
+| Key | Meaning |
+|---|---|
+| `d3d12_x.descriptor_size.shader_resource` | descriptor handle increment of CBV, SRV and UAV heaps, in bytes |
+| `d3d12_x.descriptor_size.sampler` | descriptor handle increment of sampler heaps |
+| `d3d12_x.descriptor_size.render_target` | descriptor handle increment of render target heaps |
+| `d3d12_x.descriptor_size.depth_stencil` | descriptor handle increment of depth-stencil heaps |
 
 ## Static analysis with Ghidra
 
