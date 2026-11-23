@@ -34,6 +34,11 @@ __declspec(dllexport) bool XPackageIsPackagedProcess() { return true; }
 __declspec(dllexport) HRESULT XGameRuntimeInitializeWithOptions(const void*) { return E_FAIL; }
 __declspec(dllexport) bool XGameRuntimeIsFeatureAvailable(std::uint32_t) { return false; }
 __declspec(dllexport) HRESULT XPackageGetCurrentProcessPackageIdentifier(std::size_t, char*) { return E_FAIL; }
+__declspec(dllexport) HRESULT XPersistentLocalStorageGetPath(std::size_t, char*, std::size_t*) { return E_FAIL; }
+__declspec(dllexport) HRESULT XPersistentLocalStorageGetPathSize(std::size_t*) { return E_FAIL; }
+__declspec(dllexport) HRESULT XPersistentLocalStorageGetSpaceInfo(void*) { return E_FAIL; }
+__declspec(dllexport) HRESULT XPersistentLocalStoragePromptUserForSpaceAsync(std::uint64_t, void*) { return E_FAIL; }
+__declspec(dllexport) HRESULT XPersistentLocalStoragePromptUserForSpaceResult(void*) { return E_FAIL; }
 __declspec(dllexport) HRESULT XThreadSetTimeSensitive(bool) { return E_FAIL; }
 __declspec(dllexport) bool XThreadIsTimeSensitive() { return true; }
 __declspec(dllexport) void XThreadAssertNotTimeSensitive() {}

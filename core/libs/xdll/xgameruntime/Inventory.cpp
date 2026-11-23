@@ -177,12 +177,7 @@ ABX_API HRESULT XPackageUninstallUWPInstance() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageUnregisterInstallationProgressChanged() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageUnregisterPackageInstalled() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageUpdateInstallationMonitor() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XPersistentLocalStorageGetPath() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XPersistentLocalStorageGetPathSize() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XPersistentLocalStorageGetSpaceInfo() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XPersistentLocalStorageMountForPackage() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XPersistentLocalStoragePromptUserForSpaceAsync() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XPersistentLocalStoragePromptUserForSpaceResult() { AbxNotImplemented(__func__); }
+ABX_API HRESULT XPersistentLocalStorageMountForPackage(const char*, XPackageMountHandle*) { AbxNotImplemented(__func__); }
 ABX_API HRESULT XSpeechSynthesizerCloseHandle() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XSpeechSynthesizerCloseStreamHandle() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XSpeechSynthesizerCreate() { AbxNotImplemented(__func__); }

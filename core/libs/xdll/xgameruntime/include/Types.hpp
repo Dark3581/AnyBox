@@ -114,6 +114,16 @@ enum class XGameRuntimeFeature : std::uint32_t {
 
 inline constexpr HRESULT E_GAMEPACKAGE_APP_NOT_PACKAGED = static_cast<HRESULT>(0x89245200u);
 
+struct XPackageMount;
+using XPackageMountHandle = XPackageMount*;
+
+struct XPersistentLocalStorageSpaceInfo {
+    std::uint64_t availableFreeBytes;
+    std::uint64_t totalFreeBytes;
+    std::uint64_t usedBytes;
+    std::uint64_t totalBytes;
+};
+
 struct XUser;
 using XUserHandle = XUser*;
 

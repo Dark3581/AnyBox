@@ -84,6 +84,12 @@ ABX_API HRESULT XThreadSetTimeSensitive(bool isTimeSensitiveThread);
 ABX_API bool XThreadIsTimeSensitive();
 ABX_API void XThreadAssertNotTimeSensitive();
 
+ABX_API HRESULT XPersistentLocalStorageGetPath(std::size_t pathSize, char* path, std::size_t* pathUsed);
+ABX_API HRESULT XPersistentLocalStorageGetPathSize(std::size_t* pathSize);
+ABX_API HRESULT XPersistentLocalStorageGetSpaceInfo(XPersistentLocalStorageSpaceInfo* info);
+ABX_API HRESULT XPersistentLocalStoragePromptUserForSpaceAsync(std::uint64_t requestedBytes, XAsyncBlock* asyncBlock);
+ABX_API HRESULT XPersistentLocalStoragePromptUserForSpaceResult(XAsyncBlock* asyncBlock);
+
 ABX_API HRESULT XUserAddAsync();
 ABX_API HRESULT XUserAddResult();
 ABX_API HRESULT XUserCloseHandle();
@@ -262,12 +268,7 @@ ABX_API HRESULT XPackageUninstallUWPInstance();
 ABX_API HRESULT XPackageUnregisterInstallationProgressChanged();
 ABX_API HRESULT XPackageUnregisterPackageInstalled();
 ABX_API HRESULT XPackageUpdateInstallationMonitor();
-ABX_API HRESULT XPersistentLocalStorageGetPath();
-ABX_API HRESULT XPersistentLocalStorageGetPathSize();
-ABX_API HRESULT XPersistentLocalStorageGetSpaceInfo();
-ABX_API HRESULT XPersistentLocalStorageMountForPackage();
-ABX_API HRESULT XPersistentLocalStoragePromptUserForSpaceAsync();
-ABX_API HRESULT XPersistentLocalStoragePromptUserForSpaceResult();
+ABX_API HRESULT XPersistentLocalStorageMountForPackage(const char* packageIdentifier, XPackageMountHandle* mountHandle);
 ABX_API HRESULT XSpeechSynthesizerCloseHandle();
 ABX_API HRESULT XSpeechSynthesizerCloseStreamHandle();
 ABX_API HRESULT XSpeechSynthesizerCreate();
