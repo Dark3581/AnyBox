@@ -1,11 +1,13 @@
 #pragma once
 
 #include "DescriptorHeap.hpp"
+#include "ImageDescriptor.hpp"
 #include "Resource.hpp"
 #include "ViewDesc.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -44,9 +46,17 @@ private:
     static void WriteWords(const Target& target, const void* words, std::size_t bytes);
     static void RequireImageWords(const Target& target, HeapEntry kind, const char* function);
     void WriteImageView(Resource* resource, const std::optional<ImageView>& view, bool unorderedAccess, const Target& target, const char* function, std::string& error);
+    ImageDescriptorWords BindImage(Resource* resource, const VkImageViewCreateInfo& info, VkImageView view, bool unorderedAccess, const char* function);
     VkSampler SamplerFor(const D3D12_SAMPLER_DESC& desc, std::string& error);
 
     ResourceContext context_;
+    struct BoundImage {
+        ImageDescriptorWords words{};
+    };
+    std::mutex imageLock_;
+    std::map<VkImageView, BoundImage> images_;
+    std::map<std::uint32_t, std::uint32_t> nextImageSlot_;
+    std::uint64_t nextImageBase_ = 1;
     mutable std::mutex samplerLock_;
     std::vector<std::pair<D3D12_SAMPLER_DESC, VkSampler>> samplers_;
 };

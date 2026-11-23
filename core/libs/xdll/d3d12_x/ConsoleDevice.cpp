@@ -1,15 +1,23 @@
 #include "xdll/d3d12_x/d3d12_x.hpp"
 
+#include "BindlessSet.hpp"
 #include "CommandAllocator.hpp"
 #include "CommandList.hpp"
 #include "CommandQueue.hpp"
+#include "CommandSignature.hpp"
 #include "CopyLayout.hpp"
 #include "ConsoleObjects.hpp"
 #include "DescriptorHeap.hpp"
 #include "DescriptorSizes.hpp"
 #include "DescriptorWriter.hpp"
 #include "Fence.hpp"
+#include "PipelineCompiler.hpp"
+#include "PipelineLibrary.hpp"
+#include "PipelineObject.hpp"
+#include "QueryHeap.hpp"
 #include "Resource.hpp"
+#include "ShaderStore.hpp"
+#include "RootSignature.hpp"
 #include "TextureDesc.hpp"
 #include "TitleBufferWindow.hpp"
 #include "VulkanDevice.hpp"
@@ -22,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -52,8 +61,12 @@ struct ConsoleDevice {
     std::unique_ptr<VulkanDevice> vulkan;
     std::unique_ptr<abx::d3d12x::TitleBufferWindow> window;
     std::unique_ptr<abx::d3d12x::BufferArena> arena;
+    std::unique_ptr<abx::d3d12x::BindlessSet> bindless;
     std::unique_ptr<abx::d3d12x::ResourceContext> resources;
     std::unique_ptr<abx::d3d12x::DescriptorWriter> descriptors;
+    std::unique_ptr<abx::d3d12x::PipelineCache> pipelineCache;
+    std::unique_ptr<abx::d3d12x::PipelineLibrary> pipelines;
+    std::unique_ptr<abx::d3d12x::PipelineContext> pipelineContext;
     abx::d3d12x::DescriptorSizes descriptorSizes;
     abx::d3d12x::TitleAllocator titleMemory;
     std::array<std::uint32_t, kCreationParameterWords> parameters{};
@@ -271,6 +284,80 @@ UINT STDMETHODCALLTYPE DeviceGetDescriptorHandleIncrementSize(ConsoleDevice* sel
     return 0;
 }
 
+HRESULT STDMETHODCALLTYPE DeviceCreateRootSignature(ConsoleDevice* self, UINT nodeMask, const void* blob, SIZE_T bytes, REFIID riid, void** signature) {
+    if (nodeMask > 1) {
+        AbxUnsupported("CreateRootSignature", "a node mask above 1");
+    }
+    std::string error;
+    IUnknown* inner = nullptr;
+    const HRESULT result =
+        abx::d3d12x::RootSignature::Create(AsParent(self), blob, bytes, __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&inner), error);
+    if (FAILED(result)) {
+        AbxUnsupported("CreateRootSignature", error.c_str());
+    }
+    return Deliver(Kind::RootSignature, inner, riid, signature);
+}
+
+HRESULT STDMETHODCALLTYPE DeviceCreateComputePipeline(ConsoleDevice* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* title, const void* second, const void* third,
+                                                      REFIID riid, void** state) {
+    if (title == nullptr || state == nullptr) return E_INVALIDARG;
+    if (second != nullptr || third != nullptr) {
+        AbxUnsupported("D3D12 device slot 62", "nonzero arguments after the pipeline description, which are not measured");
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = *title;
+    abx::d3d12x::RootSignature* signature = abx::d3d12x::console::Unwrap<abx::d3d12x::RootSignature>(desc.pRootSignature);
+    if (signature == nullptr) {
+        AbxUnsupported("D3D12 device slot 62", "a root signature that AnyBox did not hand out");
+    }
+    desc.pRootSignature = signature;
+    std::string error;
+    IUnknown* inner = nullptr;
+    HRESULT result = abx::d3d12x::PipelineStateObject::CreateCompute(*self->pipelineContext, AsParent(self), desc, __uuidof(ID3D12PipelineState),
+                                                                     reinterpret_cast<void**>(&inner), error);
+    if (FAILED(result)) {
+        if (error.find("is not in the shader store") == std::string::npos) {
+            AbxUnsupported("D3D12 device slot 62", error.c_str());
+        }
+        AbxLog("d3d12_x", "compute pipeline without a Vulkan pipeline (binding it stops): %s", error.c_str());
+        std::string reason = error;
+        result = abx::d3d12x::PipelineStateObject::CreateUnbuilt(AsParent(self), VK_PIPELINE_BIND_POINT_COMPUTE, signature, std::move(reason),
+                                                                 __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&inner), error);
+        if (FAILED(result)) {
+            AbxUnsupported("D3D12 device slot 62", error.c_str());
+        }
+    }
+    return Deliver(Kind::PipelineState, inner, riid, state);
+}
+
+HRESULT STDMETHODCALLTYPE DeviceCreateQueryHeap(ConsoleDevice* self, const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** heap) {
+    if (desc == nullptr) return E_INVALIDARG;
+    std::string error;
+    IUnknown* inner = nullptr;
+    const HRESULT result = abx::d3d12x::QueryHeap::Create(AsParent(self), *desc, __uuidof(ID3D12QueryHeap), reinterpret_cast<void**>(&inner), error);
+    if (FAILED(result)) {
+        AbxUnsupported("CreateQueryHeap", error.c_str());
+    }
+    AbxTrace("CreateQueryHeap(type %d, %u queries)", desc->Type, desc->Count);
+    return Deliver(Kind::QueryHeap, inner, riid, heap);
+}
+
+HRESULT STDMETHODCALLTYPE DeviceCreateCommandSignature(ConsoleDevice* self, const D3D12_COMMAND_SIGNATURE_DESC* desc, void* rootSignature, REFIID riid, void** signature) {
+    if (desc == nullptr) return E_INVALIDARG;
+    if (rootSignature != nullptr && abx::d3d12x::console::Unwrap<abx::d3d12x::RootSignature>(rootSignature) == nullptr) {
+        AbxUnsupported("CreateCommandSignature", "a root signature that AnyBox did not hand out");
+    }
+    std::string error;
+    IUnknown* inner = nullptr;
+    const HRESULT result = abx::d3d12x::CommandSignature::Create(AsParent(self), *desc, __uuidof(ID3D12CommandSignature), reinterpret_cast<void**>(&inner), error);
+    if (FAILED(result)) {
+        AbxUnsupported("CreateCommandSignature", error.c_str());
+    }
+    const auto* created = static_cast<abx::d3d12x::CommandSignature*>(inner);
+    AbxTrace("CreateCommandSignature(stride %u, %u arguments)%s%s", desc->ByteStride, desc->NumArgumentDescs, created->Signature() ? "" : ": executing it stops, ",
+             created->Unsupported().c_str());
+    return Deliver(Kind::CommandSignature, inner, riid, signature);
+}
+
 HRESULT STDMETHODCALLTYPE DeviceCreateFence(ConsoleDevice* self, UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void** fence) {
     std::string error;
     IUnknown* inner = nullptr;
@@ -287,16 +374,11 @@ std::string ResourceDescText(const D3D12_RESOURCE_DESC& desc) {
     return text;
 }
 
-D3D12_RESOURCE_ALLOCATION_INFO* DeviceGetResourceAllocationInfo(D3D12_RESOURCE_ALLOCATION_INFO* info, ConsoleDevice*, UINT visibleMask, UINT count,
-                                                                const D3D12_RESOURCE_DESC* descs) {
-    if (visibleMask > 1 || count == 0 || descs == nullptr) {
-        AbxUnsupported("GetResourceAllocationInfo", "a node mask above 1, no descriptions or a null description array");
-    }
-    constexpr UINT64 kAlignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+constexpr UINT64 kAlignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+
+UINT64 ConsoleAllocationBytes(const D3D12_RESOURCE_DESC& desc) {
     constexpr UINT kGpuWritten = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    UINT64 size = 0;
-    for (UINT index = 0; index < count; ++index) {
-        const D3D12_RESOURCE_DESC& desc = descs[index];
+    {
         UINT64 bytes = desc.Width;
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             if ((static_cast<UINT>(desc.Flags) & kGpuWritten) == 0) {
@@ -318,7 +400,18 @@ D3D12_RESOURCE_ALLOCATION_INFO* DeviceGetResourceAllocationInfo(D3D12_RESOURCE_A
                        ResourceDescText(desc).c_str(), static_cast<unsigned long long>(bytes));
             }
         }
-        size += (bytes + kAlignment - 1) / kAlignment * kAlignment;
+        return (bytes + kAlignment - 1) / kAlignment * kAlignment;
+    }
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* DeviceGetResourceAllocationInfo(D3D12_RESOURCE_ALLOCATION_INFO* info, ConsoleDevice*, UINT visibleMask, UINT count,
+                                                                const D3D12_RESOURCE_DESC* descs) {
+    if (visibleMask > 1 || count == 0 || descs == nullptr) {
+        AbxUnsupported("GetResourceAllocationInfo", "a node mask above 1, no descriptions or a null description array");
+    }
+    UINT64 size = 0;
+    for (UINT index = 0; index < count; ++index) {
+        size += ConsoleAllocationBytes(descs[index]);
     }
     info->SizeInBytes = size;
     info->Alignment = kAlignment;
@@ -340,6 +433,24 @@ std::optional<D3D12_RESOURCE_STATES> StateForLayout(std::uint32_t layout) {
     case 8: return D3D12_RESOURCE_STATE_COPY_DEST;
     default: return std::nullopt;
     }
+}
+
+HRESULT STDMETHODCALLTYPE DeviceCreateCommittedResourceWithState(ConsoleDevice* self, const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heapFlags,
+                                                                 const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial, const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                                                 void** resource) {
+    static_cast<void>(clear);
+    if (heap == nullptr || desc == nullptr || resource == nullptr) return E_INVALIDARG;
+    D3D12_RESOURCE_DESC applied = *desc;
+    applied.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<UINT>(applied.Flags) & kDesktopResourceFlags);
+    std::string error;
+    IUnknown* inner = nullptr;
+    const HRESULT result = abx::d3d12x::Resource::CreateCommitted(*self->resources, AsParent(self), *heap, heapFlags, applied, initial, __uuidof(ID3D12Resource),
+                                                                  reinterpret_cast<void**>(&inner), error);
+    AbxTrace("CreateCommittedResource (%s, heap type %d) -> 0x%08lx", ResourceDescText(*desc).c_str(), heap->Type, static_cast<unsigned long>(result));
+    if (FAILED(result)) {
+        AbxUnsupported("CreateCommittedResource", ("(" + ResourceDescText(*desc) + "): " + error).c_str());
+    }
+    return Deliver(Kind::Resource, inner, riid, resource);
 }
 
 HRESULT STDMETHODCALLTYPE DeviceCreateCommittedResource(ConsoleDevice* self, const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heapFlags, const D3D12_RESOURCE_DESC* desc,
@@ -367,6 +478,15 @@ HRESULT STDMETHODCALLTYPE DeviceCreateCommittedResource(ConsoleDevice* self, con
     AbxTrace("committed resource (%s, heap type %d, heap flags 0x%x) -> 0x%08lx", ResourceDescText(*desc).c_str(), heap->Type, heapFlags, static_cast<unsigned long>(result));
     if (FAILED(result)) {
         AbxUnsupported("D3D12 device slot 127", ("a committed resource AnyBox cannot create (" + ResourceDescText(*desc) + "): " + error).c_str());
+    }
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        const UINT64 bytes = ConsoleAllocationBytes(applied);
+        void* const memory = self->titleMemory.allocate(static_cast<std::size_t>(bytes), self->titleMemory.committedTextureAttributes);
+        if (memory == nullptr) {
+            AbxUnsupported("D3D12 device slot 127", "the title's allocator returned no memory for a committed texture");
+        }
+        static_cast<abx::d3d12x::Resource*>(inner)->AttachTitleMemory(memory, self->titleMemory.committedTextureAttributes);
+        AbxTrace("committed texture: %llu bytes taken from the title's allocator at %p (texels live in the Vulkan image)", static_cast<unsigned long long>(bytes), memory);
     }
     return Deliver(Kind::Resource, inner, riid, resource);
 }
@@ -396,6 +516,7 @@ std::array<const void*, kDeviceSlots> DeviceTable() {
     table[9] = reinterpret_cast<const void*>(&DeviceCreateCommandAllocator);
     table[14] = reinterpret_cast<const void*>(&DeviceCreateDescriptorHeap);
     table[15] = reinterpret_cast<const void*>(&DeviceGetDescriptorHandleIncrementSize);
+    table[16] = reinterpret_cast<const void*>(&DeviceCreateRootSignature);
     table[17] = reinterpret_cast<const void*>(&DeviceCreateConstantBufferView);
     table[18] = reinterpret_cast<const void*>(&DeviceCreateShaderResourceView);
     table[19] = reinterpret_cast<const void*>(&DeviceCreateUnorderedAccessView);
@@ -403,8 +524,12 @@ std::array<const void*, kDeviceSlots> DeviceTable() {
     table[21] = reinterpret_cast<const void*>(&DeviceCreateDepthStencilView);
     table[25] = reinterpret_cast<const void*>(&DeviceGetResourceAllocationInfo);
     table[26] = reinterpret_cast<const void*>(&DeviceGetCustomHeapProperties);
+    table[27] = reinterpret_cast<const void*>(&DeviceCreateCommittedResourceWithState);
     table[36] = reinterpret_cast<const void*>(&DeviceCreateFence);
+    table[39] = reinterpret_cast<const void*>(&DeviceCreateQueryHeap);
+    table[41] = reinterpret_cast<const void*>(&DeviceCreateCommandSignature);
     table[48] = reinterpret_cast<const void*>(&DeviceCreateConsoleQueue);
+    table[62] = reinterpret_cast<const void*>(&DeviceCreateComputePipeline);
     table[70] = reinterpret_cast<const void*>(&DeviceCreateShaderResourceViewAtAddress);
     table[73] = reinterpret_cast<const void*>(&DeviceCreateConsoleCommandList);
     table[78] = reinterpret_cast<const void*>(&DeviceSetFrameInterval);
@@ -432,6 +557,7 @@ std::uint64_t BufferWindowBytes() {
 
 constexpr std::uint64_t kDescriptorHeapAllocator = 0x80;
 constexpr std::uint64_t kDescriptorHeapObjectType = 4;
+constexpr std::uint64_t kPageSize64KiB = 2;
 
 abx::d3d12x::TitleAllocator TitleMemory() {
     abx::d3d12x::TitleAllocator allocator;
@@ -445,6 +571,7 @@ abx::d3d12x::TitleAllocator TitleMemory() {
         AbxUnsupported("D3D12XboxCreateDevice", "ab_xmem.dll does not export XMemAlloc and XMemFree");
     }
     allocator.descriptorHeapAttributes = (kDescriptorHeapAllocator << 16) | kDescriptorHeapObjectType;
+    allocator.committedTextureAttributes = (kDescriptorHeapAllocator << 16) | (kPageSize64KiB << 14);
     return allocator;
 }
 
@@ -500,9 +627,19 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
     }
     created->arena = std::make_unique<abx::d3d12x::BufferArena>(created->window->Start(), created->window->Size());
     created->titleMemory = TitleMemory();
+    created->bindless = abx::d3d12x::BindlessSet::Create(*created->vulkan, error);
+    if (!created->bindless) {
+        AbxUnsupported(__func__, ("the bindless descriptor set could not be created: " + error).c_str());
+    }
     created->resources =
-        std::make_unique<abx::d3d12x::ResourceContext>(abx::d3d12x::ResourceContext{*created->vulkan, *created->window, *created->arena, &created->titleMemory});
+        std::make_unique<abx::d3d12x::ResourceContext>(abx::d3d12x::ResourceContext{*created->vulkan, *created->window, *created->arena, &created->titleMemory, created->bindless.get()});
     created->descriptors = std::make_unique<abx::d3d12x::DescriptorWriter>(*created->resources);
+    const char* cacheFile = AbxSetting("d3d12_x.pipeline_cache");
+    created->pipelineCache = std::make_unique<abx::d3d12x::PipelineCache>(*created->vulkan, cacheFile != nullptr ? std::filesystem::path(cacheFile) : std::filesystem::path());
+    created->pipelines = std::make_unique<abx::d3d12x::PipelineLibrary>(*created->vulkan, created->pipelineCache->Handle(), 0);
+    created->pipelineContext =
+        std::make_unique<abx::d3d12x::PipelineContext>(abx::d3d12x::PipelineContext{abx::d3d12x::TitleShaderStore(), *created->pipelines});
+    AbxLog("d3d12_x", "D3D12XboxCreateDevice: pipeline cache %s (%zu bytes seeded)", created->pipelineCache->Note().c_str(), created->pipelineCache->SeedBytes());
     AbxLog("d3d12_x", "D3D12XboxCreateDevice: GPU buffer window %llu MiB at 0x%llx", static_cast<unsigned long long>(created->window->Size() >> 20),
            static_cast<unsigned long long>(created->window->Start()));
     g_device = created.release();

@@ -76,6 +76,22 @@ HRESULT PipelineStateObject::CreateCompute(const PipelineContext& context, IUnkn
     return Finish(new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_COMPUTE, entry.pipeline, entry.origin, signature), riid, state, error);
 }
 
+HRESULT PipelineStateObject::CreateUnbuilt(IUnknown* parent, VkPipelineBindPoint point, ID3D12RootSignature* signature, std::string reason, REFIID riid, void** state,
+                                           std::string& error) {
+    if (state == nullptr) {
+        error = "no output for the pipeline state";
+        return E_POINTER;
+    }
+    *state = nullptr;
+    RootSignature* ours = SignatureOf(signature, error);
+    if (ours == nullptr) {
+        return E_INVALIDARG;
+    }
+    PipelineStateObject* created = new PipelineStateObject(parent, point, VK_NULL_HANDLE, PipelineOrigin{}, ours);
+    created->unbuilt_ = std::move(reason);
+    return Finish(created, riid, state, error);
+}
+
 HRESULT PipelineStateObject::CreateGraphics(const PipelineContext& context, IUnknown* parent, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, REFIID riid, void** state,
                                             std::string& error) {
     if (state == nullptr) {

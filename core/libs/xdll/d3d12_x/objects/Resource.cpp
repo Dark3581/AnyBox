@@ -217,6 +217,12 @@ Resource::~Resource() {
     if (texture_.image != VK_NULL_HANDLE) vk.destroyImage(context_.device.Handle(), texture_.image, nullptr);
     if (memory_ != VK_NULL_HANDLE) vk.freeMemory(context_.device.Handle(), memory_, nullptr);
     if (allocated_) context_.arena.Free(offset_);
+    if (titleMemory_ != nullptr && context_.titleMemory != nullptr) context_.titleMemory->release(titleMemory_, titleMemoryAttributes_);
+}
+
+void Resource::AttachTitleMemory(void* memory, std::uint64_t attributes) {
+    titleMemory_ = memory;
+    titleMemoryAttributes_ = attributes;
 }
 
 namespace {

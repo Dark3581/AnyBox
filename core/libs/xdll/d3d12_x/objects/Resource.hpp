@@ -15,10 +15,13 @@
 
 namespace abx::d3d12x {
 
+class BindlessSet;
+
 struct TitleAllocator {
     void* (*allocate)(std::size_t size, std::uint64_t attributes) = nullptr;
     void (*release)(void* address, std::uint64_t attributes) = nullptr;
     std::uint64_t descriptorHeapAttributes = 0;
+    std::uint64_t committedTextureAttributes = 0;
 };
 
 struct ResourceContext {
@@ -26,6 +29,7 @@ struct ResourceContext {
     TitleBufferWindow& window;
     BufferArena& arena;
     const TitleAllocator* titleMemory = nullptr;
+    BindlessSet* bindless = nullptr;
 };
 
 constexpr std::uint64_t kBufferPlacementAlignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -56,6 +60,7 @@ public:
     BufferRef Buffer() const;
     std::uint64_t TitleAddress() const { return titleAddress_; }
     std::uint64_t Width() const { return desc_.Width; }
+    void AttachTitleMemory(void* memory, std::uint64_t attributes);
     const TextureRef& Texture() const { return texture_; }
     UINT Maps() const { return maps_; }
     VkImageView View(const VkImageViewCreateInfo& info, std::string& error);
@@ -78,6 +83,8 @@ private:
     D3D12_RESOURCE_DESC desc_;
     std::uint64_t offset_ = 0;
     std::uint64_t titleAddress_ = 0;
+    void* titleMemory_ = nullptr;
+    std::uint64_t titleMemoryAttributes_ = 0;
     bool allocated_ = false;
     TextureRef texture_;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;

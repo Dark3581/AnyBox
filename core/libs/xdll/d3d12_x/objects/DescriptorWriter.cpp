@@ -1,7 +1,9 @@
 #include "DescriptorWriter.hpp"
 
 #include "AbxApi.hpp"
+#include "BindlessSet.hpp"
 #include "BufferDescriptor.hpp"
+#include "ImageDescriptor.hpp"
 #include "ViewDesc.hpp"
 
 #include <algorithm>
@@ -30,6 +32,40 @@ Resource* Ours(ID3D12Resource* resource, const char* function) {
 void Check(bool ok, const char* function, const std::string& error) {
     if (!ok) {
         AbxUnsupported(function, error.c_str());
+    }
+}
+
+std::optional<std::uint32_t> ImageBinding(VkImageViewType type, ImageComponent component, bool storage) {
+    const std::uint32_t offset = component == ImageComponent::Uint ? 1u : component == ImageComponent::Sint ? 2u : 0u;
+    if (!storage) {
+        if (component != ImageComponent::Float) return std::nullopt;
+        switch (type) {
+        case VK_IMAGE_VIEW_TYPE_1D: return 5u;
+        case VK_IMAGE_VIEW_TYPE_2D: return 0u;
+        case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return 3u;
+        case VK_IMAGE_VIEW_TYPE_3D: return 6u;
+        default: return std::nullopt;
+        }
+    }
+    switch (type) {
+    case VK_IMAGE_VIEW_TYPE_2D: return 8u + offset;
+    case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return 11u + offset;
+    case VK_IMAGE_VIEW_TYPE_3D: return 14u + offset;
+    case VK_IMAGE_VIEW_TYPE_1D: return 17u + offset;
+    default: return std::nullopt;
+    }
+}
+
+std::optional<std::uint32_t> ImageType(VkImageViewType type) {
+    switch (type) {
+    case VK_IMAGE_VIEW_TYPE_1D: return kImageType1D;
+    case VK_IMAGE_VIEW_TYPE_2D: return kImageType2D;
+    case VK_IMAGE_VIEW_TYPE_3D: return kImageType3D;
+    case VK_IMAGE_VIEW_TYPE_CUBE: return kImageTypeCube;
+    case VK_IMAGE_VIEW_TYPE_1D_ARRAY: return kImageType1DArray;
+    case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return kImageType2DArray;
+    case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return kImageTypeCube;
+    default: return std::nullopt;
     }
 }
 
@@ -110,15 +146,76 @@ void DescriptorWriter::WriteImageView(Resource* resource, const std::optional<Im
             AbxUnsupported(function, ("the view needs the device feature " + feature + ", which this GPU or driver lacks").c_str());
         }
     }
-    RequireImageWords(target, HeapEntry::Image, function);
+    const bool encode = target.heap->ShaderVisible() && context_.bindless != nullptr;
+    if (!encode) RequireImageWords(target, HeapEntry::Image, function);
     DescriptorRecord record;
     record.kind = HeapEntry::Image;
     record.unorderedAccess = unorderedAccess;
     record.resource = resource;
     record.view = resource->View(view->info, error);
     Check(record.view != VK_NULL_HANDLE, function, error);
-    WriteWords(target, nullptr, 0);
+    if (encode) {
+        const ImageDescriptorWords words = BindImage(resource, view->info, record.view, unorderedAccess, function);
+        WriteWords(target, words.data(), sizeof(words));
+    } else {
+        WriteWords(target, nullptr, 0);
+    }
     target.heap->Record(target.index) = record;
+}
+
+ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkImageViewCreateInfo& info, VkImageView view, bool unorderedAccess, const char* function) {
+    const std::lock_guard guard(imageLock_);
+    const auto known = images_.find(view);
+    if (known != images_.end()) return known->second.words;
+    const VkImageCreateInfo& image = resource->Texture().layout.info;
+    if (image.samples != VK_SAMPLE_COUNT_1_BIT) {
+        AbxUnsupported(function, "a multisampled image in a shader-visible heap: how its sample count goes in the image descriptor is not settled");
+    }
+    const std::optional<ImageFormatInfo> format = ImageFormatOf(info.format);
+    if (!format) {
+        AbxUnsupported(function, ("Vulkan format " + std::to_string(static_cast<int>(info.format)) + " has no image descriptor format code AnyBox has sourced").c_str());
+    }
+    const std::optional<std::uint32_t> binding = ImageBinding(info.viewType, format->component, unorderedAccess);
+    const std::optional<std::uint32_t> type = ImageType(info.viewType);
+    if (!binding || !type) {
+        AbxUnsupported(function, ("an image view of type " + std::to_string(static_cast<int>(info.viewType)) + " with that component type has no bindless binding").c_str());
+    }
+    const VkImageSubresourceRange& range = info.subresourceRange;
+    const std::uint32_t levels = range.levelCount == VK_REMAINING_MIP_LEVELS ? image.mipLevels - range.baseMipLevel : range.levelCount;
+    const std::uint32_t layers = range.layerCount == VK_REMAINING_ARRAY_LAYERS ? image.arrayLayers - range.baseArrayLayer : range.layerCount;
+    ImageDescriptorFields fields;
+    fields.base = nextImageBase_++;
+    fields.format = format->code;
+    fields.width = image.extent.width;
+    fields.height = image.extent.height;
+    fields.depth = info.viewType == VK_IMAGE_VIEW_TYPE_3D ? image.extent.depth
+                   : (info.viewType == VK_IMAGE_VIEW_TYPE_2D || info.viewType == VK_IMAGE_VIEW_TYPE_1D) ? 1u
+                                                                                                         : range.baseArrayLayer + layers;
+    const VkComponentSwizzle swizzles[] = {info.components.r, info.components.g, info.components.b, info.components.a};
+    for (std::uint32_t component = 0; component < 4; ++component) {
+        const std::optional<std::uint32_t> select = ComponentSelect(swizzles[component], 4 + component);
+        if (!select) AbxUnsupported(function, "a component swizzle the image descriptor cannot express");
+        fields.select[component] = *select;
+    }
+    fields.baseLevel = range.baseMipLevel;
+    fields.lastLevel = range.baseMipLevel + levels - 1;
+    fields.type = *type;
+    fields.baseArray = range.baseArrayLayer;
+    fields.maxMip = image.mipLevels - 1;
+    const std::optional<ImageDescriptorWords> words = EncodeImageDescriptor(fields);
+    if (!words) AbxUnsupported(function, "an image whose size, mips or layers do not fit the image descriptor");
+    std::uint32_t& slot = nextImageSlot_.try_emplace(*binding, 1u).first->second;
+    std::string error;
+    Check(context_.bindless->WriteImage(*binding, slot, view, error), function, error);
+    std::uint32_t source[8];
+    std::copy(words->begin(), words->end(), source);
+    if (!context_.bindless->Table().Insert(ImageKey(source), slot)) {
+        AbxUnsupported(function, "the bindless descriptor table refused a new image key");
+    }
+    Check(context_.bindless->Upload(error), function, error);
+    ++slot;
+    images_.emplace(view, BoundImage{*words});
+    return *words;
 }
 
 void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {

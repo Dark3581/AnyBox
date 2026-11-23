@@ -58,6 +58,10 @@ const FacadeType& TypeOf(Kind kind) {
         return type;
     }();
     static const FacadeType resource = MakeFacadeType("resource", {__uuidof(ID3D12Resource)});
+    static const FacadeType signature = MakeFacadeType("root signature", {__uuidof(ID3D12RootSignature)});
+    static const FacadeType pipeline = MakeFacadeType("pipeline state", {__uuidof(ID3D12PipelineState)});
+    static const FacadeType queries = MakeFacadeType("query heap", {__uuidof(ID3D12QueryHeap)});
+    static const FacadeType indirect = MakeFacadeType("command signature", {__uuidof(ID3D12CommandSignature)});
     switch (kind) {
     case Kind::CommandQueue: return queue;
     case Kind::CommandAllocator: return allocator;
@@ -65,6 +69,10 @@ const FacadeType& TypeOf(Kind kind) {
     case Kind::Fence: return fence;
     case Kind::DescriptorHeap: return heap;
     case Kind::Resource: return resource;
+    case Kind::RootSignature: return signature;
+    case Kind::PipelineState: return pipeline;
+    case Kind::QueryHeap: return queries;
+    case Kind::CommandSignature: return indirect;
     }
     return resource;
 }

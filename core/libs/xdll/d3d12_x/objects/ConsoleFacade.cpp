@@ -2,6 +2,8 @@
 
 #include "AbxApi.hpp"
 
+#include <d3d12.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +40,10 @@ ULONG STDMETHODCALLTYPE FacadeRelease(Facade* self) {
         delete self;
     }
     return left;
+}
+
+HRESULT STDMETHODCALLTYPE FacadeSetName(Facade* self, const WCHAR* name) {
+    return static_cast<ID3D12Object*>(self->inner)->SetName(name);
 }
 
 template <std::size_t Slot>
@@ -109,6 +115,7 @@ FacadeType MakeFacadeType(std::string name, std::vector<GUID> interfaces) {
     type.table[0] = reinterpret_cast<const void*>(&FacadeQueryInterface);
     type.table[1] = reinterpret_cast<const void*>(&FacadeAddRef);
     type.table[2] = reinterpret_cast<const void*>(&FacadeRelease);
+    type.table[6] = reinterpret_cast<const void*>(&FacadeSetName);
     return type;
 }
 

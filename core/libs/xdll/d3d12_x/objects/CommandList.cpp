@@ -104,6 +104,9 @@ void CommandList::BindPipeline(ID3D12PipelineState* state, const char* function)
     if (ours == nullptr) {
         AbxUnsupported(function, "a pipeline state that AnyBox did not create");
     }
+    if (ours->Pipeline() == VK_NULL_HANDLE) {
+        AbxUnsupported(function, ("a pipeline state that has no Vulkan pipeline: " + ours->UnbuiltReason()).c_str());
+    }
     if (ours->BindPoint() == VK_PIPELINE_BIND_POINT_GRAPHICS && type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) {
         AbxUnsupported(function, "a graphics pipeline state on a compute or copy command list");
     }
