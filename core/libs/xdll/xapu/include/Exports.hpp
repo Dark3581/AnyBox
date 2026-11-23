@@ -4,8 +4,10 @@
 
 #include <windows.h>
 
-ABX_API HRESULT XApuConnect(void** connection, void** shared, const void* configuration);
+#include <cstdint>
+
+ABX_API HRESULT XApuConnect(const void* configuration, void** shared, void** connection);
 ABX_API HRESULT XApuDequeueResult();
 ABX_API HRESULT XApuDisconnect();
 ABX_API HRESULT XApuEnqueueCommand();
-ABX_API HRESULT XApuGetResultCount();
+ABX_API std::uint32_t XApuGetResultCount(void* connection);

@@ -48,6 +48,37 @@ RootSignature* PipelineStateObject::SignatureOf(ID3D12RootSignature* signature, 
 
 namespace {
 
+std::vector<std::uint8_t> CopyBytecode(const D3D12_SHADER_BYTECODE& code) {
+    if (code.pShaderBytecode == nullptr || code.BytecodeLength == 0) return {};
+    const auto* bytes = static_cast<const std::uint8_t*>(code.pShaderBytecode);
+    return std::vector<std::uint8_t>(bytes, bytes + code.BytecodeLength);
+}
+
+D3D12_SHADER_BYTECODE View(const std::vector<std::uint8_t>& bytes) {
+    return {bytes.empty() ? nullptr : bytes.data(), bytes.size()};
+}
+
+std::shared_ptr<const GraphicsDescription> Describe(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* mesh, const D3D12_SHADER_BYTECODE* amplification) {
+    auto described = std::make_shared<GraphicsDescription>();
+    described->desc = desc;
+    described->vertex = CopyBytecode(desc.VS);
+    described->pixel = CopyBytecode(desc.PS);
+    described->geometry = CopyBytecode(desc.GS);
+    if (mesh != nullptr) {
+        described->mesh = CopyBytecode(*mesh);
+        described->meshPipeline = true;
+    }
+    if (amplification != nullptr) described->amplification = CopyBytecode(*amplification);
+    for (UINT index = 0; index < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs != nullptr; ++index) {
+        described->inputs.push_back(desc.InputLayout.pInputElementDescs[index]);
+        described->semantics.emplace_back(desc.InputLayout.pInputElementDescs[index].SemanticName != nullptr ? desc.InputLayout.pInputElementDescs[index].SemanticName : "");
+    }
+    for (std::size_t index = 0; index < described->inputs.size(); ++index) described->inputs[index].SemanticName = described->semantics[index].c_str();
+    described->desc.CachedPSO = {};
+    described->desc.StreamOutput = {};
+    return described;
+}
+
 const char* StageName(VkShaderStageFlagBits stage) {
     switch (stage) {
     case VK_SHADER_STAGE_VERTEX_BIT: return "vs";
@@ -59,6 +90,17 @@ const char* StageName(VkShaderStageFlagBits stage) {
     }
 }
 
+}
+
+D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsDescription::Rebuilt() const {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC rebuilt = desc;
+    rebuilt.VS = View(vertex);
+    rebuilt.PS = View(pixel);
+    rebuilt.GS = View(geometry);
+    rebuilt.HS = {};
+    rebuilt.DS = {};
+    rebuilt.InputLayout = {inputs.empty() ? nullptr : inputs.data(), static_cast<UINT>(inputs.size())};
+    return rebuilt;
 }
 
 bool PipelineStateObject::HasStage(const char* stage) const {
@@ -126,6 +168,7 @@ HRESULT PipelineStateObject::CreateMesh(const PipelineContext& context, IUnknown
     for (const GraphicsShaderSource& shader : request->shaders) created->shaders_.push_back(StageName(shader.stage) + std::string(" ") + shader.key);
     created->usesCodeBase_ = entry.usesCodeBase;
     created->polygonMode_ = request->state.polygonMode;
+    created->description_ = Describe(desc, &mesh, amplification.pShaderBytecode != nullptr ? &amplification : nullptr);
     return Finish(created, riid, state, error);
 }
 
@@ -169,6 +212,7 @@ HRESULT PipelineStateObject::CreateGraphics(const PipelineContext& context, IUnk
     for (const GraphicsShaderSource& shader : request->shaders) created->shaders_.push_back(StageName(shader.stage) + std::string(" ") + shader.key);
     created->usesCodeBase_ = entry.usesCodeBase;
     created->polygonMode_ = request->state.polygonMode;
+    created->description_ = Describe(desc, nullptr, nullptr);
     return Finish(created, riid, state, error);
 }
 

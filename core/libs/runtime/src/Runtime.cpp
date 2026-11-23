@@ -1,4 +1,5 @@
 #include "CpuFixups.hpp"
+#include "Probe.hpp"
 #include "AbxRuntime.hpp"
 #include "LoaderRedirect.hpp"
 #include "Settings.hpp"
@@ -436,6 +437,17 @@ LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
             stop.message = "uncaught C++ exception thrown by an AnyBox library";
         }
         Emit(std::format("[anybox] crash 0x{:08x} at {}\n", stop.exceptionCode, FrameText(stop.exceptionAddress)));
+        if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+            Emit(std::format("[anybox]   {} of 0x{:x}\n", record->ExceptionInformation[0] == 0 ? "read" : record->ExceptionInformation[0] == 1 ? "write" : "execute",
+                             record->ExceptionInformation[1]));
+        }
+    }
+    if (pointers != nullptr && pointers->ContextRecord != nullptr) {
+        const CONTEXT& c = *pointers->ContextRecord;
+        Emit(std::format("[anybox]   rax {:016x} rbx {:016x} rcx {:016x} rdx {:016x} rsi {:016x} rdi {:016x} rbp {:016x} rsp {:016x}\n", c.Rax, c.Rbx, c.Rcx, c.Rdx,
+                         c.Rsi, c.Rdi, c.Rbp, c.Rsp));
+        Emit(std::format("[anybox]   r8 {:016x} r9 {:016x} r10 {:016x} r11 {:016x} r12 {:016x} r13 {:016x} r14 {:016x} r15 {:016x}\n", c.R8, c.R9, c.R10, c.R11, c.R12,
+                         c.R13, c.R14, c.R15));
     }
     if (pointers != nullptr && pointers->ContextRecord != nullptr) {
         stop.frames = frames;
@@ -473,6 +485,7 @@ void Start() {
     SetUnhandledExceptionFilter(UnhandledException);
     g_keepFilter = AddVectoredExceptionHandler(0, KeepFilter);
     abx::InstallCpuFixups();
+    abx::InstallProbes();
     abx::InstallLoaderRedirect();
     WaitForDebugger();
 }

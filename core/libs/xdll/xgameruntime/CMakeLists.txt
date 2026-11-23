@@ -1,1 +1,1 @@
-anybox_add_xdll(xgameruntime SOURCES Runtime.cpp TaskQueue.cpp Async.cpp GameSave.cpp TitleFolder.cpp PersistentLocalStorage.cpp System.cpp Package.cpp Display.cpp Thread.cpp Inventory.cpp ApiImpl.cpp)
+anybox_add_xdll(xgameruntime SOURCES Runtime.cpp TaskQueue.cpp Async.cpp GameSave.cpp TitleFolder.cpp PersistentLocalStorage.cpp System.cpp Package.cpp Display.cpp Thread.cpp User.cpp Inventory.cpp ApiImpl.cpp)

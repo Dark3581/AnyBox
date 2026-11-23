@@ -3,6 +3,7 @@
 #include "CopyLayout.hpp"
 #include "TextureDesc.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -111,11 +113,90 @@ HRESULT ComputerGetResourceLayout(TextureComputer* self, std::uint8_t* layout) {
     return S_OK;
 }
 
+constexpr std::uint64_t kTileBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+
+std::optional<std::pair<std::uint32_t, std::uint32_t>> StandardTileElements(std::uint32_t bytes) {
+    switch (bytes) {
+    case 1: return std::pair{256u, 256u};
+    case 2: return std::pair{256u, 128u};
+    case 4: return std::pair{128u, 128u};
+    case 8: return std::pair{128u, 64u};
+    case 16: return std::pair{64u, 64u};
+    default: return std::nullopt;
+    }
+}
+
+HRESULT ComputerGetResourceTiling(TextureComputer* self, UINT* totalTiles, D3D12_PACKED_MIP_INFO* packed, D3D12_TILE_SHAPE* shape, UINT* tilingCount, UINT first,
+                                  D3D12_SUBRESOURCE_TILING* tilings) {
+    const D3D12_RESOURCE_DESC& desc = self->desc;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        AbxUnsupported("xg texture computer slot 10", "tiling of a texture that is not two-dimensional");
+    }
+    const std::optional<abx::d3d12x::CopyBlock> block = abx::d3d12x::CopyBlockOf(desc.Format);
+    const auto elements = block ? StandardTileElements(block->bytes) : std::nullopt;
+    if (!elements) {
+        AbxUnsupported("xg texture computer slot 10", "tiling of a format without a standard 64 KiB tile shape");
+    }
+    const std::uint32_t tileWidth = elements->first * block->width;
+    const std::uint32_t tileHeight = elements->second * block->height;
+    const std::uint32_t layers = desc.DepthOrArraySize;
+    std::uint32_t standard = 0;
+    while (standard < self->mips && abx::d3d12x::MipExtent(desc.Width, standard) >= tileWidth && abx::d3d12x::MipExtent(desc.Height, standard) >= tileHeight) ++standard;
+    const auto& footprints = self->footprints;
+    std::uint64_t packedBytes = 0;
+    if (standard < self->mips) {
+        const std::uint64_t sliceEnd = footprints.layouts.size() > self->mips ? footprints.layouts[self->mips].Offset : footprints.totalBytes;
+        packedBytes = sliceEnd - footprints.layouts[standard].Offset;
+    }
+    const UINT packedTiles = static_cast<UINT>((packedBytes + kTileBytes - 1) / kTileBytes);
+    std::vector<D3D12_SUBRESOURCE_TILING> all;
+    UINT next = 0;
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t mip = 0; mip < self->mips; ++mip) {
+            D3D12_SUBRESOURCE_TILING tiling{};
+            if (mip < standard) {
+                tiling.WidthInTiles = (abx::d3d12x::MipExtent(desc.Width, mip) + tileWidth - 1) / tileWidth;
+                tiling.HeightInTiles = static_cast<UINT16>((abx::d3d12x::MipExtent(desc.Height, mip) + tileHeight - 1) / tileHeight);
+                tiling.DepthInTiles = 1;
+                tiling.StartTileIndexInOverallResource = next;
+                next += tiling.WidthInTiles * tiling.HeightInTiles;
+            } else {
+                tiling.StartTileIndexInOverallResource = D3D12_PACKED_TILE;
+            }
+            all.push_back(tiling);
+        }
+        next += packedTiles;
+    }
+    if (totalTiles != nullptr) *totalTiles = next;
+    if (packed != nullptr) {
+        packed->NumStandardMips = static_cast<UINT8>(standard);
+        packed->NumPackedMips = static_cast<UINT8>(self->mips - standard);
+        packed->NumTilesForPackedMips = packedTiles;
+        UINT start = 0;
+        for (std::uint32_t mip = 0; mip < standard; ++mip) start += all[mip].WidthInTiles * all[mip].HeightInTiles;
+        packed->StartTileIndexInOverallResource = start;
+    }
+    if (shape != nullptr) *shape = D3D12_TILE_SHAPE{tileWidth, tileHeight, 1};
+    if (tilingCount != nullptr) {
+        const UINT available = first < all.size() ? static_cast<UINT>(all.size()) - first : 0;
+        const UINT written = (std::min)(*tilingCount, available);
+        for (UINT index = 0; index < written && tilings != nullptr; ++index) tilings[index] = all[first + index];
+        *tilingCount = written;
+    }
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("xg", "texture computer slot 10 (resource tiling) answers with D3D12 standard 64 KiB tile shapes over AnyBox's linear layout; the console's swizzled tiling is not modeled (first: %llux%u, %u mips, %u standard, %u packed tiles)",
+               static_cast<unsigned long long>(desc.Width), desc.Height, self->mips, standard, packedTiles);
+    }
+    return S_OK;
+}
+
 std::array<const void*, kSlots> ComputerTable() {
     std::array<const void*, kSlots> table = UnmappedTable(std::make_index_sequence<kSlots>{});
     table[1] = reinterpret_cast<const void*>(&ComputerRelease);
     table[2] = reinterpret_cast<const void*>(&ComputerGetResourceLayout);
     table[8] = reinterpret_cast<const void*>(&ComputerCopyIntoSubresource);
+    table[10] = reinterpret_cast<const void*>(&ComputerGetResourceTiling);
     return table;
 }
 

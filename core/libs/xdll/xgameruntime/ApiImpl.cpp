@@ -84,6 +84,7 @@ HRESULT ThreadingQueueSubmitDelayedCallback(ApiObject*, XTaskQueueHandle queue, 
     return XTaskQueueSubmitDelayedCallback(queue, port, delay, context, callback);
 }
 void ThreadingAssertNotTimeSensitive(ApiObject*) { XThreadAssertNotTimeSensitive(); }
+bool ThreadingQueueGetProcessQueue(ApiObject*, XTaskQueueHandle* queue) { return XTaskQueueGetCurrentProcessTaskQueue(queue); }
 HRESULT ThreadingQueueTerminate(ApiObject*, XTaskQueueHandle queue, bool wait, void* context, XTaskQueueTerminatedCallback* callback) {
     return XTaskQueueTerminate(queue, wait, context, callback);
 }
@@ -121,7 +122,7 @@ const void* const kThreadingTable[] = {
     Entry(&ThreadingQueueTerminate),
     Entry(&Unmapped<23>),
     Entry(&Unmapped<24>),
-    Entry(&Unmapped<25>),
+    Entry(&ThreadingQueueGetProcessQueue),
     Entry(&Unmapped<26>),
     Entry(&Unmapped<27>),
     Entry(&Unmapped<28>),
@@ -188,28 +189,69 @@ HRESULT UserRegisterForChangeEvent(ApiObject*, XTaskQueueHandle queue, void* con
     return RegisterWithoutEvents(queue, context, callback, token);
 }
 
+HRESULT UserAddAsync(ApiObject*, std::uint32_t options, XAsyncBlock* async) {
+    return XUserAddAsync(options, async);
+}
+
+HRESULT UserAddResult(ApiObject*, XAsyncBlock* async, XUserHandle* user) {
+    return XUserAddResult(async, user);
+}
+
+void UserCloseHandle(ApiObject*, XUserHandle user) {
+    AbxUserCloseHandle(user);
+}
+
+HRESULT UserGetIsGuest(ApiObject*, XUserHandle user, bool* isGuest) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("xgameruntime", "user slot 13 writes one bool for the user (inferred to be XUserGetIsGuest from its shape and use as a flag); the offline user answers false");
+    }
+    return XUserGetIsGuest(user, isGuest);
+}
+
+HRESULT UserCheckPrivilege(ApiObject*, XUserHandle user, std::uint32_t options, std::uint32_t privilege, bool* hasPrivilege, std::uint32_t* reasons) {
+    return XUserCheckPrivilege(user, options, privilege, hasPrivilege, reasons);
+}
+
+HRESULT UserGetAgeGroup(ApiObject*, XUserHandle user, std::uint32_t* ageGroup) {
+    return XUserGetAgeGroup(user, ageGroup);
+}
+
+HRESULT UserDuplicateHandle(ApiObject*, XUserHandle user, XUserHandle* duplicated) {
+    return AbxUserDuplicateHandle(user, duplicated);
+}
+
+template <std::size_t Slot>
+HRESULT UserIdentifier(ApiObject*, XUserHandle user, std::uint64_t* value) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("xgameruntime", "user slot %zu returns a 64-bit identifier of the user; slots 9 and 11 both answer the offline user's id 1, since which is the XUID and which the local id is not measured", Slot);
+    }
+    return AbxUserGetIdentifier(user, value);
+}
+
 const void* const kUserTable[] = {
     Entry(&ObjectQueryInterface),
     Entry(&ObjectAddRef),
     Entry(&ObjectRelease),
-    Entry(&Unmapped<3>),
-    Entry(&Unmapped<4>),
+    Entry(&UserDuplicateHandle),
+    Entry(&UserCloseHandle),
     Entry(&Unmapped<5>),
     Entry(&Unmapped<6>),
-    Entry(&Unmapped<7>),
-    Entry(&Unmapped<8>),
-    Entry(&Unmapped<9>),
+    Entry(&UserAddAsync),
+    Entry(&UserAddResult),
+    Entry(&UserIdentifier<9>),
     Entry(&Unmapped<10>),
-    Entry(&Unmapped<11>),
+    Entry(&UserIdentifier<11>),
     Entry(&Unmapped<12>),
-    Entry(&Unmapped<13>),
+    Entry(&UserGetIsGuest),
     Entry(&Unmapped<14>),
     Entry(&Unmapped<15>),
     Entry(&Unmapped<16>),
     Entry(&Unmapped<17>),
     Entry(&Unmapped<18>),
-    Entry(&Unmapped<19>),
-    Entry(&Unmapped<20>),
+    Entry(&UserGetAgeGroup),
+    Entry(&UserCheckPrivilege),
     Entry(&Unmapped<21>),
     Entry(&Unmapped<22>),
     Entry(&Unmapped<23>),
@@ -334,6 +376,97 @@ const void* const kOptionalFeatureTable[] = {
 
 ApiObject g_optionalFeature{kOptionalFeatureTable, &kOptionalFeatureInterface, "provider 3e241977"};
 
+constexpr GUID kGameProvider{0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+constexpr GUID kGameInterface{0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
+
+HRESULT GameGetTitleId(ApiObject*, std::uint32_t* titleId) {
+    return XGameGetXboxTitleId(titleId);
+}
+
+const void* const kGameTable[] = {
+    Entry(&ObjectQueryInterface), Entry(&ObjectAddRef), Entry(&ObjectRelease), Entry(&GameGetTitleId), Entry(&Unmapped<4>),
+};
+
+ApiObject g_game{kGameTable, &kGameInterface, "game"};
+
+constexpr GUID kSystemProvider{0xe349bd1a, 0xfc20, 0x4e40, {0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f}};
+constexpr GUID kSystemInterface{0x1861cf2e, 0xe18b, 0x4834, {0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf}};
+
+HRESULT SystemGetSandboxId(ApiObject*, std::size_t size, char* sandbox, std::size_t* used) {
+    return XSystemGetXboxLiveSandboxId(size, sandbox, used);
+}
+
+const void* const kSystemTable[] = {
+    Entry(&ObjectQueryInterface), Entry(&ObjectAddRef), Entry(&ObjectRelease), Entry(&Unmapped<3>), Entry(&SystemGetSandboxId), Entry(&Unmapped<5>),
+};
+
+ApiObject g_system{kSystemTable, &kSystemInterface, "system"};
+
+constexpr GUID kGameSaveProvider{0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}};
+constexpr GUID kGameSaveInterface{0x1bfff3af, 0xf14a, 0x40a3, {0x8e, 0x35, 0x9a, 0xda, 0x90, 0x65, 0x93, 0xf9}};
+
+HRESULT GameSaveInitializeProviderAsync(ApiObject*, XUserHandle user, const char* configurationId, bool syncOnDemand, XAsyncBlock* async) {
+    return XGameSaveInitializeProviderAsync(user, configurationId, syncOnDemand, async);
+}
+
+HRESULT GameSaveInitializeProviderResult(ApiObject*, XAsyncBlock* async, XGameSaveProviderHandle* provider);
+void GameSaveCloseProvider(ApiObject*, XGameSaveProviderHandle provider);
+
+const void* const kGameSaveTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&Unmapped<3>),
+    Entry(&GameSaveInitializeProviderAsync),
+    Entry(&GameSaveInitializeProviderResult),
+    Entry(&GameSaveCloseProvider),
+    Entry(&Unmapped<7>),
+    Entry(&Unmapped<8>),
+    Entry(&Unmapped<9>),
+    Entry(&Unmapped<10>),
+    Entry(&Unmapped<11>),
+    Entry(&Unmapped<12>),
+    Entry(&Unmapped<13>),
+    Entry(&Unmapped<14>),
+    Entry(&Unmapped<15>),
+    Entry(&Unmapped<16>),
+    Entry(&Unmapped<17>),
+    Entry(&Unmapped<18>),
+    Entry(&Unmapped<19>),
+    Entry(&Unmapped<20>),
+    Entry(&Unmapped<21>),
+    Entry(&Unmapped<22>),
+    Entry(&Unmapped<23>),
+    Entry(&Unmapped<24>),
+    Entry(&Unmapped<25>),
+    Entry(&Unmapped<26>),
+    Entry(&Unmapped<27>),
+    Entry(&Unmapped<28>),
+    Entry(&Unmapped<29>),
+};
+
+ApiObject g_gameSave{kGameSaveTable, &kGameSaveInterface, "game save"};
+
+constexpr GUID kUserProfileInterface{0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}};
+
+HRESULT UserGetGamertag(ApiObject*, XUserHandle user, std::uint32_t component, std::size_t size, char* gamertag, std::size_t* used) {
+    return XUserGetGamertag(user, component, size, gamertag, used);
+}
+
+const void* const kUserProfileTable[] = {
+    Entry(&ObjectQueryInterface), Entry(&ObjectAddRef), Entry(&ObjectRelease), Entry(&UserGetGamertag),
+};
+
+ApiObject g_userProfile{kUserProfileTable, &kUserProfileInterface, "user gamertag"};
+
+HRESULT GameSaveInitializeProviderResult(ApiObject*, XAsyncBlock* async, XGameSaveProviderHandle* provider) {
+    return XGameSaveInitializeProviderResult(async, provider);
+}
+
+void GameSaveCloseProvider(ApiObject*, XGameSaveProviderHandle provider) {
+    XGameSaveCloseProvider(provider);
+}
+
 struct ApiInterface {
     const GUID& provider;
     const GUID& interfaceId;
@@ -348,6 +481,10 @@ const ApiInterface kInterfaces[] = {
     {kPersistentStorageProvider, kPersistentStorageInterface, g_persistentStorage},
     {kDisplayProvider, kDisplayInterface, g_display},
     {kOptionalFeatureProvider, kOptionalFeatureInterface, g_optionalFeature},
+    {kGameProvider, kGameInterface, g_game},
+    {kSystemProvider, kSystemInterface, g_system},
+    {kGameSaveProvider, kGameSaveInterface, g_gameSave},
+    {kUserInterface, kUserProfileInterface, g_userProfile},
 };
 
 }

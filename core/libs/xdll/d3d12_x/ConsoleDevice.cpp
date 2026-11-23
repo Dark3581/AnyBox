@@ -368,7 +368,9 @@ void STDMETHODCALLTYPE DeviceCreateShaderResourceViewAtAddress(ConsoleDevice* se
         std::string error;
         abx::d3d12x::Resource* texture = self->titleTextures->At(address, *resource, error);
         if (texture == nullptr) {
-            AbxUnsupported("D3D12 device slot 70", ("a texture view at title address 0x" + std::to_string(address) + ": " + error).c_str());
+            char text[48];
+            std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+            AbxUnsupported("D3D12 device slot 70", ("a texture view at title address " + std::string(text) + ": " + error).c_str());
         }
         self->descriptors->CreateShaderResourceView(texture, &desc, destination);
         return;
@@ -640,14 +642,39 @@ HRESULT STDMETHODCALLTYPE DeviceCreateConsolePipeline(ConsoleDevice* self, void*
     if (state == nullptr) return E_INVALIDARG;
     IUnknown* object = abx::d3d12x::FacadeInner(source);
     ID3D12RootSignature* signature = nullptr;
-    if (auto* pipeline = dynamic_cast<abx::d3d12x::PipelineStateObject*>(object)) signature = pipeline->Signature();
+    auto* base = dynamic_cast<abx::d3d12x::PipelineStateObject*>(object);
+    if (base != nullptr && base->Description() != nullptr && count == 1 && descs != nullptr) {
+        constexpr std::uint32_t kBlendOverride = 2;
+        std::uint32_t kind = 0;
+        std::memcpy(&kind, descs, sizeof(kind));
+        if (kind != kBlendOverride) {
+            AbxUnsupported("D3D12 device slot 55", ("a pipeline variant whose override kind is not the measured blend kind 2: " + HexWords(descs, 16)).c_str());
+        }
+        const abx::d3d12x::GraphicsDescription& described = *base->Description();
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = described.Rebuilt();
+        std::memcpy(&desc.BlendState, static_cast<const std::uint8_t*>(descs) + sizeof(kind), sizeof(desc.BlendState));
+        std::string error;
+        IUnknown* inner = nullptr;
+        const HRESULT result = described.meshPipeline
+                                   ? abx::d3d12x::PipelineStateObject::CreateMesh(*self->pipelineContext, AsParent(self), desc, described.Mesh(), described.Amplification(),
+                                                                                  __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&inner), error)
+                                   : abx::d3d12x::PipelineStateObject::CreateGraphics(*self->pipelineContext, AsParent(self), desc, __uuidof(ID3D12PipelineState),
+                                                                                      reinterpret_cast<void**>(&inner), error);
+        if (SUCCEEDED(result)) return Deliver(Kind::PipelineState, inner, riid, state);
+        AbxLog("d3d12_x", "device slot 55: the blend variant could not be built (%s); it stays unbuilt", error.c_str());
+    }
+    if (base != nullptr) signature = base->Signature();
     if (signature == nullptr) signature = dynamic_cast<abx::d3d12x::RootSignature*>(object);
     if (signature == nullptr) {
         AbxUnsupported("D3D12 device slot 55", "a first argument that is neither a pipeline state nor a root signature AnyBox handed out");
     }
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true)) {
-        AbxLog("d3d12_x", "device slot 55 pipelines (count %u) use a console description that is not decoded yet; first description: %s", count, HexWords(descs, 48).c_str());
+        const std::string why = base == nullptr ? "the source is not a pipeline state"
+                                : base->Description() == nullptr ? "the source pipeline has no kept description (" + (base->UnbuiltReason().empty() ? std::string("compute or native") : base->UnbuiltReason()) + ")"
+                                                                 : "count " + std::to_string(count);
+        AbxLog("d3d12_x", "device slot 55 pipelines stay unbuilt when they are not blend variants of a described pipeline; first case: %s; description: %s", why.c_str(),
+               HexWords(descs, 16).c_str());
     }
     std::string error;
     IUnknown* inner = nullptr;
@@ -658,6 +685,17 @@ HRESULT STDMETHODCALLTYPE DeviceCreateConsolePipeline(ConsoleDevice* self, void*
         AbxUnsupported("D3D12 device slot 55", error.c_str());
     }
     return Deliver(Kind::PipelineState, inner, riid, state);
+}
+
+HRESULT STDMETHODCALLTYPE DeviceQueryEventRecords(ConsoleDevice*, std::uint64_t token, std::uint32_t kinds, std::uint32_t* count, void* records) {
+    if (count == nullptr) return E_POINTER;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "device slot 81 (token 0x%llx, kinds 0x%x, room for %u records of 56 bytes at %p): AnyBox produces no such records and answers 0", static_cast<unsigned long long>(token),
+               kinds, *count, records);
+    }
+    *count = 0;
+    return S_OK;
 }
 
 template <VkPipelineBindPoint Point>
@@ -921,13 +959,14 @@ std::array<const void*, kDeviceSlots> DeviceTable() {
     table[61] = reinterpret_cast<const void*>(&DeviceCreateConsoleSampler);
     table[62] = reinterpret_cast<const void*>(&DeviceCreateComputePipeline);
     table[55] = reinterpret_cast<const void*>(&DeviceCreateConsolePipeline);
-    table[57] = reinterpret_cast<const void*>(&DeviceCreateNativePipeline<VK_PIPELINE_BIND_POINT_COMPUTE>);
+    table[57] = reinterpret_cast<const void*>(&DeviceCreateNativePipeline<VK_PIPELINE_BIND_POINT_GRAPHICS>);
     table[67] = reinterpret_cast<const void*>(&DeviceCreateNativePipeline<VK_PIPELINE_BIND_POINT_GRAPHICS>);
     table[70] = reinterpret_cast<const void*>(&DeviceCreateShaderResourceViewAtAddress);
     table[73] = reinterpret_cast<const void*>(&DeviceCreateConsoleCommandList);
     table[74] = reinterpret_cast<const void*>(&DeviceRegisterTitleMemory);
     table[78] = reinterpret_cast<const void*>(&DeviceSetFrameInterval);
     table[80] = reinterpret_cast<const void*>(&DeviceWaitFrameEvent);
+    table[81] = reinterpret_cast<const void*>(&DeviceQueryEventRecords);
     table[86] = reinterpret_cast<const void*>(&DeviceCreatePipelineStream);
     table[79] = reinterpret_cast<const void*>(&DeviceScheduleFrameEvent);
     table[108] = reinterpret_cast<const void*>(&DeviceGetResourceAllocationInfo1);
@@ -1037,6 +1076,7 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
     const float period = created->vulkan->Properties().limits.timestampPeriod;
     if (period > 0.0f) abx::d3d12x::console::SetTimestampFrequency(static_cast<UINT64>(1.0e9 / period));
     abx::d3d12x::console::SetVulkanDevice(created->vulkan.get());
+    abx::d3d12x::console::SetAddressSpace(created->addresses.get());
     AbxLog("d3d12_x", "D3D12XboxCreateDevice: Vulkan device %s (%s)", created->vulkan->Gpu().name.c_str(),
            abx::d3d12x::VersionText(created->vulkan->Properties().apiVersion).c_str());
     created->window = abx::d3d12x::TitleBufferWindow::Create(*created->vulkan, BufferWindowBytes(), error);

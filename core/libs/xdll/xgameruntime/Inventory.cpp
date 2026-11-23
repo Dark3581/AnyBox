@@ -1,10 +1,7 @@
 #include "xdll/xgameruntime/xgameruntime.hpp"
 
-ABX_API HRESULT XUserAddAsync() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XUserAddResult() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserCloseHandle() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserDuplicateHandle() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XUserGetGamertag() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetId() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetLocalId() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetState() { AbxNotImplemented(__func__); }
@@ -278,7 +275,6 @@ ABX_API HRESULT XSystemHandleTrack() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XSystemIsHandleValid() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserAddByIdWithUiAsync() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserAddByIdWithUiResult() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XUserCheckPrivilege() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserCloseSignOutDeferralHandle() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserCompare() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserFindControllerForUserWithUiAsync() { AbxNotImplemented(__func__); }
@@ -286,12 +282,10 @@ ABX_API HRESULT XUserFindControllerForUserWithUiResult() { AbxNotImplemented(__f
 ABX_API HRESULT XUserFindForDevice() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserFindUserById() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserFindUserByLocalId() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XUserGetAgeGroup() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetDefaultAudioEndpointUtf16() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetGamerPictureAsync() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetGamerPictureResult() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetGamerPictureResultSize() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XUserGetIsGuest() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetMaxUsers() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetSignOutDeferral() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XUserGetTokenAndSignatureAsync() { AbxNotImplemented(__func__); }

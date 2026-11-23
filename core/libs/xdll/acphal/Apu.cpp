@@ -68,8 +68,10 @@ ABX_API HRESULT AcpHalAllocateShapeContexts(std::uint8_t* request) {
 
 namespace {
 
+constexpr std::uint32_t kFirstHeap = 1;
 constexpr std::uint32_t kSecondHeap = 2;
 
+std::uint64_t g_firstUsed = 0;
 std::uint64_t g_secondUsed = 0;
 
 }
@@ -80,17 +82,29 @@ ABX_API HRESULT ApuAlloc(void** address, std::uint32_t* hardwareAddress, std::ui
     if (hardwareAddress != nullptr) {
         AbxUnsupported(__func__, "a request for the allocation's audio processor address (second argument)");
     }
-    if (heapSelector != kSecondHeap) {
-        AbxUnsupported(__func__, ("heap selector " + std::to_string(heapSelector) + "; only selector 2, the second ApuCreateHeap region, is measured").c_str());
+    if (heapSelector != kFirstHeap && heapSelector != kSecondHeap) {
+        AbxUnsupported(__func__, ("heap selector " + std::to_string(heapSelector) + "; only selectors 1 and 2 (the two ApuCreateHeap regions) are known").c_str());
     }
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) return E_INVALIDARG;
     ApuHeap& heap = Heap();
     const std::lock_guard guard(heap.lock);
     if (heap.base == nullptr) return E_FAIL;
-    const std::uint64_t start = (g_secondUsed + alignment - 1) / alignment * alignment;
-    if (start + bytes > heap.secondBytes) return E_OUTOFMEMORY;
-    g_secondUsed = start + bytes;
-    *address = heap.base + heap.firstBytes + start;
+    const bool first = heapSelector == kFirstHeap;
+    std::uint64_t& used = first ? g_firstUsed : g_secondUsed;
+    const std::uint64_t limit = first ? heap.firstBytes : heap.secondBytes;
+    const std::uint64_t start = (used + alignment - 1) / alignment * alignment;
+    if (start + bytes > limit) {
+        AbxLog("acphal", "ApuAlloc: %u bytes do not fit in audio heap %u (%llu of %llu bytes used)", bytes, heapSelector, static_cast<unsigned long long>(used),
+               static_cast<unsigned long long>(limit));
+        return E_OUTOFMEMORY;
+    }
+    used = start + bytes;
+    *address = heap.base + (first ? 0 : heap.firstBytes) + start;
+    static bool reported = false;
+    if (first && !reported) {
+        reported = true;
+        AbxLog("acphal", "ApuAlloc selector 1 is served from the first ApuCreateHeap region (inferred: selector 2 measured as the second region)");
+    }
     return S_OK;
 }
 

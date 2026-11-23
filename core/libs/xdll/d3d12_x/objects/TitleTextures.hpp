@@ -20,12 +20,15 @@ public:
     Resource* At(std::uint64_t address, const D3D12_RESOURCE_DESC& desc, std::string& error);
 
 private:
-    bool Upload(Resource& texture, std::uint64_t address, std::uint32_t mips, std::string& error);
+    enum class Filled { Yes, NotMapped, Failed };
+    Filled Upload(Resource& texture, std::uint64_t address, std::uint32_t mips, std::string& error);
+    bool MakeReadable(Resource& texture, std::string& error);
 
     ResourceContext context_;
     IUnknown* parent_;
     std::mutex lock_;
     std::map<std::pair<std::uint64_t, std::vector<std::uint8_t>>, Resource*> textures_;
+    std::map<Resource*, std::pair<std::uint64_t, std::uint32_t>> pending_;
 };
 
 }

@@ -5,6 +5,8 @@
 #include "RootSignature.hpp"
 #include "ShaderStore.hpp"
 
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,6 +15,18 @@ namespace abx::d3d12x {
 struct PipelineContext {
     const ShaderStore& store;
     PipelineLibrary& library;
+};
+
+struct GraphicsDescription {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    std::vector<D3D12_INPUT_ELEMENT_DESC> inputs;
+    std::vector<std::string> semantics;
+    std::vector<std::uint8_t> vertex, pixel, geometry, mesh, amplification;
+    bool meshPipeline = false;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC Rebuilt() const;
+    D3D12_SHADER_BYTECODE Mesh() const { return {mesh.empty() ? nullptr : mesh.data(), mesh.size()}; }
+    D3D12_SHADER_BYTECODE Amplification() const { return {amplification.empty() ? nullptr : amplification.data(), amplification.size()}; }
 };
 
 class PipelineStateObject final : public DeviceChildBase<ID3D12PipelineState> {
@@ -36,6 +50,7 @@ public:
     bool UsesCodeBase() const { return usesCodeBase_; }
     VkPolygonMode PolygonMode() const { return polygonMode_; }
     bool HasStage(const char* stage) const;
+    const GraphicsDescription* Description() const { return description_.get(); }
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -53,6 +68,7 @@ private:
     std::string unbuilt_;
     std::vector<std::string> shaders_;
     bool usesCodeBase_ = false;
+    std::shared_ptr<const GraphicsDescription> description_;
     VkPolygonMode polygonMode_ = VK_POLYGON_MODE_FILL;
 };
 

@@ -126,16 +126,35 @@ void CommandList::PushUserData(const RootArguments& arguments, std::uint32_t fir
     Check(Recorder(function).SetPushConstants(block.data(), static_cast<std::uint32_t>(block.size() * sizeof(std::uint32_t)), error), function, error);
 }
 
-void CommandList::PrepareDraw(const char* function) {
+bool CommandList::SkippedWork(const char* function) const {
+    enum Reason { Unbuilt, CodeBase, Mesh, Count };
+    static const char* const kReasons[Count] = {
+        "its pipeline has no Vulkan pipeline",
+        "its shaders read constants from their own code, and placing shader code in title memory is not implemented",
+        "it uses a mesh pipeline, whose mesh stage reads root words from s16 while the pixel stage reads them from s8, which one push constant block cannot serve yet",
+    };
+    static std::atomic<std::uint64_t> skipped[Count]{};
+    Reason reason = Count;
+    if (pipeline_->Pipeline() == VK_NULL_HANDLE) reason = Unbuilt;
+    else if (pipeline_->UsesCodeBase()) reason = CodeBase;
+    else if (pipeline_->HasStage("ms")) reason = Mesh;
+    if (reason == Count) return false;
+    const std::uint64_t total = ++skipped[reason];
+    bool power = total == 1;
+    for (std::uint64_t step = 10; step <= total && !power; step *= 10) power = total == step;
+    if (power) {
+        AbxLog("d3d12_x", "%s skipped (%llu so far for this reason): %s%s%s", function, static_cast<unsigned long long>(total), kReasons[reason],
+               reason == Unbuilt ? ": " : "", reason == Unbuilt ? pipeline_->UnbuiltReason().c_str() : "");
+    }
+    return true;
+}
+
+bool CommandList::PrepareDraw(const char* function) {
     if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_GRAPHICS) {
-        AbxUnsupported(function, "a draw without a graphics pipeline state");
+        AbxUnsupported(function, pipeline_ == nullptr ? "a draw with no pipeline state set on this command list since its last reset"
+                                                      : ("a draw while a compute pipeline state is set: " + std::string(pipeline_->Shaders().empty() ? pipeline_->UnbuiltReason() : pipeline_->Shaders().front())).c_str());
     }
-    if (pipeline_->UsesCodeBase()) {
-        AbxUnsupported(function, "a pipeline whose shaders read constants from their own code; placing shader code in title memory is not implemented");
-    }
-    if (pipeline_->HasStage("ms")) {
-        AbxUnsupported(function, "a mesh pipeline: the mesh stage reads root words from s16 and the pixel stage from s8, which one push constant block cannot serve yet");
-    }
+    if (SkippedWork(function)) return false;
     if (context_.device.RectangleFill()) {
         Recorder(function).SetPolygonMode(rectangles_ ? VK_POLYGON_MODE_FILL_RECTANGLE_NV : pipeline_->PolygonMode());
     } else if (rectangles_) {
@@ -143,7 +162,7 @@ void CommandList::PrepareDraw(const char* function) {
     }
     PushUserData(graphics_, kGraphicsFirstRootSgpr, function);
     BindTitleSet(VK_PIPELINE_BIND_POINT_GRAPHICS);
-    if (rendering_) return;
+    if (rendering_) return true;
     VkExtent2D extent{UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
     bool any = false;
@@ -162,6 +181,7 @@ void CommandList::PrepareDraw(const char* function) {
     std::string error;
     Check(Recorder(function).BeginRendering(renderTargets_, depthStencil_ ? &*depthStencil_ : nullptr, extent, layers, error), function, error);
     rendering_ = true;
+    return true;
 }
 
 void CommandList::OrderCopy(const char* function) {
@@ -196,13 +216,10 @@ void CommandList::BindPipeline(ID3D12PipelineState* state, const char* function)
     if (ours == nullptr) {
         AbxUnsupported(function, "a pipeline state that AnyBox did not create");
     }
-    if (ours->Pipeline() == VK_NULL_HANDLE) {
-        AbxUnsupported(function, ("a pipeline state that has no Vulkan pipeline: " + ours->UnbuiltReason()).c_str());
-    }
     if (ours->BindPoint() == VK_PIPELINE_BIND_POINT_GRAPHICS && type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) {
         AbxUnsupported(function, "a graphics pipeline state on a compute or copy command list");
     }
-    Recorder(function).BindPipeline(ours->BindPoint(), ours->Pipeline());
+    if (ours->Pipeline() != VK_NULL_HANDLE) Recorder(function).BindPipeline(ours->BindPoint(), ours->Pipeline());
     pipeline_ = ours;
 }
 
@@ -381,7 +398,7 @@ void CommandList::ReportRootState(const RootArguments& arguments, const char* fu
 
 void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance) {
     const char* function = "ID3D12GraphicsCommandList::DrawInstanced";
-    PrepareDraw(function);
+    if (!PrepareDraw(function)) return;
     Recorder(function).Draw(vertices, instances, firstVertex, firstInstance);
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true)) ReportRootState(graphics_, "first DrawInstanced");
@@ -389,7 +406,7 @@ void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT vertices, UINT instances,
 
 void STDMETHODCALLTYPE CommandList::DrawIndexedInstanced(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance) {
     const char* function = "ID3D12GraphicsCommandList::DrawIndexedInstanced";
-    PrepareDraw(function);
+    if (!PrepareDraw(function)) return;
     Recorder(function).DrawIndexed(indices, instances, firstIndex, baseVertex, firstInstance);
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true)) ReportRootState(graphics_, "first DrawIndexedInstanced");
@@ -401,9 +418,7 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z) {
     if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_COMPUTE) {
         AbxUnsupported(function, "a dispatch without a compute pipeline state");
     }
-    if (pipeline_->UsesCodeBase()) {
-        AbxUnsupported(function, "a compute shader that reads constants from its own code; placing shader code in title memory is not implemented");
-    }
+    if (SkippedWork(function)) return;
     PushUserData(compute_, kComputeFirstRootSgpr, function);
     BindTitleSet(VK_PIPELINE_BIND_POINT_COMPUTE);
     Recorder(function).Dispatch(x, y, z);

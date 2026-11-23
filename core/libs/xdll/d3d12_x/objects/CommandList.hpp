@@ -111,7 +111,8 @@ private:
     void SetSignature(RootArguments& arguments, ID3D12RootSignature* signature, const char* function);
     void ReportRootState(const RootArguments& arguments, const char* function) const;
     void EndPass();
-    void PrepareDraw(const char* function);
+    bool PrepareDraw(const char* function);
+    bool SkippedWork(const char* function) const;
     void PushUserData(const RootArguments& arguments, std::uint32_t firstSgpr, const char* function);
     void BindTitleSet(VkPipelineBindPoint point);
     const RootParameterLayout& Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const;

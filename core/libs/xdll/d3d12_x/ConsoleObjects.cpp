@@ -27,6 +27,9 @@
 namespace abx::d3d12x::console {
 namespace {
 
+const TitleAddressSpace* g_addresses = nullptr;
+
+
 std::atomic<UINT64> g_timestampFrequency{0};
 std::atomic<const VulkanDevice*> g_vulkan{nullptr};
 
@@ -75,6 +78,33 @@ void STDMETHODCALLTYPE ListRecordedCommand(Facade*, std::uint32_t first, std::ui
     } else {
         AbxTrace("console command list slot %zu (0x%x, 0x%x, 0x%x, 0x%llx): not applied", Slot, first, second, third, static_cast<unsigned long long>(fourth));
     }
+}
+
+struct GpuPageRecord {
+    std::uint64_t address;
+    std::uint32_t pages;
+    std::uint32_t unknown;
+};
+
+HRESULT STDMETHODCALLTYPE QueueUpdateGpuPages(Facade*, UINT count, const GpuPageRecord* records, const void* frames, UINT fifth, UINT sixth) {
+    constexpr UINT kMaxRecords = 4096;
+    if (count > kMaxRecords || (count != 0 && records == nullptr)) AbxUnsupported("D3D12 command queue slot 31", "more than 4096 records or a null record array");
+    static std::atomic<bool> reported{false};
+    if (count != 0 && !reported.exchange(true)) {
+        AbxLog("d3d12_x", "command queue slot 31 updates GPU page mappings (%u records, first 0x%llx x %u pages, 0x%x; %p, 0x%x, 0x%x); AnyBox's page table already follows the CPU mappings",
+               count, static_cast<unsigned long long>(records[0].address), records[0].pages, records[0].unknown, frames, fifth, sixth);
+    }
+    for (UINT index = 0; index < count && g_addresses != nullptr; ++index) {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(records[index].pages) * 0x10000;
+        if (bytes != 0 && !g_addresses->Contains(records[index].address, bytes)) {
+            static std::atomic<bool> missing{false};
+            if (!missing.exchange(true)) {
+                AbxLog("d3d12_x", "command queue slot 31: 0x%llx (%u pages) is not CPU-mapped GPU-visible memory, so shaders read zero there (later cases are not logged)",
+                       static_cast<unsigned long long>(records[index].address), records[index].pages);
+            }
+        }
+    }
+    return S_OK;
 }
 
 void STDMETHODCALLTYPE QueueExecuteCommandLists(Facade* self, UINT count, void* const* lists, std::uint64_t frameToken, std::uint32_t flags) {
@@ -419,6 +449,14 @@ void MirrorFences() {
     }
 }
 
+HRESULT STDMETHODCALLTYPE AllocatorReset(Facade* self) {
+    return InnerOf<CommandAllocator>(self)->Reset();
+}
+
+UINT64 STDMETHODCALLTYPE FenceGetCompletedValue(Facade* self) {
+    return InnerOf<Fence>(self)->GetCompletedValue();
+}
+
 const std::atomic<UINT64>* FenceCompletedAddress(Facade* self) {
     Fence* fence = InnerOf<Fence>(self);
     std::call_once(g_mirrorThread, [] {
@@ -487,12 +525,14 @@ const FacadeType& TypeOf(Kind kind) {
         FacadeType type = MakeFacadeType("command queue", {__uuidof(ID3D12CommandQueue)});
         Map(type, 16, &QueueSignal);
         Map(type, 18, &QueueGetTimestampFrequency);
+        Map(type, 31, &QueueUpdateGpuPages);
         Map(type, 32, &QueuePresent);
         Map(type, 35, &QueueExecuteCommandLists);
         return type;
     }();
     static const FacadeType allocator = [] {
         FacadeType type = MakeFacadeType("command allocator", {__uuidof(ID3D12CommandAllocator)});
+        Map(type, 8, &AllocatorReset);
         Map(type, 9, &AllocatorSetMemoryCallback);
         return type;
     }();
@@ -548,6 +588,7 @@ const FacadeType& TypeOf(Kind kind) {
     }();
     static const FacadeType fence = [] {
         FacadeType type = MakeFacadeType("fence", {__uuidof(ID3D12Fence)});
+        Map(type, 8, &FenceGetCompletedValue);
         Map(type, 12, &FenceCompletedAddress);
         return type;
     }();
@@ -586,6 +627,10 @@ const FacadeType& TypeOf(Kind kind) {
     return resource;
 }
 
+}
+
+void SetAddressSpace(const TitleAddressSpace* addresses) {
+    g_addresses = addresses;
 }
 
 void SetVulkanDevice(const VulkanDevice* device) {
