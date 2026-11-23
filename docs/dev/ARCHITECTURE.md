@@ -1,5 +1,17 @@
 # Architecture
 
+<p align="center">
+  <a href="../../README.md">Home</a> &nbsp;·&nbsp;
+  <a href="../user/USAGE.md">Usage</a> &nbsp;·&nbsp;
+  <a href="BUILD.md">Build</a> &nbsp;·&nbsp;
+  <b>Architecture</b> &nbsp;·&nbsp;
+  <a href="GAME_TESTING.md">Game testing</a> &nbsp;·&nbsp;
+  <a href="../../CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp;
+  <a href="CONVENTIONS.md">Conventions</a> &nbsp;·&nbsp;
+  <a href="TechnicalDebt.md">Technical debt</a> &nbsp;·&nbsp;
+  <a href="PROGRESS.md">Progress</a>
+</p>
+
 How a GDK executable becomes a Windows program. Nothing is emulated: the converted executable runs as a normal process and calls native implementations of the system libraries.
 
 ## Overview

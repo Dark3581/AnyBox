@@ -1,5 +1,17 @@
 # Project technical debt
 
+<p align="center">
+  <a href="../../README.md">Home</a> &nbsp;·&nbsp;
+  <a href="../user/USAGE.md">Usage</a> &nbsp;·&nbsp;
+  <a href="BUILD.md">Build</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="GAME_TESTING.md">Game testing</a> &nbsp;·&nbsp;
+  <a href="../../CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp;
+  <a href="CONVENTIONS.md">Conventions</a> &nbsp;·&nbsp;
+  <b>Technical debt</b> &nbsp;·&nbsp;
+  <a href="PROGRESS.md">Progress</a>
+</p>
+
 Known gaps: what differs from the console, what is unverified, and what stops a title. Entries about one library or component are in [debt](debt/), one file per library, under the same `###` sections as this page. An entry may end with `Closes when:` and the measurement, title or test that would close it, so contributors can search for the ones they can re-check.
 
 #### Fragments

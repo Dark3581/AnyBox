@@ -1,5 +1,17 @@
 # Progress tracking
 
+<p align="center">
+  <a href="../../README.md">Home</a> &nbsp;·&nbsp;
+  <a href="../user/USAGE.md">Usage</a> &nbsp;·&nbsp;
+  <a href="BUILD.md">Build</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="GAME_TESTING.md">Game testing</a> &nbsp;·&nbsp;
+  <a href="../../CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp;
+  <a href="CONVENTIONS.md">Conventions</a> &nbsp;·&nbsp;
+  <a href="TechnicalDebt.md">Technical debt</a> &nbsp;·&nbsp;
+  <b>Progress</b>
+</p>
+
 What is counted, where it is published, and how to read it.
 
 ## Library counts

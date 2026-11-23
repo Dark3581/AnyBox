@@ -1,5 +1,17 @@
 # Build
 
+<p align="center">
+  <a href="../../README.md">Home</a> &nbsp;·&nbsp;
+  <a href="../user/USAGE.md">Usage</a> &nbsp;·&nbsp;
+  <b>Build</b> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="GAME_TESTING.md">Game testing</a> &nbsp;·&nbsp;
+  <a href="../../CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp;
+  <a href="CONVENTIONS.md">Conventions</a> &nbsp;·&nbsp;
+  <a href="TechnicalDebt.md">Technical debt</a> &nbsp;·&nbsp;
+  <a href="PROGRESS.md">Progress</a>
+</p>
+
 ## Requirements
 
 - CMake 3.20 or newer and Ninja.

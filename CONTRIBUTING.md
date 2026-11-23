@@ -1,5 +1,17 @@
 # Contributing
 
+<p align="center">
+  <a href="README.md">Home</a> &nbsp;·&nbsp;
+  <a href="docs/user/USAGE.md">Usage</a> &nbsp;·&nbsp;
+  <a href="docs/dev/BUILD.md">Build</a> &nbsp;·&nbsp;
+  <a href="docs/dev/ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="docs/dev/GAME_TESTING.md">Game testing</a> &nbsp;·&nbsp;
+  <b>Contributing</b> &nbsp;·&nbsp;
+  <a href="docs/dev/CONVENTIONS.md">Conventions</a> &nbsp;·&nbsp;
+  <a href="docs/dev/TechnicalDebt.md">Technical debt</a> &nbsp;·&nbsp;
+  <a href="docs/dev/PROGRESS.md">Progress</a>
+</p>
+
 Thanks for helping. AnyBox grows one function at a time, and most contributions are small: implement one stub, forward one export, or add the stubs a new title needs. This page is everything you need to do that.
 
 ## Find something to do

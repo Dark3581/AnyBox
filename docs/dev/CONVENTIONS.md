@@ -1,5 +1,17 @@
 # Conventions
 
+<p align="center">
+  <a href="../../README.md">Home</a> &nbsp;·&nbsp;
+  <a href="../user/USAGE.md">Usage</a> &nbsp;·&nbsp;
+  <a href="BUILD.md">Build</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">Architecture</a> &nbsp;·&nbsp;
+  <a href="GAME_TESTING.md">Game testing</a> &nbsp;·&nbsp;
+  <a href="../../CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp;
+  <b>Conventions</b> &nbsp;·&nbsp;
+  <a href="TechnicalDebt.md">Technical debt</a> &nbsp;·&nbsp;
+  <a href="PROGRESS.md">Progress</a>
+</p>
+
 `python tools/check_conventions.py` checks the rules marked ✔. CI runs it on every pull request.
 
 ## Code
