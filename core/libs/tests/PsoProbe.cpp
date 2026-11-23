@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -2652,6 +2653,36 @@ int FenceGpu(bool validate) {
     expect(SUCCEEDED(fence->Signal(5)), "signalling the current value again");
     expect(SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)), "blocking wait on a reached value");
     CloseHandle(event);
+
+    ID3D12Fence* many = nullptr;
+    expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&many), error)), "create a fence for many waits");
+    if (status != 0) return status;
+    std::vector<HANDLE> events;
+    for (UINT64 value = 10; value < 60; ++value) {
+        events.push_back(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        expect(SUCCEEDED(many->SetEventOnCompletion(value, events.back())), "queue an event wait");
+    }
+    Fence* manyFence = dynamic_cast<Fence*>(many);
+    expect(manyFence->PendingEvents() == 50, "fifty event waits pending on one fence");
+    expect(SUCCEEDED(many->Signal(30)), "CPU signal to 30");
+    expect(WaitForMultipleObjects(21, events.data(), TRUE, 5000) == WAIT_OBJECT_0, "the waits up to 30 are signalled");
+    Sleep(50);
+    expect(WaitForSingleObject(events[21], 0) == WAIT_TIMEOUT && manyFence->PendingEvents() == 29, "the waits above 30 stay pending");
+    expect(SUCCEEDED(direct->Signal(many, 59)), "a GPU signal to 59");
+    std::size_t signalled = 0;
+    for (std::size_t index = 0; index < events.size(); index += 64) {
+        const DWORD batch = static_cast<DWORD>((std::min)(events.size() - index, std::size_t{64}));
+        if (WaitForMultipleObjects(batch, events.data() + index, TRUE, 5000) == WAIT_OBJECT_0) signalled += batch;
+    }
+    expect(signalled == events.size() && manyFence->PendingEvents() == 0, "a GPU signal releases the rest");
+    for (HANDLE handle : events) CloseHandle(handle);
+    HANDLE never = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    expect(SUCCEEDED(many->SetEventOnCompletion(1000, never)), "an event wait that is never reached");
+    const auto released = std::chrono::steady_clock::now();
+    many->Release();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - released).count();
+    expect(seconds < 2.0 && WaitForSingleObject(never, 0) == WAIT_TIMEOUT, "releasing a fence with a pending wait stops its waiter at once and signals nothing");
+    CloseHandle(never);
     std::printf("fences and queues: %zu checks\n", checks);
     direct->Release();
     compute->Release();
@@ -2975,6 +3006,12 @@ int CommandListGpu(bool validate) {
     const D3D12_TEXTURE_COPY_LOCATION toCorner = bufferLocation(readback, 0x30000);
     list->CopyTextureRegion(&toCorner, 1, 1, 0, &mip1, &corner);
     list->CopyBufferRegion(readback, 0x40000, upload, 0x10000, 4096);
+    list->CopyBufferRegion(readback, 0x50000, upload, 0x10000, 4096);
+    list->CopyBufferRegion(readback, 0x50000, upload, 0x11000, 2048);
+    CommandList* ordered = dynamic_cast<CommandList*>(list);
+    expect(ordered->CopyPending(), "a copy since the last barrier is tracked");
+    list->RSSetViewports(0, nullptr);
+    list->RSSetScissorRects(0, nullptr);
     expect(SUCCEEDED(list->Close()) && list->Close() == E_FAIL, "close once, refuse a second close");
     queue->ExecuteCommandLists(0, nullptr);
     ID3D12CommandList* lists[] = {list};
@@ -2990,6 +3027,9 @@ int CommandListGpu(bool validate) {
         bool bytes = true;
         for (std::uint32_t index = 0; index < 4096 && bytes; ++index) bytes = result[0x40000 + index] == source[0x10000 + index];
         expect(bytes && result[0x40000 + 4096] == 0xAB, "a buffer region copy");
+        bool second = true;
+        for (std::uint32_t index = 0; index < 4096 && second; ++index) second = result[0x50000 + index] == source[(index < 2048 ? 0x11000 : 0x10000) + index];
+        expect(second, "a second copy over the first lands after it");
     }
 
     std::fill(result, result + (1u << 20), std::uint8_t{0xAB});

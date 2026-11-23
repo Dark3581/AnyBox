@@ -67,9 +67,26 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
     commands_ = commands;
     closed_ = false;
     states_.clear();
+    copied_ = false;
     ResetBindings();
     if (initial != nullptr) BindPipeline(initial, "ID3D12GraphicsCommandList::Reset");
     return true;
+}
+
+void CommandList::OrderCopy(const char* function) {
+    Recorder(function);
+    if (copied_) {
+        VkMemoryBarrier2 order{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        order.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        order.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        order.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        order.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dependency.memoryBarrierCount = 1;
+        dependency.pMemoryBarriers = &order;
+        context_.device.Vk().cmdPipelineBarrier2(commands_, &dependency);
+    }
+    copied_ = true;
 }
 
 void CommandList::ResetBindings() {
@@ -243,6 +260,7 @@ void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* destination
         AbxUnsupported(function, "a copy between buffers with a texture");
     }
     std::string error;
+    OrderCopy(function);
     Check(Recorder(function).CopyBufferRegion(to->Buffer(), destinationOffset, from->Buffer(), sourceOffset, bytes, error), function, error);
 }
 
@@ -255,6 +273,7 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
     Resource* to = Ours(destination->pResource, function);
     Resource* from = Ours(source->pResource, function);
     std::string error;
+    OrderCopy(function);
     const bool toTexture = destination->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     const bool fromTexture = source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     if (toTexture != to->IsBuffer() && fromTexture != from->IsBuffer()) {
@@ -289,6 +308,7 @@ void STDMETHODCALLTYPE CommandList::CopyResource(ID3D12Resource* destination, ID
     Resource* to = Ours(destination, function);
     Resource* from = Ours(source, function);
     std::string error;
+    OrderCopy(function);
     if (to->IsBuffer() && from->IsBuffer()) {
         if (to->Buffer().size != from->Buffer().size) {
             AbxUnsupported(function, "buffers of different sizes");
@@ -330,6 +350,7 @@ void STDMETHODCALLTYPE CommandList::ResolveSubresource(ID3D12Resource* destinati
         AbxUnsupported(function, "a resolve format other than the textures' own");
     }
     std::string error;
+    OrderCopy(function);
     Check(Recorder(function).ResolveSubresource(to->Texture(), StateOf(to, destinationSubresource, D3D12_RESOURCE_STATE_RESOLVE_DEST), destinationSubresource, from->Texture(),
                                         StateOf(from, sourceSubresource, D3D12_RESOURCE_STATE_RESOLVE_SOURCE), sourceSubresource, error),
           function, error);
@@ -346,6 +367,10 @@ void STDMETHODCALLTYPE CommandList::RSSetViewports(UINT count, const D3D12_VIEWP
     if (count != 0 && viewports == nullptr) {
         AbxUnsupported(function, "viewports without a viewport array");
     }
+    if (count == 0) {
+        Recorder(function);
+        return;
+    }
     std::string error;
     const std::vector<D3D12_VIEWPORT> list = count != 0 ? std::vector<D3D12_VIEWPORT>(viewports, viewports + count) : std::vector<D3D12_VIEWPORT>{};
     Check(Recorder(function).SetViewports(list, error), function, error);
@@ -355,6 +380,10 @@ void STDMETHODCALLTYPE CommandList::RSSetScissorRects(UINT count, const D3D12_RE
     const char* function = "ID3D12GraphicsCommandList::RSSetScissorRects";
     if (count != 0 && rects == nullptr) {
         AbxUnsupported(function, "scissor rectangles without a rectangle array");
+    }
+    if (count == 0) {
+        Recorder(function);
+        return;
     }
     std::string error;
     const std::vector<D3D12_RECT> list = count != 0 ? std::vector<D3D12_RECT>(rects, rects + count) : std::vector<D3D12_RECT>{};
@@ -439,6 +468,7 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
     dependency.imageMemoryBarrierCount = static_cast<std::uint32_t>(images.size());
     dependency.pImageMemoryBarriers = images.empty() ? nullptr : images.data();
     context_.device.Vk().cmdPipelineBarrier2(commands_, &dependency);
+    copied_ = false;
 }
 
 void STDMETHODCALLTYPE CommandList::ExecuteBundle(ID3D12GraphicsCommandList*) { AbxUnsupported("ID3D12GraphicsCommandList::ExecuteBundle", "bundles"); }

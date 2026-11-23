@@ -84,6 +84,7 @@ public:
 
     VkCommandBuffer Commands() const { return commands_; }
     bool Closed() const { return closed_; }
+    bool CopyPending() const { return copied_; }
     DescriptorHeap* ShaderResourceHeap() const { return shaderResourceHeap_; }
     DescriptorHeap* SamplerHeap() const { return samplerHeap_; }
     const std::vector<AttachmentRef>& RenderTargets() const { return renderTargets_; }
@@ -105,6 +106,7 @@ private:
     BufferRef WindowRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 bytes, const char* function) const;
     const DescriptorRecord& Attachment(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_DESCRIPTOR_HEAP_TYPE type, const char* function) const;
     void ResetBindings();
+    void OrderCopy(const char* function);
     void BindPipeline(ID3D12PipelineState* state, const char* function);
     void SetSignature(RootArguments& arguments, ID3D12RootSignature* signature, const char* function);
     const RootParameterLayout& Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const;
@@ -116,6 +118,7 @@ private:
     D3D12_COMMAND_LIST_TYPE type_;
     VkCommandBuffer commands_ = VK_NULL_HANDLE;
     bool closed_ = true;
+    bool copied_ = false;
     std::map<std::pair<const Resource*, UINT>, D3D12_RESOURCE_STATES> states_;
     DescriptorHeap* shaderResourceHeap_ = nullptr;
     DescriptorHeap* samplerHeap_ = nullptr;

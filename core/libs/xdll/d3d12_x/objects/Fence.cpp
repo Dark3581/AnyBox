@@ -4,6 +4,7 @@
 #include "CommandQueue.hpp"
 
 #include <thread>
+#include <utility>
 
 namespace abx::d3d12x {
 
@@ -36,7 +37,77 @@ HRESULT Fence::Create(const VulkanDevice& device, IUnknown* parent, UINT64 initi
 }
 
 Fence::~Fence() {
+    {
+        std::lock_guard<std::mutex> guard(waitLock_);
+        stopping_ = true;
+        if (wake_ != VK_NULL_HANDLE) WakeLocked();
+    }
+    if (waiter_.joinable()) waiter_.join();
+    for (const auto& [value, event] : events_) CloseHandle(event);
+    if (wake_ != VK_NULL_HANDLE) device_.Vk().destroySemaphore(device_.Handle(), wake_, nullptr);
     if (semaphore_ != VK_NULL_HANDLE) device_.Vk().destroySemaphore(device_.Handle(), semaphore_, nullptr);
+}
+
+std::size_t Fence::PendingEvents() const {
+    std::lock_guard<std::mutex> guard(waitLock_);
+    return events_.size();
+}
+
+bool Fence::StartWaiter() {
+    if (waiter_.joinable()) {
+        return true;
+    }
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    if (wake_ == VK_NULL_HANDLE && device_.Vk().createSemaphore(device_.Handle(), &info, nullptr, &wake_) != VK_SUCCESS) {
+        wake_ = VK_NULL_HANDLE;
+        return false;
+    }
+    waiter_ = std::thread([this] { RunWaiter(); });
+    return true;
+}
+
+void Fence::WakeLocked() {
+    VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+    signal.semaphore = wake_;
+    signal.value = ++wakeValue_;
+    device_.Vk().signalSemaphore(device_.Handle(), &signal);
+}
+
+void Fence::RunWaiter() {
+    for (;;) {
+        UINT64 target = 0;
+        UINT64 wakeTarget = 0;
+        {
+            std::lock_guard<std::mutex> guard(waitLock_);
+            if (stopping_) return;
+            const UINT64 completed = GetCompletedValue();
+            while (!events_.empty() && events_.begin()->first <= completed) {
+                SetEvent(events_.begin()->second);
+                CloseHandle(events_.begin()->second);
+                events_.erase(events_.begin());
+            }
+            target = events_.empty() ? 0 : events_.begin()->first;
+            wakeTarget = wakeValue_ + 1;
+        }
+        const VkSemaphore semaphores[2] = {wake_, semaphore_};
+        const UINT64 values[2] = {wakeTarget, target};
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
+        wait.semaphoreCount = target != 0 ? 2 : 1;
+        wait.pSemaphores = semaphores;
+        wait.pValues = values;
+        if (device_.Vk().waitSemaphores(device_.Handle(), &wait, UINT64_MAX) != VK_SUCCESS) {
+            std::lock_guard<std::mutex> guard(waitLock_);
+            for (const auto& [value, event] : events_) {
+                SetEvent(event);
+                CloseHandle(event);
+            }
+            events_.clear();
+            return;
+        }
+    }
 }
 
 bool Fence::Implements(REFIID riid) const {
@@ -67,16 +138,13 @@ HRESULT STDMETHODCALLTYPE Fence::SetEventOnCompletion(UINT64 value, HANDLE event
     if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &copy, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
         return E_INVALIDARG;
     }
-    AddRef();
-    std::thread([this, value, copy] {
-        VkSemaphoreWaitInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        info.semaphoreCount = 1;
-        info.pSemaphores = &semaphore_;
-        info.pValues = &value;
-        if (device_.Vk().waitSemaphores(device_.Handle(), &info, UINT64_MAX) == VK_SUCCESS) SetEvent(copy);
+    std::lock_guard<std::mutex> guard(waitLock_);
+    if (!StartWaiter()) {
         CloseHandle(copy);
-        Release();
-    }).detach();
+        return E_OUTOFMEMORY;
+    }
+    events_.emplace(value, copy);
+    WakeLocked();
     return S_OK;
 }
 

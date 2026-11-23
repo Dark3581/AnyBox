@@ -3,9 +3,12 @@
 #include "ObjectBase.hpp"
 #include "VulkanDevice.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace abx::d3d12x {
@@ -25,6 +28,7 @@ public:
     UINT64 Promised() const;
     void Promise(UINT64 value);
     void WatchFor(CommandQueue* queue);
+    std::size_t PendingEvents() const;
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -32,6 +36,9 @@ protected:
 private:
     Fence(const VulkanDevice& device, IUnknown* parent, D3D12_FENCE_FLAGS flags) : DeviceChildBase(parent), device_(device), flags_(flags) {}
     ~Fence() override;
+    bool StartWaiter();
+    void WakeLocked();
+    void RunWaiter();
 
     const VulkanDevice& device_;
     D3D12_FENCE_FLAGS flags_;
@@ -39,6 +46,12 @@ private:
     mutable std::mutex lock_;
     UINT64 promised_ = 0;
     std::vector<CommandQueue*> watchers_;
+    mutable std::mutex waitLock_;
+    std::multimap<UINT64, HANDLE> events_;
+    std::thread waiter_;
+    VkSemaphore wake_ = VK_NULL_HANDLE;
+    UINT64 wakeValue_ = 0;
+    bool stopping_ = false;
 };
 
 }
