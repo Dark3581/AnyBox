@@ -1584,6 +1584,74 @@ int ApiImpl() {
     return Fail("QueryApiImpl returned");
 }
 
+void* g_api = nullptr;
+
+void* ApiSlot(int slot) {
+    return (*static_cast<void* const* const*>(g_api))[slot];
+}
+
+int OpenThreadingApi() {
+    const HMODULE runtime = LoadLibraryExW(L"xgameruntime.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (runtime == nullptr) return Fail("dynamic load of xgameruntime.dll");
+    using Initialize = HRESULT (*)(std::uint64_t, std::uint64_t, std::uint64_t, void*);
+    using QueryApi = HRESULT (*)(const GUID*, const GUID*, void**);
+    const auto initialize = reinterpret_cast<Initialize>(reinterpret_cast<void*>(GetProcAddress(runtime, "InitializeApiImplEx2")));
+    const auto query = reinterpret_cast<QueryApi>(reinterpret_cast<void*>(GetProcAddress(runtime, "QueryApiImpl")));
+    if (initialize == nullptr || query == nullptr) return Fail("API-impl entry points");
+    if (initialize(0x0000633600002712ull, 0x000065f400001832ull, 3, nullptr) != S_OK) return Fail("handshake");
+    const GUID threading{0x073b7dcb, 0x1fcf, 0x4030, {0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28}};
+    if (query(&threading, &threading, &g_api) != S_OK || g_api == nullptr) return Fail("QueryApiImpl for the threading interface");
+    return 0;
+}
+
+HRESULT ApiProvider(std::uint32_t op, const AsyncProviderData* data) {
+    using Schedule = HRESULT (*)(void*, AsyncBlock*, std::uint32_t);
+    using Complete = void (*)(void*, AsyncBlock*, HRESULT, std::size_t);
+    if (op == OpBegin) return reinterpret_cast<Schedule>(ApiSlot(9))(g_api, data->async, 0);
+    if (op == OpDoWork) reinterpret_cast<Complete>(ApiSlot(10))(g_api, data->async, S_OK, 0);
+    return S_OK;
+}
+
+int ApiThreading() {
+    if (OpenThreadingApi() != 0) return 1;
+    using Create = HRESULT (*)(void*, std::uint32_t, std::uint32_t, void**);
+    using Delayed = HRESULT (*)(void*, void*, std::uint32_t, std::uint32_t, void*, void (*)(void*, bool));
+    using Terminate = HRESULT (*)(void*, void*, bool, void*, void (*)(void*));
+    using Close = void (*)(void*, void*);
+    using Begin = HRESULT (*)(void*, AsyncBlock*, void*, const void*, const char*, AsyncProvider);
+    using Status = HRESULT (*)(void*, AsyncBlock*, bool);
+    using Query = HRESULT (*)(void*, const GUID&, void**);
+    using Release = ULONG (*)(void*);
+    using Assert = void (*)(void*);
+    reinterpret_cast<Assert>(ApiSlot(29))(g_api);
+    void* queue = nullptr;
+    if (reinterpret_cast<Create>(ApiSlot(12))(g_api, 1, 1, &queue) != S_OK || queue == nullptr) return Fail("queue through slot 12");
+    HANDLE ran = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const auto signal = [](void* context, bool) { SetEvent(static_cast<HANDLE>(context)); };
+    if (reinterpret_cast<Delayed>(ApiSlot(19))(g_api, queue, 0, 0, ran, signal) != S_OK) return Fail("callback through slot 19");
+    if (WaitForSingleObject(ran, 5000) != WAIT_OBJECT_0) return Fail("the callback ran");
+    CloseHandle(ran);
+    AsyncBlock block{};
+    block.queue = queue;
+    if (reinterpret_cast<Begin>(ApiSlot(7))(g_api, &block, nullptr, nullptr, nullptr, ApiProvider) != S_OK) return Fail("XAsync through slot 7");
+    if (reinterpret_cast<Status>(ApiSlot(3))(g_api, &block, true) != S_OK) return Fail("XAsync completed through slots 9, 10 and 3");
+    if (reinterpret_cast<Terminate>(ApiSlot(22))(g_api, queue, true, nullptr, nullptr) != S_OK) return Fail("terminate through slot 22");
+    reinterpret_cast<Close>(ApiSlot(17))(g_api, queue);
+    const GUID other{0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
+    void* none = reinterpret_cast<void*>(1);
+    if (reinterpret_cast<Query>(ApiSlot(0))(g_api, other, &none) != E_NOINTERFACE || none != nullptr) return Fail("QueryInterface for another interface");
+    reinterpret_cast<Release>(ApiSlot(2))(g_api);
+    std::printf("api threading ok\n");
+    return 0;
+}
+
+int ApiUnmapped() {
+    if (OpenThreadingApi() != 0) return 1;
+    using Dispatch = bool (*)(void*, void*, std::uint32_t, std::uint32_t);
+    reinterpret_cast<Dispatch>(ApiSlot(16))(g_api, nullptr, 0, 0);
+    return Fail("an unmapped slot returned");
+}
+
 int main(int argc, char** argv) {
     const char* scenario = argc > 1 ? argv[1] : "taskqueue";
     if (std::strcmp(scenario, "stub") == 0) {
@@ -1622,6 +1690,12 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(scenario, "api_impl") == 0) {
         return ApiImpl();
+    }
+    if (std::strcmp(scenario, "api_threading") == 0) {
+        return ApiThreading();
+    }
+    if (std::strcmp(scenario, "api_unmapped") == 0) {
+        return ApiUnmapped();
     }
     if (std::strcmp(scenario, "gamesave") == 0) {
         return GameSave();
