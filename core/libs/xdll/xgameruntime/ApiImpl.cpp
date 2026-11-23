@@ -1,5 +1,6 @@
 #include "xdll/xgameruntime/xgameruntime.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -130,6 +131,156 @@ const void* const kThreadingTable[] = {
 
 ApiObject g_threading{kThreadingTable, &kThreadingInterface, "threading: XAsync and XTaskQueue"};
 
+constexpr GUID kNetworkingProvider{0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
+constexpr GUID kNetworkingInterface{0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
+
+constexpr std::size_t kConnectivityHintBytes = 16;
+constexpr std::size_t kConnectivityLevelOffset = 0;
+constexpr std::size_t kNetworkInitializedOffset = 12;
+
+HRESULT NetworkingGetConnectivityHint(ApiObject*, std::uint8_t* hint) {
+    if (hint == nullptr) {
+        AbxUnsupported("QueryApiImpl", "the connectivity hint method was called without an output");
+    }
+    std::memset(hint, 0, kConnectivityHintBytes);
+    const std::uint32_t noInternet = 0;
+    std::memcpy(hint + kConnectivityLevelOffset, &noInternet, sizeof(noInternet));
+    hint[kNetworkInitializedOffset] = 1;
+    return S_OK;
+}
+
+const void* const kNetworkingTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&Unmapped<3>),
+    Entry(&Unmapped<4>),
+    Entry(&Unmapped<5>),
+    Entry(&Unmapped<6>),
+    Entry(&Unmapped<7>),
+    Entry(&Unmapped<8>),
+    Entry(&Unmapped<9>),
+    Entry(&Unmapped<10>),
+    Entry(&Unmapped<11>),
+    Entry(&Unmapped<12>),
+    Entry(&Unmapped<13>),
+    Entry(&Unmapped<14>),
+    Entry(&NetworkingGetConnectivityHint),
+    Entry(&Unmapped<16>),
+    Entry(&Unmapped<17>),
+};
+
+ApiObject g_networking{kNetworkingTable, &kNetworkingInterface, "networking: connectivity"};
+
+constexpr GUID kUserInterface{0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};
+
+std::atomic<std::uint64_t> g_nextToken{1};
+
+HRESULT RegisterWithoutEvents(void*, void*, void*, std::uint64_t* token) {
+    if (token == nullptr) {
+        AbxUnsupported("QueryApiImpl", "an event registration without a token output");
+    }
+    *token = g_nextToken++;
+    return S_OK;
+}
+
+HRESULT UserRegisterForChangeEvent(ApiObject*, XTaskQueueHandle queue, void* context, void* callback, std::uint64_t* token) {
+    return RegisterWithoutEvents(queue, context, callback, token);
+}
+
+const void* const kUserTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&Unmapped<3>),
+    Entry(&Unmapped<4>),
+    Entry(&Unmapped<5>),
+    Entry(&Unmapped<6>),
+    Entry(&Unmapped<7>),
+    Entry(&Unmapped<8>),
+    Entry(&Unmapped<9>),
+    Entry(&Unmapped<10>),
+    Entry(&Unmapped<11>),
+    Entry(&Unmapped<12>),
+    Entry(&Unmapped<13>),
+    Entry(&Unmapped<14>),
+    Entry(&Unmapped<15>),
+    Entry(&Unmapped<16>),
+    Entry(&Unmapped<17>),
+    Entry(&Unmapped<18>),
+    Entry(&Unmapped<19>),
+    Entry(&Unmapped<20>),
+    Entry(&Unmapped<21>),
+    Entry(&Unmapped<22>),
+    Entry(&Unmapped<23>),
+    Entry(&Unmapped<24>),
+    Entry(&Unmapped<25>),
+    Entry(&Unmapped<26>),
+    Entry(&Unmapped<27>),
+    Entry(&Unmapped<28>),
+    Entry(&Unmapped<29>),
+    Entry(&Unmapped<30>),
+    Entry(&Unmapped<31>),
+    Entry(&Unmapped<32>),
+    Entry(&UserRegisterForChangeEvent),
+    Entry(&Unmapped<34>),
+};
+
+ApiObject g_user{kUserTable, &kUserInterface, "user"};
+
+constexpr GUID kPackageProvider{0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
+constexpr GUID kPackageInterface{0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
+
+bool PackageIsPackagedProcess(ApiObject*) { return XPackageIsPackagedProcess(); }
+HRESULT PackageEnumeratePackages(ApiObject*, std::uint32_t kind, std::uint32_t scope, void* context, void* callback) {
+    return XPackageEnumeratePackages(kind, scope, context, callback);
+}
+
+const void* const kPackageTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&Unmapped<3>),
+    Entry(&PackageIsPackagedProcess),
+    Entry(&Unmapped<5>),
+    Entry(&Unmapped<6>),
+    Entry(&Unmapped<7>),
+    Entry(&Unmapped<8>),
+    Entry(&Unmapped<9>),
+    Entry(&Unmapped<10>),
+    Entry(&Unmapped<11>),
+    Entry(&Unmapped<12>),
+    Entry(&Unmapped<13>),
+    Entry(&Unmapped<14>),
+    Entry(&Unmapped<15>),
+    Entry(&Unmapped<16>),
+    Entry(&Unmapped<17>),
+    Entry(&Unmapped<18>),
+    Entry(&Unmapped<19>),
+    Entry(&Unmapped<20>),
+    Entry(&Unmapped<21>),
+    Entry(&Unmapped<22>),
+    Entry(&Unmapped<23>),
+    Entry(&Unmapped<24>),
+    Entry(&Unmapped<25>),
+    Entry(&Unmapped<26>),
+    Entry(&Unmapped<27>),
+    Entry(&Unmapped<28>),
+    Entry(&Unmapped<29>),
+    Entry(&Unmapped<30>),
+    Entry(&Unmapped<31>),
+    Entry(&Unmapped<32>),
+    Entry(&Unmapped<33>),
+    Entry(&Unmapped<34>),
+    Entry(&Unmapped<35>),
+    Entry(&Unmapped<36>),
+    Entry(&Unmapped<37>),
+    Entry(&Unmapped<38>),
+    Entry(&PackageEnumeratePackages),
+};
+
+ApiObject g_package{kPackageTable, &kPackageInterface, "package"};
+
 struct ApiInterface {
     const GUID& provider;
     const GUID& interfaceId;
@@ -138,6 +289,9 @@ struct ApiInterface {
 
 const ApiInterface kInterfaces[] = {
     {kThreadingInterface, kThreadingInterface, g_threading},
+    {kNetworkingProvider, kNetworkingInterface, g_networking},
+    {kUserInterface, kUserInterface, g_user},
+    {kPackageProvider, kPackageInterface, g_package},
 };
 
 }

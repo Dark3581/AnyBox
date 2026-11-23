@@ -1,1 +1,1 @@
-anybox_add_xdll(xmem SOURCES Memory.cpp)
+anybox_add_xdll(xmem SOURCES Inventory.cpp Memory.cpp)

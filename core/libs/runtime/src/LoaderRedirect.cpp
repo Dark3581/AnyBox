@@ -1,6 +1,7 @@
 #include "LoaderRedirect.hpp"
 
 #include "AbxApi.hpp"
+#include "PathRedirect.hpp"
 
 #include <windows.h>
 #include <winternl.h>
@@ -305,6 +306,7 @@ void InstallLoaderRedirect() {
     Add(kernel32, kernelbase, "GetModuleHandleA", reinterpret_cast<void*>(&RedirectGetModuleHandleA));
     Add(kernel32, kernelbase, "GetModuleHandleExW", reinterpret_cast<void*>(&RedirectGetModuleHandleExW));
     Add(kernel32, kernelbase, "GetModuleHandleExA", reinterpret_cast<void*>(&RedirectGetModuleHandleExA));
+    AddPathRedirects([&](const char* name, void* replacement) { Add(kernel32, kernelbase, name, replacement); });
 
     const PEB* peb = reinterpret_cast<const PEB*>(reinterpret_cast<const TEB*>(NtCurrentTeb())->ProcessEnvironmentBlock);
     const LIST_ENTRY* head = &peb->Ldr->InMemoryOrderModuleList;

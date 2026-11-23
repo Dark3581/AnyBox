@@ -25,3 +25,5 @@ ABX_API HRESULT D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* roo
 ABX_API HRESULT D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* rootSignature, ID3DBlob** blob, ID3DBlob** errorBlob);
 ABX_API HRESULT D3D12CreateRootSignatureDeserializer(const void* data, SIZE_T size, REFIID iid, void** deserializer);
 ABX_API HRESULT D3D12CreateVersionedRootSignatureDeserializer(const void* data, SIZE_T size, REFIID iid, void** deserializer);
+
+ABX_API HRESULT D3D12ConfigureVirtualMemoryX(const void* description);

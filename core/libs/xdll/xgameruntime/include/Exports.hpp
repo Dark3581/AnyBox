@@ -240,7 +240,7 @@ ABX_API HRESULT XPackageCloseMountHandle();
 ABX_API HRESULT XPackageCreateInstallationMonitor();
 ABX_API HRESULT XPackageEnumerateChunkAvailability();
 ABX_API HRESULT XPackageEnumerateFeatures();
-ABX_API HRESULT XPackageEnumeratePackages();
+ABX_API HRESULT XPackageEnumeratePackages(std::uint32_t kind, std::uint32_t scope, void* context, void* callback);
 ABX_API HRESULT XPackageEstimateDownloadSize();
 ABX_API HRESULT XPackageFindChunkAvailability();
 ABX_API HRESULT XPackageGetInstallationProgress();

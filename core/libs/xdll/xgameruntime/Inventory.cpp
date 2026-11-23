@@ -156,7 +156,6 @@ ABX_API HRESULT XPackageCloseMountHandle() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageCreateInstallationMonitor() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageEnumerateChunkAvailability() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageEnumerateFeatures() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XPackageEnumeratePackages() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageEstimateDownloadSize() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageFindChunkAvailability() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XPackageGetInstallationProgress() { AbxNotImplemented(__func__); }

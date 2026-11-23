@@ -29,3 +29,5 @@ msvcp140_atomic_wait.dll
 msvcp140_codecvt_ids.dll
 concrt140.dll
 vccorlib140.dll
+mfplat.dll
+mfreadwrite.dll

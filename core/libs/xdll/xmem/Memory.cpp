@@ -106,3 +106,34 @@ ABX_API BOOL XMemGetWorkingSetStatistics(std::uint32_t request, void* statistics
     AbxTrace("XMemGetWorkingSetStatistics(0x%x, %p) -> 0", request, statistics);
     return FALSE;
 }
+
+namespace {
+
+constexpr std::uint32_t kDesktopAllocationTypes = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN;
+constexpr std::uint32_t kConsoleOnlyAllocationTypes = 0x00400000u | 0x20000000u;
+constexpr std::uint32_t kProtectionValues[] = {PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+                                               PAGE_EXECUTE_WRITECOPY};
+
+bool StandardProtection(std::uint32_t protection) {
+    for (const std::uint32_t value : kProtectionValues) {
+        if (protection == value) return true;
+    }
+    return false;
+}
+
+}
+
+ABX_API void* XMemVirtualAlloc(void* address, std::size_t size, std::uint32_t allocationType, std::uint64_t attributes, std::uint32_t protect) {
+    const std::uint32_t unknownTypes = allocationType & ~(kDesktopAllocationTypes | kConsoleOnlyAllocationTypes);
+    if (unknownTypes != 0) {
+        AbxUnsupported(__func__, "allocation type bits that are neither desktop nor known console-only flags");
+    }
+    const std::uint32_t protection = protect & 0xFFu;
+    if (!StandardProtection(protection)) {
+        AbxUnsupported(__func__, "a page protection whose low byte is not one standard protection value");
+    }
+    void* result = VirtualAlloc(address, size, allocationType & kDesktopAllocationTypes, protection);
+    AbxTrace("XMemVirtualAlloc(%p, 0x%zx, type 0x%x, attributes 0x%llx, protect 0x%x) = %p (console-only type bits 0x%x and protection bits 0x%x dropped)", address, size,
+             allocationType, static_cast<unsigned long long>(attributes), protect, result, allocationType & kConsoleOnlyAllocationTypes, protect & ~0xFFu);
+    return result;
+}

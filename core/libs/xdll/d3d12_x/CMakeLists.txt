@@ -12,4 +12,4 @@ target_include_directories(d3d12_x_pso PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/pso ${
 target_compile_definitions(d3d12_x_pso PRIVATE ABX_LIBRARY_NAME="d3d12_x" PUBLIC $<$<CXX_COMPILER_ID:GNU>:WIDL_EXPLICIT_AGGREGATE_RETURNS>)
 target_link_libraries(d3d12_x_pso PUBLIC d3d12_x_store d3d12_x_vulkan)
 
-anybox_add_xdll(d3d12_x SOURCES Inventory.cpp RootSignature.cpp LINK d3d12_x_pso d3d12_x_store d3d12_x_vulkan)
+anybox_add_xdll(d3d12_x SOURCES Inventory.cpp RootSignature.cpp VirtualMemory.cpp LINK d3d12_x_pso d3d12_x_store d3d12_x_vulkan)
