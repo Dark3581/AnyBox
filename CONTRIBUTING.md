@@ -64,6 +64,7 @@ Toolchains and the relinker-only build are in [BUILD.md](docs/dev/BUILD.md).
 - One topic per pull request, based on current `main`. Follow-ups go in a new pull request.
 - Fill in the [template](.github/pull_request_template.md): what changed, how it was tested, dependencies, the issue it fixes, the title it unblocks (`Unblocks: 4D5307E6 #12`), and whether AI assisted.
 - Known gaps are added, changed or removed through a fragment in `docs/dev/debt/changes/<branch>.md`, never by editing the debt files ([format](docs/dev/TechnicalDebt.md#fragments)). Maintainers fold fragments with `python tools/debt_fold.py`.
+- The README embeds the documentation pages as collapsible sections. After editing one of them, run `python tools/readme_docs.py`; a test fails while the README is out of date.
 - Investigation notes, logs and screenshots go in the pull request, not in the repository.
 - CI runs the conventions check, the relinker tests on Linux, the full Windows build and tests, and posts the library progress change as a comment.
 - Labels are added for you: the area a pull request touches (`libs`, `relinker`, `tools`, `ci`, or `docs` when it changes only documentation; [labeler.yml](.github/labeler.yml)), `fixes issue` when it closes an issue, and `unblocks title` when its `Unblocks:` line names a title ID.

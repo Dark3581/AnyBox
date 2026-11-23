@@ -148,6 +148,11 @@ def main():
         debt_path(name).write_text(text, encoding="utf-8")
     for path in fragments():
         path.unlink()
+    import readme_docs
+    readme = readme_docs.README.read_text(encoding="utf-8")
+    fresh = readme_docs.updated(readme)
+    if fresh != readme:
+        readme_docs.README.write_text(fresh, encoding="utf-8", newline="\n")
     print(f"folded into {len(results)} debt files")
     return 0
 
