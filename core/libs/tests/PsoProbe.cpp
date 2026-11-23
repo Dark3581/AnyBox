@@ -14,9 +14,11 @@
 #include "GraphicsState.hpp"
 #include "PipelineCompiler.hpp"
 #include "PipelineLibrary.hpp"
+#include "PipelineObject.hpp"
 #include "PipelineState.hpp"
 #include "Resource.hpp"
 #include "ResourceState.hpp"
+#include "RootSignature.hpp"
 #include "RootSignatureLayout.hpp"
 #include "ShaderStore.hpp"
 #include "TextureDesc.hpp"
@@ -3300,6 +3302,200 @@ int DescriptorsGpu(bool validate) {
     return status;
 }
 
+int PipelineObjects(int argc, char** argv) {
+    const bool graphics = std::strcmp(argv[3], "graphics") == 0;
+    if ((graphics && argc < 6) || (!graphics && std::strcmp(argv[3], "compute") != 0)) return Fail("usage: pso-objects <store> compute <cs> | graphics <vs> <ps>");
+    ShaderStore store;
+    if (!LoadStore(argv[2], store)) return 1;
+    const std::vector<unsigned char> first = ReadBytes(Utf8Path(argv[4]));
+    const std::vector<unsigned char> second = graphics ? ReadBytes(Utf8Path(argv[5])) : std::vector<unsigned char>{};
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress"};
+    requirements.hostMemoryImport = true;
+    requirements.validation = HasFlag(argc, argv, "--validate");
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return requirements.validation && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const HMODULE host = LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto serialize = host ? reinterpret_cast<PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE>(reinterpret_cast<void*>(GetProcAddress(host, "D3D12SerializeVersionedRootSignature"))) : nullptr;
+    if (serialize == nullptr) {
+        std::puts("SKIP the host has no d3d12.dll serializer");
+        return kNoDevice;
+    }
+    const std::unique_ptr<TitleBufferWindow> window = TitleBufferWindow::Create(*device, 16u << 20, error);
+    if (!window) return Fail("window: " + error);
+    BufferArena arena(window->Start(), window->Size());
+    const ResourceContext context{*device, *window, arena};
+    int status = 0;
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+
+    const D3D12_DESCRIPTOR_RANGE1 ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0}};
+    D3D12_ROOT_PARAMETER1 parameters[4]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 4};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[1].Descriptor = {1, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[2].DescriptorTable = {1, ranges};
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[3].Descriptor = {0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
+    desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    desc.Desc_1_1 = {4, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC single{};
+    single.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    single.Desc_1_1 = {1, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    const auto makeSignature = [&](const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& from) -> ID3D12RootSignature* {
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* messages = nullptr;
+        if (FAILED(serialize(&from, &blob, &messages))) return nullptr;
+        ID3D12RootSignature* signature = nullptr;
+        RootSignature::Create(nullptr, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&signature), error);
+        blob->Release();
+        return signature;
+    };
+    ID3D12RootSignature* signature = makeSignature(desc);
+    ID3D12RootSignature* other = makeSignature(single);
+    expect(signature != nullptr && other != nullptr, "create root signatures: " + error);
+    if (status != 0) return status;
+    const RootSignatureLayout& layout = dynamic_cast<RootSignature*>(signature)->Layout();
+    expect(layout.parameters.size() == 4 && layout.words == 9 && layout.parameters[2].firstWord == 6 && layout.parameters[3].firstWord == 7, "the root signature layout from its blob");
+    const std::uint8_t junk[16] = {1, 2, 3};
+    void* nothing = nullptr;
+    expect(RootSignature::Create(nullptr, junk, sizeof(junk), __uuidof(ID3D12RootSignature), &nothing, error) == E_INVALIDARG && nothing == nullptr, "a junk blob refused");
+
+    PipelineCache cache(*device, {});
+    ID3D12PipelineState* state = nullptr;
+    {
+        PipelineLibrary library(*device, cache.Handle(), 0);
+        const PipelineContext pipelines{store, library};
+        HRESULT created = E_FAIL;
+        HRESULT withoutSignature = E_FAIL;
+        if (graphics) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC description = DefaultGraphics();
+            description.VS = {first.data(), first.size()};
+            description.PS = {second.data(), second.size()};
+            withoutSignature = PipelineStateObject::CreateGraphics(pipelines, nullptr, description, __uuidof(ID3D12PipelineState), &nothing, error);
+            description.pRootSignature = signature;
+            created = PipelineStateObject::CreateGraphics(pipelines, nullptr, description, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&state), error);
+        } else {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC description = Description(first);
+            withoutSignature = PipelineStateObject::CreateCompute(pipelines, nullptr, description, __uuidof(ID3D12PipelineState), &nothing, error);
+            description.pRootSignature = signature;
+            created = PipelineStateObject::CreateCompute(pipelines, nullptr, description, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&state), error);
+        }
+        expect(withoutSignature == E_INVALIDARG && nothing == nullptr && error.find("embedded") != std::string::npos, "a pipeline state without a root signature refused");
+        if (graphics) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC description = DefaultGraphics();
+            description.pRootSignature = signature;
+            description.VS = {second.data(), second.size()};
+            description.PS = {second.data(), second.size()};
+            expect(PipelineStateObject::CreateGraphics(pipelines, nullptr, description, __uuidof(ID3D12PipelineState), &nothing, error) == E_INVALIDARG && nothing == nullptr,
+                   "a pixel shader in the vertex slot refused");
+        }
+        expect(SUCCEEDED(created) && state != nullptr, "create pipeline state: " + error);
+        if (status != 0) return status;
+        PipelineStateObject* object = dynamic_cast<PipelineStateObject*>(state);
+        expect(object->Pipeline() != VK_NULL_HANDLE && object->BindPoint() == (graphics ? VK_PIPELINE_BIND_POINT_GRAPHICS : VK_PIPELINE_BIND_POINT_COMPUTE) &&
+                   object->Signature() == dynamic_cast<RootSignature*>(signature),
+               "the pipeline state's pipeline, bind point and root signature");
+        ID3DBlob* blob = reinterpret_cast<ID3DBlob*>(&nothing);
+        expect(state->GetCachedBlob(&blob) == E_NOTIMPL && blob == nullptr, "no cached blob: the title's blobs hold console GPU code");
+
+        DescriptorSizes sizes;
+        sizes.shaderResource = 32;
+        const D3D12_DESCRIPTOR_HEAP_DESC heapDesc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        ID3D12DescriptorHeap* heap = nullptr;
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12Fence* fence = nullptr;
+        ID3D12CommandAllocator* allocator = nullptr;
+        ID3D12GraphicsCommandList* list = nullptr;
+        const D3D12_COMMAND_QUEUE_DESC queueDesc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+        expect(SUCCEEDED(DescriptorHeap::Create(context, nullptr, heapDesc, sizes, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&heap), error)) &&
+                   SUCCEEDED(CommandQueue::Create(*device, nullptr, queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue), error)) &&
+                   SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence), error)) &&
+                   SUCCEEDED(CommandAllocator::Create(*device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&allocator),
+                                                      error)) &&
+                   SUCCEEDED(CommandList::Create(context, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, state, __uuidof(ID3D12GraphicsCommandList),
+                                                 reinterpret_cast<void**>(&list), error)),
+               "create heap, queue, fence, allocator and a list with an initial pipeline state: " + error);
+        if (status != 0) return status;
+        CommandList* recording = dynamic_cast<CommandList*>(list);
+        expect(recording->Pipeline() == object, "the initial pipeline state is bound");
+        const D3D12_GPU_VIRTUAL_ADDRESS buffer = window->Start() + (8u << 20);
+        const D3D12_GPU_DESCRIPTOR_HANDLE table{heap->GetGPUDescriptorHandleForHeapStart().ptr + 3 * 32};
+        ID3D12DescriptorHeap* heaps[] = {heap};
+        list->SetDescriptorHeaps(1, heaps);
+        const std::uint32_t pair[2] = {11, 22};
+        const RootArguments* arguments = nullptr;
+        if (graphics) {
+            list->SetGraphicsRootSignature(signature);
+            list->SetGraphicsRoot32BitConstants(0, 2, pair, 0);
+            list->SetGraphicsRoot32BitConstant(0, 7, 3);
+            list->SetGraphicsRootConstantBufferView(1, buffer);
+            list->SetGraphicsRootDescriptorTable(2, table);
+            list->SetGraphicsRootUnorderedAccessView(3, buffer + 256);
+            arguments = &recording->GraphicsArguments();
+        } else {
+            list->SetComputeRootSignature(signature);
+            list->SetComputeRoot32BitConstants(0, 2, pair, 0);
+            list->SetComputeRoot32BitConstant(0, 7, 3);
+            list->SetComputeRootConstantBufferView(1, buffer);
+            list->SetComputeRootDescriptorTable(2, table);
+            list->SetComputeRootUnorderedAccessView(3, buffer + 256);
+            arguments = &recording->ComputeArguments();
+        }
+        const std::array<std::uint32_t, 64>& words = arguments->words;
+        expect(words[0] == 11 && words[1] == 22 && words[2] == 0 && words[3] == 7, "root constants land at their offsets");
+        expect(words[4] == static_cast<std::uint32_t>(buffer) && words[5] == static_cast<std::uint32_t>(buffer >> 32) && words[6] == static_cast<std::uint32_t>(table.ptr) &&
+                   words[7] == static_cast<std::uint32_t>(buffer + 256) && words[8] == static_cast<std::uint32_t>((buffer + 256) >> 32),
+               "root views take two words and a descriptor table one");
+        if (graphics) {
+            list->SetGraphicsRootSignature(signature);
+        } else {
+            list->SetComputeRootSignature(signature);
+        }
+        expect(arguments->words[3] == 7, "setting the same root signature again keeps the arguments");
+        if (graphics) {
+            list->SetGraphicsRootSignature(other);
+        } else {
+            list->SetComputeRootSignature(other);
+        }
+        expect(arguments->signature == dynamic_cast<RootSignature*>(other) && std::all_of(words.begin(), words.end(), [](std::uint32_t word) { return word == 0; }),
+               "another root signature clears the arguments");
+        list->SetPipelineState(state);
+        list->ClearState(nullptr);
+        expect(recording->Pipeline() == nullptr && recording->ShaderResourceHeap() == nullptr && arguments->signature == nullptr, "ClearState drops the bound state");
+        list->ClearState(state);
+        expect(recording->Pipeline() == object, "ClearState with a pipeline state binds it");
+        expect(SUCCEEDED(list->Close()), "close the list");
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        expect(SUCCEEDED(queue->Signal(fence, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, event)) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0,
+               "a list that binds the pipeline executes");
+        CloseHandle(event);
+        for (IUnknown* object : std::initializer_list<IUnknown*>{list, allocator, queue, fence, heap, state}) object->Release();
+    }
+    signature->Release();
+    other->Release();
+    std::printf("pipeline objects (%s): %zu checks\n", graphics ? "graphics" : "compute", checks);
+    if (requirements.validation) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::printf("PASS pso objects %s\n", graphics ? "graphics" : "compute");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -3322,6 +3518,7 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "resources-gpu") == 0) return ResourcesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "commandlist-gpu") == 0) return CommandListGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "descriptors-gpu") == 0) return DescriptorsGpu(HasFlag(argc, argv, "--validate"));
+    if (argc >= 5 && std::strcmp(argv[1], "pso-objects") == 0) return PipelineObjects(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
@@ -3331,6 +3528,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate] | descriptors-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate] | descriptors-gpu [--validate] | pso-objects <store> compute <cs container> | graphics <vs container> <ps container> [--validate]");
     return 2;
 }

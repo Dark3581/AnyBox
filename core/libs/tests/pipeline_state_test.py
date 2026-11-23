@@ -103,6 +103,16 @@ def check_graphics(args, env):
     limited = graphics("vs_inputs", "ps_float", "--layout", "--cache", args.work / "graphics_fresh.bin", "--limit", "16")
     counted = stats(limited.stdout)
     assert counted["compiled"] == 0 and counted["failed"] == 0 and counted["refused"] + counted["ready"] == 2, counted
+    pipeline_objects(args, env, store, "graphics", carved / "vs_plain.dxbc", carved / "ps_float.dxbc")
+
+
+def pipeline_objects(args, env, store, kind, *containers):
+    command = [str(part) for part in [args.probe, "pso-objects", store, kind, *containers]]
+    checked = subprocess.run(command + ["--validate"], capture_output=True, text=True, env=env, timeout=600)
+    if checked.returncode == 4:
+        checked = subprocess.run(command, capture_output=True, text=True, env=env, timeout=600)
+    print(checked.stdout.strip())
+    assert checked.returncode in (0, 3), (kind, checked.stdout[-3000:], checked.stderr[-2000:])
 
 
 def main():
@@ -131,6 +141,7 @@ def main():
     (carved / "index.json").write_text(json.dumps([{"name": n, "file": f"{n}.dxbc"} for n in shaders]), encoding="utf-8")
     (translated / "index.json").write_text(json.dumps({n: d for n, (_, d, _) in shaders.items()}), encoding="utf-8")
     run([sys.executable, args.tool, "build", carved, translated, store], env)
+    pipeline_objects(args, env, store, "compute", carved / "cs_a.dxbc")
     (carved / "unknown.dxbc").write_bytes(container(9))
     (carved / "junk.bin").write_bytes(b"not a container at all, but long enough to read")
 

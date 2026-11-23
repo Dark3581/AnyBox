@@ -4,6 +4,7 @@
 #include "CopyLayout.hpp"
 #include "ResourceState.hpp"
 
+#include <cstring>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -15,8 +16,8 @@ namespace {
 
 constexpr UINT kAllSubresources = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-[[noreturn]] void NotYet(const char* function) {
-    AbxUnsupported(function, "not implemented yet: it needs descriptor heaps, root signatures or pipeline state objects");
+[[noreturn]] void RootMappingUnknown(const char* function) {
+    AbxUnsupported(function, "how root arguments, descriptor heaps and the heap base reach the translated shader's user data is unknown until a title's calls show it");
 }
 
 }
@@ -49,8 +50,8 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
         error = "the command allocator is missing, foreign or of another type";
         return false;
     }
-    if (initial != nullptr) {
-        error = "an initial pipeline state is not supported yet";
+    if (initial != nullptr && dynamic_cast<PipelineStateObject*>(initial) == nullptr) {
+        error = "an initial pipeline state that AnyBox did not create";
         return false;
     }
     const VkCommandBuffer commands = pool->Next(error);
@@ -67,6 +68,7 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
     closed_ = false;
     states_.clear();
     ResetBindings();
+    if (initial != nullptr) BindPipeline(initial, "ID3D12GraphicsCommandList::Reset");
     return true;
 }
 
@@ -75,6 +77,83 @@ void CommandList::ResetBindings() {
     samplerHeap_ = nullptr;
     renderTargets_.clear();
     depthStencil_.reset();
+    pipeline_ = nullptr;
+    graphics_ = RootArguments{};
+    compute_ = RootArguments{};
+}
+
+void CommandList::BindPipeline(ID3D12PipelineState* state, const char* function) {
+    PipelineStateObject* ours = dynamic_cast<PipelineStateObject*>(state);
+    if (ours == nullptr) {
+        AbxUnsupported(function, "a pipeline state that AnyBox did not create");
+    }
+    if (ours->BindPoint() == VK_PIPELINE_BIND_POINT_GRAPHICS && type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        AbxUnsupported(function, "a graphics pipeline state on a compute or copy command list");
+    }
+    Recorder(function).BindPipeline(ours->BindPoint(), ours->Pipeline());
+    pipeline_ = ours;
+}
+
+void CommandList::SetSignature(RootArguments& arguments, ID3D12RootSignature* signature, const char* function) {
+    Recorder(function);
+    const RootSignature* ours = nullptr;
+    if (signature != nullptr) {
+        ours = dynamic_cast<RootSignature*>(signature);
+        if (ours == nullptr) {
+            AbxUnsupported(function, "a root signature that AnyBox did not create");
+        }
+    }
+    if (ours != arguments.signature) {
+        arguments = RootArguments{};
+        arguments.signature = ours;
+    }
+}
+
+const RootParameterLayout& CommandList::Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const {
+    Recorder(function);
+    if (arguments.signature == nullptr) {
+        AbxUnsupported(function, "a root argument before a root signature is set");
+    }
+    const std::vector<RootParameterLayout>& parameters = arguments.signature->Layout().parameters;
+    if (index >= parameters.size() || parameters[index].type != type) {
+        AbxUnsupported(function, "a root parameter index outside the root signature, or of another type");
+    }
+    return parameters[index];
+}
+
+void CommandList::SetConstants(RootArguments& arguments, UINT index, UINT count, const void* data, UINT offset, const char* function) {
+    const RootParameterLayout& parameter = Parameter(arguments, index, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, function);
+    if (offset > parameter.constants || count > parameter.constants - offset || (count != 0 && data == nullptr)) {
+        AbxUnsupported(function, "root constants outside their parameter, or without data");
+    }
+    if (count != 0) std::memcpy(arguments.words.data() + parameter.firstWord + offset, data, static_cast<std::size_t>(count) * sizeof(std::uint32_t));
+}
+
+void CommandList::SetRootView(RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address, const char* function) {
+    const RootParameterLayout& parameter = Parameter(arguments, index, type, function);
+    if (address != 0 && !context_.window.Contains(address, 1)) {
+        AbxUnsupported(function, "a root view address outside the title buffer window");
+    }
+    arguments.words[parameter.firstWord] = static_cast<std::uint32_t>(address);
+    arguments.words[parameter.firstWord + 1] = static_cast<std::uint32_t>(address >> 32);
+}
+
+void CommandList::SetTable(RootArguments& arguments, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle, const char* function) {
+    const RootParameterLayout& parameter = Parameter(arguments, index, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, function);
+    const bool samplers = !parameter.ranges.empty() && parameter.ranges.front().RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    const DescriptorHeap* heap = samplers ? samplerHeap_ : shaderResourceHeap_;
+    if (heap == nullptr) {
+        AbxUnsupported(function, "a descriptor table before SetDescriptorHeaps bound a heap of its type");
+    }
+    const std::uint64_t start = heap->GpuStart().ptr;
+    const std::uint64_t end = start + static_cast<std::uint64_t>(heap->Count()) * heap->Increment();
+    if (handle.ptr < start || handle.ptr >= end || (handle.ptr - start) % heap->Increment() != 0) {
+        AbxUnsupported(function, "a descriptor table handle outside the bound heap of its type");
+    }
+    if (handle.ptr > 0xFFFFFFFFull) {
+        AbxUnsupported(function, "a descriptor table above 4 GB, which a single root word cannot hold");
+    }
+    arguments.words[parameter.firstWord] = static_cast<std::uint32_t>(handle.ptr);
 }
 
 const DescriptorRecord& CommandList::Attachment(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_DESCRIPTOR_HEAP_TYPE type, const char* function) const {
@@ -112,10 +191,8 @@ HRESULT STDMETHODCALLTYPE CommandList::Reset(ID3D12CommandAllocator* allocator, 
 }
 
 void STDMETHODCALLTYPE CommandList::ClearState(ID3D12PipelineState* state) {
-    if (state != nullptr) {
-        NotYet("ID3D12GraphicsCommandList::ClearState");
-    }
     ResetBindings();
+    if (state != nullptr) BindPipeline(state, "ID3D12GraphicsCommandList::ClearState");
 }
 
 Resource* CommandList::Ours(ID3D12Resource* resource, const char* function) const {
@@ -154,9 +231,9 @@ BufferRef CommandList::WindowRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 byt
     return {context_.window.Buffer(), address - context_.window.Start(), bytes};
 }
 
-void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT, UINT, UINT, UINT) { NotYet("ID3D12GraphicsCommandList::DrawInstanced"); }
-void STDMETHODCALLTYPE CommandList::DrawIndexedInstanced(UINT, UINT, UINT, INT, UINT) { NotYet("ID3D12GraphicsCommandList::DrawIndexedInstanced"); }
-void STDMETHODCALLTYPE CommandList::Dispatch(UINT, UINT, UINT) { NotYet("ID3D12GraphicsCommandList::Dispatch"); }
+void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT, UINT, UINT, UINT) { RootMappingUnknown("ID3D12GraphicsCommandList::DrawInstanced"); }
+void STDMETHODCALLTYPE CommandList::DrawIndexedInstanced(UINT, UINT, UINT, INT, UINT) { RootMappingUnknown("ID3D12GraphicsCommandList::DrawIndexedInstanced"); }
+void STDMETHODCALLTYPE CommandList::Dispatch(UINT, UINT, UINT) { RootMappingUnknown("ID3D12GraphicsCommandList::Dispatch"); }
 
 void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* destination, UINT64 destinationOffset, ID3D12Resource* source, UINT64 sourceOffset, UINT64 bytes) {
     const char* function = "ID3D12GraphicsCommandList::CopyBufferRegion";
@@ -293,7 +370,9 @@ void STDMETHODCALLTYPE CommandList::OMSetStencilRef(UINT reference) {
     Recorder("ID3D12GraphicsCommandList::OMSetStencilRef").SetStencilReference(reference);
 }
 
-void STDMETHODCALLTYPE CommandList::SetPipelineState(ID3D12PipelineState*) { NotYet("ID3D12GraphicsCommandList::SetPipelineState"); }
+void STDMETHODCALLTYPE CommandList::SetPipelineState(ID3D12PipelineState* state) {
+    BindPipeline(state, "ID3D12GraphicsCommandList::SetPipelineState");
+}
 
 void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
     const char* function = "ID3D12GraphicsCommandList::ResourceBarrier";
@@ -388,20 +467,48 @@ void STDMETHODCALLTYPE CommandList::SetDescriptorHeaps(UINT count, ID3D12Descrip
     shaderResourceHeap_ = shaderResource;
     samplerHeap_ = sampler;
 }
-void STDMETHODCALLTYPE CommandList::SetComputeRootSignature(ID3D12RootSignature*) { NotYet("ID3D12GraphicsCommandList::SetComputeRootSignature"); }
-void STDMETHODCALLTYPE CommandList::SetGraphicsRootSignature(ID3D12RootSignature*) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRootSignature"); }
-void STDMETHODCALLTYPE CommandList::SetComputeRootDescriptorTable(UINT, D3D12_GPU_DESCRIPTOR_HANDLE) { NotYet("ID3D12GraphicsCommandList::SetComputeRootDescriptorTable"); }
-void STDMETHODCALLTYPE CommandList::SetGraphicsRootDescriptorTable(UINT, D3D12_GPU_DESCRIPTOR_HANDLE) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable"); }
-void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstant(UINT, UINT, UINT) { NotYet("ID3D12GraphicsCommandList::SetComputeRoot32BitConstant"); }
-void STDMETHODCALLTYPE CommandList::SetGraphicsRoot32BitConstant(UINT, UINT, UINT) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstant"); }
-void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT, UINT, const void*, UINT) { NotYet("ID3D12GraphicsCommandList::SetComputeRoot32BitConstants"); }
-void STDMETHODCALLTYPE CommandList::SetGraphicsRoot32BitConstants(UINT, UINT, const void*, UINT) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants"); }
-void STDMETHODCALLTYPE CommandList::SetComputeRootConstantBufferView(UINT, D3D12_GPU_VIRTUAL_ADDRESS) { NotYet("ID3D12GraphicsCommandList::SetComputeRootConstantBufferView"); }
-void STDMETHODCALLTYPE CommandList::SetGraphicsRootConstantBufferView(UINT, D3D12_GPU_VIRTUAL_ADDRESS) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView"); }
-void STDMETHODCALLTYPE CommandList::SetComputeRootShaderResourceView(UINT, D3D12_GPU_VIRTUAL_ADDRESS) { NotYet("ID3D12GraphicsCommandList::SetComputeRootShaderResourceView"); }
-void STDMETHODCALLTYPE CommandList::SetGraphicsRootShaderResourceView(UINT, D3D12_GPU_VIRTUAL_ADDRESS) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRootShaderResourceView"); }
-void STDMETHODCALLTYPE CommandList::SetComputeRootUnorderedAccessView(UINT, D3D12_GPU_VIRTUAL_ADDRESS) { NotYet("ID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView"); }
-void STDMETHODCALLTYPE CommandList::SetGraphicsRootUnorderedAccessView(UINT, D3D12_GPU_VIRTUAL_ADDRESS) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRootUnorderedAccessView"); }
+void STDMETHODCALLTYPE CommandList::SetComputeRootSignature(ID3D12RootSignature* signature) {
+    SetSignature(compute_, signature, "ID3D12GraphicsCommandList::SetComputeRootSignature");
+}
+void STDMETHODCALLTYPE CommandList::SetGraphicsRootSignature(ID3D12RootSignature* signature) {
+    SetSignature(graphics_, signature, "ID3D12GraphicsCommandList::SetGraphicsRootSignature");
+}
+void STDMETHODCALLTYPE CommandList::SetComputeRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
+    SetTable(compute_, index, handle, "ID3D12GraphicsCommandList::SetComputeRootDescriptorTable");
+}
+void STDMETHODCALLTYPE CommandList::SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
+    SetTable(graphics_, index, handle, "ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable");
+}
+void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) {
+    SetConstants(compute_, index, 1, &value, offset, "ID3D12GraphicsCommandList::SetComputeRoot32BitConstant");
+}
+void STDMETHODCALLTYPE CommandList::SetGraphicsRoot32BitConstant(UINT index, UINT value, UINT offset) {
+    SetConstants(graphics_, index, 1, &value, offset, "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstant");
+}
+void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT index, UINT count, const void* data, UINT offset) {
+    SetConstants(compute_, index, count, data, offset, "ID3D12GraphicsCommandList::SetComputeRoot32BitConstants");
+}
+void STDMETHODCALLTYPE CommandList::SetGraphicsRoot32BitConstants(UINT index, UINT count, const void* data, UINT offset) {
+    SetConstants(graphics_, index, count, data, offset, "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants");
+}
+void STDMETHODCALLTYPE CommandList::SetComputeRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    SetRootView(compute_, index, D3D12_ROOT_PARAMETER_TYPE_CBV, address, "ID3D12GraphicsCommandList::SetComputeRootConstantBufferView");
+}
+void STDMETHODCALLTYPE CommandList::SetGraphicsRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    SetRootView(graphics_, index, D3D12_ROOT_PARAMETER_TYPE_CBV, address, "ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView");
+}
+void STDMETHODCALLTYPE CommandList::SetComputeRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    SetRootView(compute_, index, D3D12_ROOT_PARAMETER_TYPE_SRV, address, "ID3D12GraphicsCommandList::SetComputeRootShaderResourceView");
+}
+void STDMETHODCALLTYPE CommandList::SetGraphicsRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    SetRootView(graphics_, index, D3D12_ROOT_PARAMETER_TYPE_SRV, address, "ID3D12GraphicsCommandList::SetGraphicsRootShaderResourceView");
+}
+void STDMETHODCALLTYPE CommandList::SetComputeRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    SetRootView(compute_, index, D3D12_ROOT_PARAMETER_TYPE_UAV, address, "ID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView");
+}
+void STDMETHODCALLTYPE CommandList::SetGraphicsRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    SetRootView(graphics_, index, D3D12_ROOT_PARAMETER_TYPE_UAV, address, "ID3D12GraphicsCommandList::SetGraphicsRootUnorderedAccessView");
+}
 
 void STDMETHODCALLTYPE CommandList::IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) {
     if (view == nullptr || view->BufferLocation == 0) {
@@ -486,10 +593,10 @@ void STDMETHODCALLTYPE CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_H
     Check(Recorder(function).ClearRenderTarget(record.attachment, color, list, error), function, error);
 }
 void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT[4], UINT, const D3D12_RECT*) {
-    NotYet("ID3D12GraphicsCommandList::ClearUnorderedAccessViewUint");
+    AbxUnsupported("ID3D12GraphicsCommandList::ClearUnorderedAccessViewUint", "unordered access view clears are not implemented yet");
 }
 void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const float[4], UINT, const D3D12_RECT*) {
-    NotYet("ID3D12GraphicsCommandList::ClearUnorderedAccessViewFloat");
+    AbxUnsupported("ID3D12GraphicsCommandList::ClearUnorderedAccessViewFloat", "unordered access view clears are not implemented yet");
 }
 void STDMETHODCALLTYPE CommandList::BeginQuery(ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT) { AbxUnsupported("ID3D12GraphicsCommandList::BeginQuery", "queries"); }
 void STDMETHODCALLTYPE CommandList::EndQuery(ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT) { AbxUnsupported("ID3D12GraphicsCommandList::EndQuery", "queries"); }
@@ -498,7 +605,7 @@ void STDMETHODCALLTYPE CommandList::ResolveQueryData(ID3D12QueryHeap*, D3D12_QUE
 }
 void STDMETHODCALLTYPE CommandList::SetPredication(ID3D12Resource*, UINT64, D3D12_PREDICATION_OP) { AbxUnsupported("ID3D12GraphicsCommandList::SetPredication", "predication"); }
 void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64) {
-    NotYet("ID3D12GraphicsCommandList::ExecuteIndirect");
+    RootMappingUnknown("ID3D12GraphicsCommandList::ExecuteIndirect");
 }
 
 }

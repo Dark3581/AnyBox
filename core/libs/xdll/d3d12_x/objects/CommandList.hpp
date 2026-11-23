@@ -3,9 +3,12 @@
 #include "CommandAllocator.hpp"
 #include "CommandRecorder.hpp"
 #include "DescriptorHeap.hpp"
+#include "PipelineObject.hpp"
+#include "RootSignature.hpp"
 #include "ObjectBase.hpp"
 #include "Resource.hpp"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -14,6 +17,11 @@
 #include <vector>
 
 namespace abx::d3d12x {
+
+struct RootArguments {
+    const RootSignature* signature = nullptr;
+    std::array<std::uint32_t, kRootSignatureWordLimit> words{};
+};
 
 class CommandList final : public DeviceChildBase<ID3D12GraphicsCommandList> {
 public:
@@ -80,6 +88,9 @@ public:
     DescriptorHeap* SamplerHeap() const { return samplerHeap_; }
     const std::vector<AttachmentRef>& RenderTargets() const { return renderTargets_; }
     const std::optional<AttachmentRef>& DepthStencil() const { return depthStencil_; }
+    const PipelineStateObject* Pipeline() const { return pipeline_; }
+    const RootArguments& GraphicsArguments() const { return graphics_; }
+    const RootArguments& ComputeArguments() const { return compute_; }
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -94,6 +105,12 @@ private:
     BufferRef WindowRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 bytes, const char* function) const;
     const DescriptorRecord& Attachment(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_DESCRIPTOR_HEAP_TYPE type, const char* function) const;
     void ResetBindings();
+    void BindPipeline(ID3D12PipelineState* state, const char* function);
+    void SetSignature(RootArguments& arguments, ID3D12RootSignature* signature, const char* function);
+    const RootParameterLayout& Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const;
+    void SetConstants(RootArguments& arguments, UINT index, UINT count, const void* data, UINT offset, const char* function);
+    void SetRootView(RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address, const char* function);
+    void SetTable(RootArguments& arguments, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle, const char* function);
 
     ResourceContext context_;
     D3D12_COMMAND_LIST_TYPE type_;
@@ -104,6 +121,9 @@ private:
     DescriptorHeap* samplerHeap_ = nullptr;
     std::vector<AttachmentRef> renderTargets_;
     std::optional<AttachmentRef> depthStencil_;
+    PipelineStateObject* pipeline_ = nullptr;
+    RootArguments graphics_;
+    RootArguments compute_;
 };
 
 }
