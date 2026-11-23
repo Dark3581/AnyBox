@@ -40,6 +40,12 @@ std::optional<DescriptorSizes> DescriptorSizesFromSettings(std::string& error) {
     return sizes;
 }
 
+DeviceRequirements DeviceRequirementsFromSettings(DeviceRequirements requirements) {
+    const char* preferred = AbxSetting("d3d12_x.vulkan_device");
+    if (preferred != nullptr) requirements.preferredDevice = preferred;
+    return requirements;
+}
+
 std::optional<UINT> DescriptorIncrement(const DescriptorSizes& sizes, D3D12_DESCRIPTOR_HEAP_TYPE type, std::string& error) {
     const char* name = nullptr;
     std::optional<UINT> size;

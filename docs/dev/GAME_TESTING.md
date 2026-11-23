@@ -77,6 +77,7 @@ Each value a library reads is logged with its source (`setting ... = 32 (from an
 | `d3d12_x.descriptor_size.sampler` | descriptor handle increment of sampler heaps |
 | `d3d12_x.descriptor_size.render_target` | descriptor handle increment of render target heaps |
 | `d3d12_x.descriptor_size.depth_stencil` | descriptor handle increment of depth-stencil heaps |
+| `d3d12_x.vulkan_device` | part of the name of the GPU to use, case-insensitive, when several are installed (`python tools/gpu_report.py` lists them); without it the best native GPU is used, and a layered driver such as Dozen only when nothing else can run the title |
 
 ## Static analysis with Ghidra
 

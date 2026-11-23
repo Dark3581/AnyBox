@@ -19,7 +19,10 @@ struct DeviceRequirements {
     bool maintenance8 = false;
     bool validation = false;
     bool hostMemoryImport = false;
+    std::string preferredDevice;
 };
+
+int DeviceScore(VkPhysicalDeviceType type, VkDriverId driver, const std::string& name, const std::string& preferred);
 
 struct DeviceFunctions {
     PFN_vkDestroyDevice destroyDevice = nullptr;
@@ -130,6 +133,7 @@ public:
     bool Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
     std::mutex& QueueLock() const { return queueLock_; }
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
+    bool PreferenceMissed() const { return preferenceMissed_; }
     bool HasFeature(const std::string& name) const;
     const std::vector<std::string>& EnabledExtensions() const { return extensions_; }
     bool CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const;
@@ -159,6 +163,7 @@ private:
     VkPhysicalDeviceProperties properties_{};
     VkPhysicalDeviceVulkan12Properties limits12_{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     std::uint32_t queueFamily_ = 0;
+    bool preferenceMissed_ = false;
     VkQueue queue_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory_{};
     bool bufferDeviceAddress_ = false;

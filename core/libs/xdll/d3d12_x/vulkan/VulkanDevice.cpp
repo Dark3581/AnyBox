@@ -2,6 +2,7 @@
 #include "TitleLayout.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace abx::d3d12x {
@@ -217,6 +218,34 @@ VulkanDevice::~VulkanDevice() {
     instance_.Reset();
 }
 
+namespace {
+
+constexpr int kPreferredBonus = 100;
+
+std::string Lower(std::string text) {
+    for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return text;
+}
+
+}
+
+int DeviceScore(VkPhysicalDeviceType type, VkDriverId driver, const std::string& name, const std::string& preferred) {
+    int score = 0;
+    if (driver == VK_DRIVER_ID_MESA_DOZEN) {
+        score = 2;
+    } else if (type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        score = 4;
+    } else if (type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        score = 3;
+    } else if (type == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU) {
+        score = 1;
+    }
+    if (!preferred.empty() && Lower(name).find(Lower(preferred)) != std::string::npos) {
+        score += kPreferredBonus;
+    }
+    return score;
+}
+
 bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& error) {
     for (const std::string& name : requirements.features) {
         if (FindFeature(name) == nullptr) {
@@ -371,9 +400,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
             reject("no queue family with graphics and compute");
             continue;
         }
-        const int score = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2
-                          : properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1
-                                                                                                         : 0;
+        const int score = DeviceScore(properties.properties.deviceType, limits.driverID, name, requirements.preferredDevice);
         if (score > bestScore) {
             bestScore = score;
             physical_ = candidate;
@@ -388,6 +415,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         error = "no Vulkan device can run the title's shaders: " + reasons;
         return false;
     }
+    preferenceMissed_ = !requirements.preferredDevice.empty() && bestScore < kPreferredBonus;
 
     gpu_ = DescribePhysicalDevice(loader, rawInstance, physical_);
     FeatureChain supported;

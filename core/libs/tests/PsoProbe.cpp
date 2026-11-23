@@ -3343,6 +3343,35 @@ int DescriptorsGpu(bool validate) {
     return status;
 }
 
+int DeviceSelection() {
+    const VkDriverId nvidia = VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+    const VkDriverId dozen = VK_DRIVER_ID_MESA_DOZEN;
+    const int discrete = DeviceScore(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, nvidia, "GeForce", "");
+    const int integrated = DeviceScore(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS, "Intel UHD", "");
+    const int layered = DeviceScore(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, dozen, "Microsoft Direct3D12 (GeForce)", "");
+    const int software = DeviceScore(VK_PHYSICAL_DEVICE_TYPE_CPU, VK_DRIVER_ID_MESA_LLVMPIPE, "llvmpipe", "");
+    if (!(discrete > integrated && integrated > layered && layered > software)) return Fail("native discrete, native integrated, then a layered driver, then a CPU device");
+    if (DeviceScore(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS, "Intel UHD", "uhd") <= discrete) return Fail("a preferred device wins over a better one");
+    if (DeviceScore(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, nvidia, "GeForce", "radeon") != discrete) return Fail("a preference that does not match changes nothing");
+    std::puts("PASS device selection selftest");
+    DeviceRequirements requirements;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return kNoDevice;
+    }
+    const std::string name = device->Gpu().name;
+    requirements.preferredDevice = name.substr(name.size() / 2);
+    const std::unique_ptr<VulkanDevice> preferred = VulkanDevice::Create(requirements, error);
+    requirements.preferredDevice = "no such device name";
+    const std::unique_ptr<VulkanDevice> missed = VulkanDevice::Create(requirements, error);
+    if (!preferred || preferred->Gpu().name != name || preferred->PreferenceMissed()) return Fail("a preference matching part of the name selects that device");
+    if (!missed || missed->Gpu().name != name || !missed->PreferenceMissed()) return Fail("an unmatched preference falls back to the best device and says so");
+    std::printf("PASS device selection gpu (%s)\n", name.c_str());
+    return 0;
+}
+
 int SettingsSelfTest() {
     std::string error;
     std::optional<UINT> size;
@@ -3359,6 +3388,7 @@ int SettingsSelfTest() {
     const auto show = [](const std::optional<UINT>& value) { return value ? std::to_string(*value) : std::string("unset"); };
     std::printf("sizes %s %s %s %s\n", show(sizes->shaderResource).c_str(), show(sizes->sampler).c_str(), show(sizes->renderTarget).c_str(),
                 show(sizes->depthStencil).c_str());
+    std::printf("vulkan device %s\n", DeviceRequirementsFromSettings({}).preferredDevice.c_str());
     const char* other = AbxSetting("other.key");
     std::printf("other %s missing %s\n", other != nullptr ? other : "null", AbxSetting("never.set") == nullptr ? "null" : "set");
     return 0;
@@ -3576,6 +3606,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "buffers-selftest") == 0) return BuffersSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "rootsig-selftest") == 0) return RootSignatureSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "settings-selftest") == 0) return SettingsSelfTest();
+    if (argc == 2 && std::strcmp(argv[1], "device-selection") == 0) return DeviceSelection();
     if (argc >= 2 && std::strcmp(argv[1], "fence-gpu") == 0) return FenceGpu(HasFlag(argc, argv, "--validate"));
     if (argc == 2 && std::strcmp(argv[1], "arena-selftest") == 0) return ArenaSelfTest();
     if (argc >= 2 && std::strcmp(argv[1], "resources-gpu") == 0) return ResourcesGpu(HasFlag(argc, argv, "--validate"));
@@ -3591,6 +3622,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | settings-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate] | descriptors-gpu [--validate] | pso-objects <store> compute <cs container> | graphics <vs container> <ps container> [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | settings-selftest | device-selection | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate] | descriptors-gpu [--validate] | pso-objects <store> compute <cs container> | graphics <vs container> <ps container> [--validate]");
     return 2;
 }

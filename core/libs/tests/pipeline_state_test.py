@@ -61,10 +61,10 @@ def check_settings(args, env):
                       "not a setting\n"
                       "d3d12_x.descriptor_size.render_target = 64\n"
                       "d3d12_x.descriptor_size.render_target = 128\n", encoding="utf-8")
-    settings_env = dict(env, ANYBOX_CONFIG=str(config), ANYBOX_SET="d3d12_x.descriptor_size.depth_stencil=48; other.key = x")
+    settings_env = dict(env, ANYBOX_CONFIG=str(config), ANYBOX_SET="d3d12_x.descriptor_size.depth_stencil=48; other.key = x; d3d12_x.vulkan_device = rtx")
     checked = subprocess.run([str(args.probe), "settings-selftest"], capture_output=True, text=True, env=settings_env, timeout=60)
     assert checked.returncode == 0, (checked.stdout, checked.stderr)
-    assert "sizes 32 16 128 48" in checked.stdout and "other x missing null" in checked.stdout, checked.stdout
+    assert "sizes 32 16 128 48" in checked.stdout and "other x missing null" in checked.stdout and "vulkan device rtx" in checked.stdout, checked.stdout
     log = checked.stderr
     assert "read 3 setting(s) from" in log, log
     assert "anybox.cfg:5: ignored, not a lower-case key = value" in log, log
@@ -199,6 +199,9 @@ def main():
     assert "PASS root signature selftest" in run([args.probe, "rootsig-selftest"], env)
     assert "PASS arena selftest" in run([args.probe, "arena-selftest"], env)
     check_settings(args, env)
+    selection = subprocess.run([str(args.probe), "device-selection"], capture_output=True, text=True, env=env, timeout=120)
+    print(selection.stdout.strip())
+    assert selection.returncode in (0, 3) and "PASS device selection selftest" in selection.stdout, (selection.stdout, selection.stderr)
     for command in ("states-gpu", "textures-gpu", "views-gpu", "commands-gpu", "draw-gpu", "indirect-gpu", "planes-gpu", "fence-gpu", "resources-gpu", "commandlist-gpu", "descriptors-gpu"):
         checked = subprocess.run([str(args.probe), command, "--validate"], capture_output=True, text=True, env=env, timeout=600)
         if checked.returncode == 4:
