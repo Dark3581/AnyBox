@@ -47,7 +47,6 @@ ABX_API HRESULT XClosedCaptionGetProperties() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XClosedCaptionSetEnabled() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XDisplayAcquireTimeoutDeferral() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XDisplayCloseTimeoutDeferralHandle() { AbxNotImplemented(__func__); }
-ABX_API HRESULT XDisplayTryEnableHdrMode() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XErrorSetCallback() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XErrorSetOptions() { AbxNotImplemented(__func__); }
 ABX_API HRESULT XGameActivationAcceptPendingInvite() { AbxNotImplemented(__func__); }

@@ -137,7 +137,7 @@ ABX_API HRESULT XClosedCaptionGetProperties();
 ABX_API HRESULT XClosedCaptionSetEnabled();
 ABX_API HRESULT XDisplayAcquireTimeoutDeferral();
 ABX_API HRESULT XDisplayCloseTimeoutDeferralHandle();
-ABX_API HRESULT XDisplayTryEnableHdrMode();
+ABX_API std::uint32_t XDisplayTryEnableHdrMode(std::uint32_t preference, void* info);
 ABX_API HRESULT XErrorSetCallback();
 ABX_API HRESULT XErrorSetOptions();
 ABX_API HRESULT XGameActivationAcceptPendingInvite();

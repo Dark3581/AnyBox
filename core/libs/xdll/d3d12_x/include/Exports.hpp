@@ -18,7 +18,7 @@
 #undef D3D12CreateRootSignatureDeserializer
 #undef D3D12CreateVersionedRootSignatureDeserializer
 
-ABX_API HRESULT D3D12XboxCreateDevice();
+ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters, REFIID riid, void** device);
 ABX_API HRESULT D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL minimumFeatureLevel, REFIID iid, void** device);
 ABX_API HRESULT D3D12GetDebugInterface(REFIID iid, void** debug);
 ABX_API HRESULT D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* rootSignature, D3D_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob, ID3DBlob** errorBlob);

@@ -55,7 +55,15 @@ HRESULT Resource::CreateCommitted(const ResourceContext& context, IUnknown* pare
     return result;
 }
 
-bool Resource::CreateBuffer(std::string& error) {
+namespace {
+
+constexpr UINT kBufferFlags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                              D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+constexpr UINT kDesktopResourceFlags = 0xFFFF;
+
+}
+
+bool Resource::CheckBufferDesc(UINT allowedFlags, std::string& error) const {
     if (desc_.Width == 0 || desc_.Height != 1 || desc_.DepthOrArraySize != 1 || desc_.MipLevels != 1 || desc_.Format != DXGI_FORMAT_UNKNOWN || desc_.SampleDesc.Count != 1 ||
         desc_.SampleDesc.Quality != 0 || desc_.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
         error = "a buffer description needs a nonzero width, height, depth and mips of 1, format UNKNOWN, one sample and the row-major layout";
@@ -65,10 +73,60 @@ bool Resource::CreateBuffer(std::string& error) {
         error = "buffer alignment " + std::to_string(desc_.Alignment) + " is not 0 or 64 KiB";
         return false;
     }
-    const UINT unsupported = static_cast<UINT>(desc_.Flags) & ~static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
-                                                                                D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    const UINT unsupported = static_cast<UINT>(desc_.Flags) & ~allowedFlags;
     if (unsupported != 0) {
         error = "buffer flags " + std::to_string(unsupported) + " are not supported";
+        return false;
+    }
+    return true;
+}
+
+HRESULT Resource::CreateAtTitleAddress(const ResourceContext& context, IUnknown* parent, std::uint64_t address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** resource,
+                                       std::string& error) {
+    if (resource == nullptr) {
+        error = "no output for the resource";
+        return E_POINTER;
+    }
+    *resource = nullptr;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        AbxUnsupported("ID3D12Device (resource at a title address)", "a texture at a title address: its tiling and Vulkan image are not mapped yet");
+    }
+    if (address == 0 || address % kBufferPlacementAlignment != 0) {
+        error = "a title address of " + std::to_string(address) + " is null or not 64 KiB aligned";
+        return E_INVALIDARG;
+    }
+    MEMORY_BASIC_INFORMATION region{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT) {
+        error = "the title address is not committed memory";
+        return E_INVALIDARG;
+    }
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1};
+    Resource* created = new Resource(context, parent, heap, D3D12_HEAP_FLAG_NONE, desc);
+    if (!created->CheckBufferDesc(kBufferFlags | ~kDesktopResourceFlags, error)) {
+        created->Release();
+        return E_INVALIDARG;
+    }
+    const UINT consoleFlags = static_cast<UINT>(desc.Flags) & ~kDesktopResourceFlags;
+    if (consoleFlags != 0) {
+        AbxTrace("resource at title address 0x%llx: console-only flags 0x%x recorded, not applied", static_cast<unsigned long long>(address), consoleFlags);
+    }
+    created->titleAddress_ = address;
+    created->desc_.Alignment = kBufferPlacementAlignment;
+    const HRESULT result = created->QueryInterface(riid, resource);
+    created->Release();
+    if (FAILED(result)) error = "the resource does not implement the requested interface";
+    return result;
+}
+
+BufferRef Resource::Buffer() const {
+    if (titleAddress_ != 0) {
+        AbxUnsupported("ID3D12Resource", "GPU access to a buffer at a title address: the title's own memory has no Vulkan backing yet");
+    }
+    return {context_.window.Buffer(), offset_, desc_.Width};
+}
+
+bool Resource::CreateBuffer(std::string& error) {
+    if (!CheckBufferDesc(kBufferFlags, error)) {
         return false;
     }
     const std::uint64_t bytes = (desc_.Width + kBufferPlacementAlignment - 1) / kBufferPlacementAlignment * kBufferPlacementAlignment;
@@ -209,7 +267,7 @@ HRESULT STDMETHODCALLTYPE Resource::Map(UINT subresource, const D3D12_RANGE*, vo
     }
     ++maps_;
     if (data != nullptr) {
-        *data = context_.window.Base() + offset_;
+        *data = titleAddress_ != 0 ? reinterpret_cast<void*>(titleAddress_) : static_cast<void*>(context_.window.Base() + offset_);
     }
     return S_OK;
 }
@@ -221,6 +279,7 @@ void STDMETHODCALLTYPE Resource::Unmap(UINT subresource, const D3D12_RANGE*) {
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE Resource::GetGPUVirtualAddress() {
+    if (titleAddress_ != 0) return titleAddress_;
     return IsBuffer() ? context_.window.Start() + offset_ : 0;
 }
 

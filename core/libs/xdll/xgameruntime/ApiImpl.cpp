@@ -281,6 +281,41 @@ const void* const kPackageTable[] = {
 
 ApiObject g_package{kPackageTable, &kPackageInterface, "package"};
 
+constexpr GUID kPersistentStorageProvider{0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
+constexpr GUID kPersistentStorageInterface{0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
+
+HRESULT PersistentStorageGetPath(ApiObject*, std::size_t size, char* path, std::size_t* used) {
+    return XPersistentLocalStorageGetPath(size, path, used);
+}
+
+const void* const kPersistentStorageTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&Unmapped<3>),
+    Entry(&PersistentStorageGetPath),
+    Entry(&Unmapped<5>),
+};
+
+ApiObject g_persistentStorage{kPersistentStorageTable, &kPersistentStorageInterface, "persistent local storage"};
+
+constexpr GUID kDisplayProvider{0x03f0fe74, 0xfdd9, 0x4e5c, {0xb6, 0x30, 0xf9, 0x33, 0x9c, 0x47, 0xac, 0xc5}};
+constexpr GUID kDisplayInterface{0x35f07670, 0x706e, 0x4bfb, {0x94, 0x76, 0x09, 0x07, 0x98, 0xc5, 0xeb, 0xf3}};
+
+std::uint32_t DisplayTryEnableHdrMode(ApiObject*, std::uint32_t preference, void* info) {
+    return XDisplayTryEnableHdrMode(preference, info);
+}
+
+const void* const kDisplayTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&Unmapped<3>),
+    Entry(&DisplayTryEnableHdrMode),
+};
+
+ApiObject g_display{kDisplayTable, &kDisplayInterface, "display"};
+
 struct ApiInterface {
     const GUID& provider;
     const GUID& interfaceId;
@@ -292,6 +327,8 @@ const ApiInterface kInterfaces[] = {
     {kNetworkingProvider, kNetworkingInterface, g_networking},
     {kUserInterface, kUserInterface, g_user},
     {kPackageProvider, kPackageInterface, g_package},
+    {kPersistentStorageProvider, kPersistentStorageInterface, g_persistentStorage},
+    {kDisplayProvider, kDisplayInterface, g_display},
 };
 
 }

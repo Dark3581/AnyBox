@@ -2587,7 +2587,13 @@ int FenceGpu(bool validate) {
     expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence), error)) && fence != nullptr, "create fence: " + error);
     expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&other), error)) && other != nullptr, "create second fence");
     void* nothing = nullptr;
-    expect(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), &nothing, error) == E_INVALIDARG && nothing == nullptr, "shared fence refused");
+    expect(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER, __uuidof(ID3D12Fence), &nothing, error) == E_INVALIDARG && nothing == nullptr,
+           "cross-adapter fence refused");
+    ID3D12Fence* shared = nullptr;
+    expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&shared), error)) && shared != nullptr &&
+               shared->GetCreationFlags() == D3D12_FENCE_FLAG_SHARED,
+           "shared fence keeps its flags: " + error);
+    if (shared != nullptr) shared->Release();
     D3D12_COMMAND_QUEUE_DESC directDesc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     D3D12_COMMAND_QUEUE_DESC computeDesc{D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, 0};
     ID3D12CommandQueue* direct = nullptr;

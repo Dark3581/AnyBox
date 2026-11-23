@@ -59,9 +59,23 @@ HRESULT DescriptorHeap::Create(const ResourceContext& context, IUnknown* parent,
     return result;
 }
 
+D3D12_GPU_DESCRIPTOR_HANDLE DescriptorHeap::GpuStart() const {
+    if (!ShaderVisible()) return {0};
+    if (titleMemory_) return {reinterpret_cast<UINT64>(memory_)};
+    return {context_.window.Start() + offset_};
+}
+
 bool DescriptorHeap::Allocate(std::string& error) {
     const std::uint64_t bytes = static_cast<std::uint64_t>(desc_.NumDescriptors) * increment_;
-    if (ShaderVisible()) {
+    if (context_.titleMemory != nullptr) {
+        const TitleAllocator& title = *context_.titleMemory;
+        memory_ = static_cast<std::uint8_t*>(title.allocate(static_cast<std::size_t>(bytes), title.descriptorHeapAttributes));
+        if (memory_ == nullptr) {
+            error = "the title's allocator returned no memory for " + std::to_string(bytes) + " bytes of descriptors";
+            return false;
+        }
+        titleMemory_ = true;
+    } else if (ShaderVisible()) {
         const std::optional<std::uint64_t> offset = context_.arena.Allocate(bytes, kBufferPlacementAlignment);
         if (!offset) {
             error = "the buffer window has no free range of " + std::to_string(bytes) + " bytes for a shader-visible descriptor heap";
@@ -89,6 +103,7 @@ DescriptorHeap::~DescriptorHeap() {
         registry.heaps.erase(reinterpret_cast<SIZE_T>(memory_));
     }
     if (allocated_) context_.arena.Free(offset_);
+    if (titleMemory_) context_.titleMemory->release(memory_, context_.titleMemory->descriptorHeapAttributes);
 }
 
 bool DescriptorHeap::Implements(REFIID riid) const {

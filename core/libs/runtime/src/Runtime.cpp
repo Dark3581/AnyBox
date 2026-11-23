@@ -1,3 +1,4 @@
+#include "CpuFixups.hpp"
 #include "AbxRuntime.hpp"
 #include "LoaderRedirect.hpp"
 #include "Settings.hpp"
@@ -471,6 +472,7 @@ void Start() {
     }
     SetUnhandledExceptionFilter(UnhandledException);
     g_keepFilter = AddVectoredExceptionHandler(0, KeepFilter);
+    abx::InstallCpuFixups();
     abx::InstallLoaderRedirect();
     WaitForDebugger();
 }

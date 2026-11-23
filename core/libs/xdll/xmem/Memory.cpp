@@ -1,7 +1,9 @@
 #include "xdll/xmem/xmem.hpp"
+#include "PhysicalMemory.hpp"
 
 #include <malloc.h>
 
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -59,17 +61,56 @@ void* Allocate(std::size_t size) {
 
 }
 
+namespace {
+
+struct TitleAllocationHooks {
+    void* (*allocate)(std::size_t size, std::uint64_t attributes);
+    void (*release)(void* address, std::uint64_t attributes);
+};
+
+const TitleAllocationHooks* TitleHooks() {
+    static const TitleAllocationHooks* hooks = [] {
+        const auto* found = reinterpret_cast<const TitleAllocationHooks*>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(nullptr), "__XMemAllocationHooks__")));
+        AbxLog("xmem", found != nullptr ? "the title exports __XMemAllocationHooks__: XMemAlloc and XMemFree go through its routines"
+                                        : "the title exports no __XMemAllocationHooks__: XMemAlloc and XMemFree use the default allocator");
+        return found;
+    }();
+    return hooks;
+}
+
+}
+
 ABX_API void* XMemAlloc(std::size_t size, std::uint64_t attributes) {
+    const TitleAllocationHooks* hooks = TitleHooks();
+    if (hooks != nullptr && hooks->allocate != nullptr) {
+        void* const address = hooks->allocate(size, attributes);
+        AbxTrace("XMemAlloc(%zu, 0x%llx) -> %p through the title's hook", size, static_cast<unsigned long long>(attributes), address);
+        return address;
+    }
+    return XMemAllocDefault(size, attributes);
+}
+
+ABX_API void XMemFree(void* address, std::uint64_t attributes) {
+    const TitleAllocationHooks* hooks = TitleHooks();
+    if (hooks != nullptr && hooks->release != nullptr) {
+        AbxTrace("XMemFree(%p, 0x%llx) through the title's hook", address, static_cast<unsigned long long>(attributes));
+        hooks->release(address, attributes);
+        return;
+    }
+    XMemFreeDefault(address, attributes);
+}
+
+ABX_API void* XMemAllocDefault(std::size_t size, std::uint64_t attributes) {
     if (size == 0) {
         AbxUnsupported(__func__, "size is 0");
     }
     void* const address = Allocate(size);
-    AbxTrace("XMemAlloc(%zu, 0x%llx) -> %p", size, static_cast<unsigned long long>(attributes), address);
+    AbxTrace("XMemAllocDefault(%zu, 0x%llx) -> %p", size, static_cast<unsigned long long>(attributes), address);
     return address;
 }
 
-ABX_API void XMemFree(void* address, std::uint64_t attributes) {
-    AbxTrace("XMemFree(%p, 0x%llx)", address, static_cast<unsigned long long>(attributes));
+ABX_API void XMemFreeDefault(void* address, std::uint64_t attributes) {
+    AbxTrace("XMemFreeDefault(%p, 0x%llx)", address, static_cast<unsigned long long>(attributes));
     if (address == nullptr) {
         AbxUnsupported(__func__, "address is null");
     }
@@ -85,7 +126,7 @@ ABX_API void XMemFree(void* address, std::uint64_t attributes) {
         }
     }
     if (!known) {
-        AbxUnsupported(__func__, "address was not returned by XMemAlloc");
+        AbxUnsupported(__func__, "address was not returned by XMemAllocDefault");
     }
     Release(address, block);
 }
@@ -109,8 +150,10 @@ ABX_API BOOL XMemGetWorkingSetStatistics(std::uint32_t request, void* statistics
 
 namespace {
 
-constexpr std::uint32_t kDesktopAllocationTypes = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN;
-constexpr std::uint32_t kConsoleOnlyAllocationTypes = 0x00400000u | 0x20000000u;
+constexpr std::uint32_t kPlaceholderTypes = abx::xmem::kReservePlaceholder | abx::xmem::kReplacePlaceholder;
+constexpr std::uint32_t kDesktopAllocationTypes = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | kPlaceholderTypes;
+constexpr std::uint32_t kPhysicalAllocationType = 0x00400000u;
+constexpr std::uint32_t kConsoleOnlyAllocationTypes = kPhysicalAllocationType | 0x20000000u;
 constexpr std::uint32_t kProtectionValues[] = {PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
                                                PAGE_EXECUTE_WRITECOPY};
 
@@ -126,13 +169,35 @@ bool StandardProtection(std::uint32_t protection) {
 ABX_API void* XMemVirtualAlloc(void* address, std::size_t size, std::uint32_t allocationType, std::uint64_t attributes, std::uint32_t protect) {
     const std::uint32_t unknownTypes = allocationType & ~(kDesktopAllocationTypes | kConsoleOnlyAllocationTypes);
     if (unknownTypes != 0) {
-        AbxUnsupported(__func__, "allocation type bits that are neither desktop nor known console-only flags");
+        char message[160];
+        std::snprintf(message, sizeof(message), "allocation type 0x%x has bits 0x%x that are neither desktop nor known console-only flags (protect 0x%x, attributes 0x%llx)",
+                      allocationType, unknownTypes, protect, static_cast<unsigned long long>(attributes));
+        AbxUnsupported(__func__, message);
     }
     const std::uint32_t protection = protect & 0xFFu;
     if (!StandardProtection(protection)) {
-        AbxUnsupported(__func__, "a page protection whose low byte is not one standard protection value");
+        char message[128];
+        std::snprintf(message, sizeof(message), "page protection 0x%x: its low byte is not one standard protection value (type 0x%x)", protect, allocationType);
+        AbxUnsupported(__func__, message);
     }
-    void* result = VirtualAlloc(address, size, allocationType & kDesktopAllocationTypes, protection);
+    if ((allocationType & kPhysicalAllocationType) != 0 && (allocationType & MEM_COMMIT) == 0) {
+        if ((allocationType & abx::xmem::kReservePlaceholder) != 0) {
+            AbxUnsupported(__func__, "a physical page window that is itself reserved as a placeholder");
+        }
+        void* window = nullptr;
+        if ((allocationType & abx::xmem::kReplacePlaceholder) != 0) {
+            window = abx::xmem::AdoptPhysicalWindow(address, size, protection);
+        } else if (address == nullptr) {
+            window = abx::xmem::ReservePhysicalWindow(size, protection);
+        } else {
+            AbxUnsupported(__func__, "a physical page window at a fixed address that is not a placeholder");
+        }
+        AbxTrace("XMemVirtualAlloc(%p, 0x%zx, type 0x%x, attributes 0x%llx, protect 0x%x) = %p (physical page window, views mapped with protection 0x%x)", address, size,
+                 allocationType, static_cast<unsigned long long>(attributes), protect, window, protection);
+        return window;
+    }
+    void* result = (allocationType & kPlaceholderTypes) != 0 ? abx::xmem::AllocateWithPlaceholders(address, size, allocationType & kDesktopAllocationTypes, protection)
+                                                             : VirtualAlloc(address, size, allocationType & kDesktopAllocationTypes, protection);
     AbxTrace("XMemVirtualAlloc(%p, 0x%zx, type 0x%x, attributes 0x%llx, protect 0x%x) = %p (console-only type bits 0x%x and protection bits 0x%x dropped)", address, size,
              allocationType, static_cast<unsigned long long>(attributes), protect, result, allocationType & kConsoleOnlyAllocationTypes, protect & ~0xFFu);
     return result;

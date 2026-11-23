@@ -141,7 +141,7 @@ void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const 
         if (desc == nullptr) {
             AbxUnsupported(function, "a buffer shader resource view without a description");
         }
-        const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Buffer().size, *desc, error);
+        const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Width(), *desc, error);
         Check(words.has_value(), function, error);
         WriteWords(target, words->data(), kBufferDescriptorBytes);
         DescriptorRecord record;
@@ -151,6 +151,19 @@ void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const 
         return;
     }
     WriteImageView(ours, ShaderResourceView(ours->Texture().desc, desc, error), false, target, function, error);
+}
+
+void DescriptorWriter::CreateShaderResourceViewAt(std::uint64_t address, std::uint64_t bytes, const D3D12_SHADER_RESOURCE_VIEW_DESC& desc,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    const char* function = "ID3D12Device::CreateShaderResourceView (buffer at an address)";
+    const Target target = Resolve(destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, function);
+    std::string error;
+    const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(address, bytes, desc, error);
+    Check(words.has_value(), function, error);
+    WriteWords(target, words->data(), kBufferDescriptorBytes);
+    DescriptorRecord record;
+    record.kind = HeapEntry::Buffer;
+    target.heap->Record(target.index) = record;
 }
 
 void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
@@ -172,7 +185,7 @@ void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D1
         if (desc == nullptr) {
             AbxUnsupported(function, "a buffer unordered access view without a description");
         }
-        const std::optional<BufferDescriptorWords> words = UnorderedAccessBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Buffer().size, *desc, counter != nullptr, error);
+        const std::optional<BufferDescriptorWords> words = UnorderedAccessBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Width(), *desc, counter != nullptr, error);
         Check(words.has_value(), function, error);
         WriteWords(target, words->data(), kBufferDescriptorBytes);
         DescriptorRecord record;
