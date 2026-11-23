@@ -75,7 +75,7 @@ def combine_chunks(chunks, entries):
                 stage[key] = stage.get(key, 0) + value
         problems.extend(chunk["problems"])
     failed = [{"start": chunk["start"], "count": chunk["count"], "exit_code": chunk["exit_code"], "last_compiling": chunk["last_compiling"]}
-              for chunk in chunks if not pipelines_passed(chunk)]
+              for chunk in chunks if chunk_failed(chunk)]
     exit_codes = [chunk["exit_code"] for chunk in chunks if chunk["exit_code"] != 0]
     totals = {key: sum(stage.get(key, 0) for stage in stages.values()) for key in TOTALS}
     return {"complete": covered == entries and all(chunk["complete"] for chunk in chunks), "stages": stages, "totals": totals,
@@ -100,6 +100,16 @@ def parse_pipelines(text):
             complete = True
     totals = {key: sum(stage.get(key, 0) for stage in stages.values()) for key in TOTALS}
     return {"complete": complete, "stages": stages, "totals": totals, "problems": problems, "last_compiling": last_compiling}
+
+
+def size_skips(result):
+    return [problem["name"] for problem in result["problems"] if problem["kind"] == "big_skip"]
+
+
+def chunk_failed(chunk):
+    totals = chunk["totals"]
+    return (chunk.get("exit_code") != 0 or not chunk["complete"] or totals["modules_failed"] != 0 or totals["pipelines_failed"] != 0
+            or any(problem["kind"] in ("pipeline_fail", "module_fail") for problem in chunk["problems"]))
 
 
 def pipelines_passed(result):
@@ -257,21 +267,29 @@ def main(argv=None):
                          "seconds": round(time.monotonic() - began, 1)}
                 chunks.append(chunk)
                 totals = chunk["totals"]
+                over = len(size_skips(chunk))
                 print(f"build_shaders: pipelines [{start}, {start + count}): {totals['pipelines_ok']} ok, {totals['pipelines_failed']} failed, "
-                      f"{totals['pipelines_skipped']} skipped; exit {code}" + ("" if pipelines_passed(chunk) else f"; FAILED, see {log}"), flush=True)
+                      f"{totals['pipelines_skipped']} skipped" + (f", {over} over the size limit" if over else "") + f"; exit {code}"
+                      + (f"; FAILED, see {log}" if chunk_failed(chunk) else ""), flush=True)
                 summary["pipelines"] = {**combine_chunks(chunks, len(index)), "checker": identity, "chunk": args.pipeline_chunk, "chunks": chunks}
                 save(paths, summary)
             result = {**combine_chunks(chunks, len(index)), "checker": identity, "chunk": args.pipeline_chunk, "chunks": chunks}
             summary["pipelines"] = result
             save(paths, summary)
             totals = result["totals"]
-            print(f"build_shaders: pipelines {totals['pipelines_ok']} ok, {totals['pipelines_failed']} failed, {totals['pipelines_skipped']} skipped; "
-                  f"modules {totals['modules_failed']} failed; {len(result['failed_chunks'])} of {len(chunks)} chunks failed", flush=True)
+            over = size_skips(result)
+            print(f"build_shaders: pipelines {totals['pipelines_ok']} ok, {totals['pipelines_failed']} failed, {totals['pipelines_skipped']} skipped, "
+                  f"{len(over)} not checked (over the size limit); modules {totals['modules_failed']} failed; "
+                  f"{len(result['failed_chunks'])} of {len(chunks)} chunks failed", flush=True)
             for failed in result["failed_chunks"]:
                 print(f"build_shaders:   [{failed['start']}, {failed['start'] + failed['count']}) exit {failed['exit_code']}, "
                       f"last named compile {failed['last_compiling']}", flush=True)
-            if not pipelines_passed(result):
+            for name in over:
+                print(f"build_shaders:   not checked: {name}", flush=True)
+            if result["failed_chunks"] or totals["modules_failed"] or totals["pipelines_failed"]:
                 raise BuildError(f"the pipeline check did not pass; chunk logs are in {paths['pipelines_logs']}")
+            if not pipelines_passed(result):
+                raise BuildError(f"the pipeline check is incomplete: {len(over)} modules over --pipeline-max-bytes were not checked; chunk logs are in {paths['pipelines_logs']}")
     except (BuildError, shader_store.StoreError) as error:
         print(f"build_shaders: {error}", file=sys.stderr)
         return 1

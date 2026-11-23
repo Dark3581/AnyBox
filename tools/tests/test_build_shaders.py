@@ -53,6 +53,9 @@ if mode == "crash" and start > 0:
     print("  still compiling big_cs after 62s")
     sys.exit(7)
 ps = count
+if mode == "big" and start == 0:
+    ps -= 1
+    print("BIG SKIP huge_cs (70000000 bytes, limit 41943040)")
 if mode == "fail" and start == 0:
     ps -= 1
     print("PIPELINE FAIL cs_b (cs w32, -3)")
@@ -241,6 +244,20 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("did not pass", errors)
         self.assertEqual(self.summary()["pipelines"]["problems"], [{"kind": "pipeline_fail", "name": "cs_b"}])
+
+    def test_size_skips_leave_the_check_incomplete_not_failed(self):
+        self.assertEqual(self.build()[0], 0)
+        self.use_checker("big")
+        code, output, errors = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("is incomplete: 1 modules over --pipeline-max-bytes were not checked", errors)
+        self.assertNotIn("did not pass", errors)
+        self.assertIn("1 over the size limit; exit 0", output)
+        self.assertNotIn("FAILED", output)
+        self.assertIn("1 not checked (over the size limit)", output)
+        self.assertIn("0 of 1 chunks failed", output)
+        self.assertIn("not checked: huge_cs", output)
+        self.assertEqual(self.summary()["pipelines"]["failed_chunks"], [])
 
     def test_chunks_resume_and_recheck(self):
         self.assertEqual(self.build()[0], 0)

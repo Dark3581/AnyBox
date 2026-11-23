@@ -702,7 +702,7 @@ Measured on one title's package (26,503 shaders) with an RTX 3070 Ti and 32 GB o
 | Compute sample through AnyBox's own pipeline code | ✅ 60 of 60, no validation errors |
 | Bindless descriptors and buffer access on the GPU | ✅ 3,701 of 3,701 descriptor lookups; buffer windows below 4 GB of up to 2 GiB |
 | The title's shaders through AnyBox's pipeline state code | ✅ 12 compute shaders and 8 vertex shaders with vertex inputs become pipelines from their own containers; the largest compute shader is refused in 0.3 s instead of a 75 GB compile; with the offline cache, the pipelines come back without compiling |
-| Every pipeline created by the driver | 🔄 in progress, in chunks of 500: 25,000 of 26,503 checked, 24,998 created (9,282 mesh, 11,248 pixel, 2,225 compute, 2,048 vertex and 195 geometry shaders) and none failed. Two compute modules of 43 MiB each need about 75 GB of memory to compile, more than this PC can commit, so they are skipped by size here |
+| Every pipeline created by the driver | ⚠️ 26,501 of 26,503 created (9,282 mesh, 12,101 pixel, 2,687 compute, 2,236 vertex and 195 geometry shaders), none failed, in 54 chunks of 500. The other 2 are compute modules of 43 MiB each that need about 75 GB of memory to compile, more than this PC can commit, so they were not checked here |
 | Shaders running in a title | ❌ needs the title's executable: device creation, command lists, root signatures and presentation follow from its calls |
 
 What is not proven yet: that any translated shader computes the right values inside the title, and how the title binds its resources at run time. Both need the executable.
