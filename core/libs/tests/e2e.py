@@ -144,7 +144,7 @@ STOP_MESSAGES = {
     "gamesavefiles_containers": "holds XGameSave containers",
     "gamesave_folders": "holds XGameSaveFiles files",
     "gamesave_folders_async": "holds XGameSaveFiles files",
-    "api_unmapped": "slot 16 of the GDK API interface {073b7dcb-1fcf-4030-94be-e3c9eb623428} (threading: XAsync and XTaskQueue) is not mapped",
+    "api_unmapped": "slot 20 of the GDK API interface {073b7dcb-1fcf-4030-94be-e3c9eb623428} (threading: XAsync and XTaskQueue) is not mapped",
     "api_impl": "interface {cafef00d-0102-0304-0506-0708090a0b0c} of provider {11111111-2222-3333-4455-66778899aabb} is not implemented",
 }
 

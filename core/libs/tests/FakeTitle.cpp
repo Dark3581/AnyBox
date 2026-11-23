@@ -1631,6 +1631,17 @@ int ApiThreading() {
     if (reinterpret_cast<Delayed>(ApiSlot(19))(g_api, queue, 0, 0, ran, signal) != S_OK) return Fail("callback through slot 19");
     if (WaitForSingleObject(ran, 5000) != WAIT_OBJECT_0) return Fail("the callback ran");
     CloseHandle(ran);
+    using Submit = HRESULT (*)(void*, void*, std::uint32_t, void*, void (*)(void*, bool));
+    using Dispatch = bool (*)(void*, void*, std::uint32_t, std::uint32_t);
+    void* manual = nullptr;
+    if (reinterpret_cast<Create>(ApiSlot(12))(g_api, 0, 0, &manual) != S_OK) return Fail("manual queue through slot 12");
+    int counted = 0;
+    const auto count = [](void* context, bool) { ++*static_cast<int*>(context); };
+    if (reinterpret_cast<Submit>(ApiSlot(18))(g_api, manual, 0, &counted, count) != S_OK) return Fail("callback through slot 18");
+    if (counted != 0 || !reinterpret_cast<Dispatch>(ApiSlot(16))(g_api, manual, 0, 0) || counted != 1) return Fail("dispatch through slot 16 runs the callback");
+    if (reinterpret_cast<Dispatch>(ApiSlot(16))(g_api, manual, 0, 0)) return Fail("dispatch through slot 16 on an empty port");
+    reinterpret_cast<Terminate>(ApiSlot(22))(g_api, manual, true, nullptr, nullptr);
+    reinterpret_cast<Close>(ApiSlot(17))(g_api, manual);
     AsyncBlock block{};
     block.queue = queue;
     if (reinterpret_cast<Begin>(ApiSlot(7))(g_api, &block, nullptr, nullptr, nullptr, ApiProvider) != S_OK) return Fail("XAsync through slot 7");
@@ -1647,8 +1658,8 @@ int ApiThreading() {
 
 int ApiUnmapped() {
     if (OpenThreadingApi() != 0) return 1;
-    using Dispatch = bool (*)(void*, void*, std::uint32_t, std::uint32_t);
-    reinterpret_cast<Dispatch>(ApiSlot(16))(g_api, nullptr, 0, 0);
+    using Register = HRESULT (*)(void*, void*, std::uint32_t, void*, void*, void*, void*);
+    reinterpret_cast<Register>(ApiSlot(20))(g_api, nullptr, 0, nullptr, nullptr, nullptr, nullptr);
     return Fail("an unmapped slot returned");
 }
 

@@ -74,7 +74,11 @@ HRESULT ThreadingQueueCreateComposite(ApiObject*, XTaskQueuePortHandle work, XTa
 }
 HRESULT ThreadingQueueGetPort(ApiObject*, XTaskQueueHandle queue, XTaskQueuePort port, XTaskQueuePortHandle* handle) { return XTaskQueueGetPort(queue, port, handle); }
 HRESULT ThreadingQueueDuplicateHandle(ApiObject*, XTaskQueueHandle queue, XTaskQueueHandle* duplicated) { return XTaskQueueDuplicateHandle(queue, duplicated); }
+bool ThreadingQueueDispatch(ApiObject*, XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t timeout) { return XTaskQueueDispatch(queue, port, timeout); }
 void ThreadingQueueCloseHandle(ApiObject*, XTaskQueueHandle queue) { XTaskQueueCloseHandle(queue); }
+HRESULT ThreadingQueueSubmitCallback(ApiObject*, XTaskQueueHandle queue, XTaskQueuePort port, void* context, XTaskQueueCallback* callback) {
+    return XTaskQueueSubmitCallback(queue, port, context, callback);
+}
 HRESULT ThreadingQueueSubmitDelayedCallback(ApiObject*, XTaskQueueHandle queue, XTaskQueuePort port, std::uint32_t delay, void* context, XTaskQueueCallback* callback) {
     return XTaskQueueSubmitDelayedCallback(queue, port, delay, context, callback);
 }
@@ -107,9 +111,9 @@ const void* const kThreadingTable[] = {
     Entry(&ThreadingQueueCreateComposite),
     Entry(&ThreadingQueueGetPort),
     Entry(&ThreadingQueueDuplicateHandle),
-    Entry(&Unmapped<16>),
+    Entry(&ThreadingQueueDispatch),
     Entry(&ThreadingQueueCloseHandle),
-    Entry(&Unmapped<18>),
+    Entry(&ThreadingQueueSubmitCallback),
     Entry(&ThreadingQueueSubmitDelayedCallback),
     Entry(&Unmapped<20>),
     Entry(&Unmapped<21>),
