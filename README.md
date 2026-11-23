@@ -20,7 +20,7 @@ The [progress page](https://dark3581.github.io/AnyBox/progress.html) lists every
 
 | Library | Serves | State |
 |---|---|---|
-| [xgameruntime](core/libs/xdll/xgameruntime) | `xgameruntime.dll` | XGameRuntime init and options, all of XTaskQueue (composite queues, monitors and waiters included), XAsync, XThread and XGameSave implemented; XUser, XGameSaveFiles, most of XPackage and XSystem stubs |
+| [xgameruntime](core/libs/xdll/xgameruntime) | `xgameruntime.dll` | XGameRuntime init and options, all of XTaskQueue (composite queues, monitors and waiters included), XAsync, XThread, XGameSave and XGameSaveFiles implemented; XUser, most of XPackage and XSystem stubs |
 | [d3d12_x](core/libs/xdll/d3d12_x) | `d3d12_x.dll`, `d3d12_xs.dll` | uses two back ends: root signature serialization is forwarded to the host's `d3d12.dll`, and everything the device does goes to Vulkan. Built on the Vulkan side: the device, shader store, compute and graphics pipeline state (render state, vertex input, cache first), resource barriers, texture images, views and samplers, bindless descriptors and the buffer window ([Graphics](#graphics-and-shaders)). Device creation still stops the title until its calls show the device's shape |
 | [xaudio2](core/libs/xdll/xaudio2) | `xaudio2_9.dll` | forwarded to the host's XAudio2 |
 | [gameinput](core/libs/xdll/gameinput) | `gameinput.dll` | forwarded to the host's GameInput |
