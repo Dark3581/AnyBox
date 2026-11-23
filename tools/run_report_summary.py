@@ -38,6 +38,9 @@ def summary(report):
         ending = f"stopped at {stop['kind']} {stop.get('library')}!{stop.get('function')}"
         if stop.get("message"):
             ending += f": {stop['message']}"
+        caller = stop.get("caller")
+        if caller and caller.get("module"):
+            ending += f" (called from {caller['module']}+{caller.get('offset')})"
     commit = (report["anybox"].get("commit") or "unknown")[:10]
     system = report["system"]
     return f"{title} v{game.get('version') or '?'}: {ending} after {report['run']['seconds']:.0f} s | AnyBox {commit} | {system.get('osVersion')} | {system.get('cpu')}"

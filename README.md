@@ -27,7 +27,7 @@ The [progress page](https://dark3581.github.io/AnyBox/progress.html) lists every
 | [kernelx](core/libs/xdll/kernelx) | `kernelx.dll` | Win32 subset forwarded to `kernel32` |
 | [xmem](core/libs/xdll/xmem) | `xmem.dll` | `XMemAlloc`, `XMemFree`, `XMemVirtualQuery` and `XMemGetWorkingSetStatistics` implemented; the allocation attribute word is not decoded yet, so every block is plain read-write memory |
 
-Unsupported or unexpected states stop the process with a [run report](docs/run-report.schema.json) (`anybox-report.json`) that names the library and function. Nothing returns a made-up success.
+Unsupported or unexpected states stop the process with a [run report](docs/run-report.schema.json) (`anybox-report.json`) that names the library and function, the place in the title that reached it and the stack, and with a debugger attached the stop breaks into it ([Debugging a stop](docs/dev/GAME_TESTING.md#debugging-a-stop)). Nothing returns a made-up success.
 
 ## Graphics and shaders
 

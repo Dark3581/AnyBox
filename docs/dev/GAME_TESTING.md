@@ -37,9 +37,26 @@ Attach `anybox-report.json` and the log. Never attach game files, executables, k
 |---|---|---|
 | Exit code | shell | `0xAB01` (43777) stub, `0xAB02` (43778) unsupported, `0xC0000005` access violation, `0xC0000135` a DLL is missing beside the executable |
 | Stop | `anybox-report.json` `stop` | the library and function, or the crash module and offset |
+| Caller | `anybox-report.json` `stop.caller`, log line `called from` | where in the title the stop was reached: the first frame outside AnyBox and Windows, as `module+offset` (null when the title is not on the stack, for example on an AnyBox worker thread) |
+| Frames | `anybox-report.json` `stop.frames`, log lines `#00`, `#01`, ... | up to 32 frames of the stopping or crashing thread |
 | Libraries | `anybox-report.json` `libraries` | which AnyBox DLLs the title loaded |
 | Log | stderr or `ANYBOX_LOG_FILE` | `[anybox] not implemented: lib!func (file:line)` |
 | Loader errors | message box at start-up | "The procedure entry point X could not be located in Y": a forwarded or host export the desktop lacks; report it as a library gap |
+
+## Debugging a stop
+
+A stop names the AnyBox function and, under `caller`, the place in the title that reached it, such as `called from game.exe+0x31013`. The relinker leaves the title's sections where they were, so that offset is the same RVA in the original executable: in Ghidra or IDA, go to the image base plus the offset (`0x140000000 + 0x31013` for the usual base). Frames are return addresses, so the offset is the instruction just after the call; the call is the instruction before it. A crash lists its frames the same way, starting at the faulting instruction.
+
+To look at the title's state at the stop, run it under a debugger (x64dbg, WinDbg or Visual Studio). With a debugger attached, a stop breaks into it before the process exits, with the title's call on the stack; set `ANYBOX_BREAK=0` to turn that off. When something else starts the title, set `ANYBOX_WAIT_DEBUGGER=<seconds>`: AnyBox logs its process ID, waits up to that long for a debugger to attach, and breaks before the title's entry point runs. The debugger also receives its own attach break, so continue past both.
+
+| Variable | Effect |
+|---|---|
+| `ANYBOX_LOG_FILE=<path>` | append the log to a file as well as stderr |
+| `ANYBOX_TRACE=<library>[,<library>...]` or `all` | log each traced call of those libraries |
+| `ANYBOX_REPORT=<path>` | write the run report there instead of beside the executable |
+| `ANYBOX_NO_REPORT=1` | write no run report |
+| `ANYBOX_BREAK=0` | do not break into an attached debugger at a stop |
+| `ANYBOX_WAIT_DEBUGGER=<seconds>` | wait for a debugger at start-up, then break before the title starts |
 
 ## Static analysis with Ghidra
 

@@ -7,7 +7,7 @@ target_link_libraries(fake_title PRIVATE fake_xgameruntime)
 anybox_static_runtime(fake_title)
 
 if(Python3_FOUND)
-    foreach(scenario IN ITEMS taskqueue taskqueue_composite taskqueue_monitor taskqueue_monitor_reentry taskqueue_waiter taskqueue_terminate_reentry stub crash crash_chained crash_recovered device_scarlett device_durango device_pc device_default device_none device_noexecutable device_unknown console_id sandbox_id async gamesave gamesavefiles gamesavefiles_mismatch gamesavefiles_containers gamesave_folders gamesave_folders_async gamesave_empty_folder async_null async_terminated async_begin_terminated startup startup_options thread_assert)
+    foreach(scenario IN ITEMS taskqueue taskqueue_composite taskqueue_monitor taskqueue_monitor_reentry taskqueue_waiter taskqueue_terminate_reentry stub stub_debugger crash crash_chained crash_recovered device_scarlett device_durango device_pc device_default device_none device_noexecutable device_unknown console_id sandbox_id async gamesave gamesavefiles gamesavefiles_mismatch gamesavefiles_containers gamesave_folders gamesave_folders_async gamesave_empty_folder async_null async_terminated async_begin_terminated startup startup_options thread_assert)
         add_test(NAME e2e_${scenario}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/e2e.py
                 --relinker $<TARGET_FILE:relinker> --title $<TARGET_FILE:fake_title> --libs ${ANYBOX_LIBS_DIR}

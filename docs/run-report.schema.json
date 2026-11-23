@@ -86,11 +86,23 @@
             "module": { "$ref": "#/$defs/text" },
             "offset": { "type": ["string", "null"], "pattern": "^0x[0-9a-f]+$" }
           }
-        }
+        },
+        "caller": { "oneOf": [{ "$ref": "#/$defs/frame" }, { "type": "null" }] },
+        "frames": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/frame" } }
       }
     }
   },
   "$defs": {
-    "text": { "type": ["string", "null"], "maxLength": 512 }
+    "text": { "type": ["string", "null"], "maxLength": 512 },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "offset", "address"],
+      "properties": {
+        "module": { "$ref": "#/$defs/text" },
+        "offset": { "type": ["string", "null"], "pattern": "^0x[0-9a-f]+$" },
+        "address": { "type": "string", "pattern": "^0x[0-9a-f]+$" }
+      }
+    }
   }
 }

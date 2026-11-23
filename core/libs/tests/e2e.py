@@ -1,11 +1,14 @@
 import argparse
+import ctypes
 import json
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 CONFIG = """<?xml version="1.0" encoding="utf-8"?>
 <Game configVersion="1">
@@ -38,6 +41,7 @@ EXPECTED = {
     "taskqueue_waiter": (0, "none"),
     "taskqueue_terminate_reentry": (0xAB02, "unsupported"),
     "stub": (0xAB01, "not-implemented"),
+    "stub_debugger": (0xAB01, "not-implemented"),
     "crash": (0xC0000005, "crash"),
     "crash_chained": (0xC0000005, "crash"),
     "crash_recovered": (0, "none"),
@@ -66,8 +70,55 @@ EXPECTED = {
     "thread_assert": (0xAB02, "unsupported"),
 }
 
+DIRECT_CALLS = {"stub", "stub_debugger", "device_none", "device_noexecutable", "device_unknown", "startup_options", "gamesave_folders"}
+WORKER_CALLS = {"gamesavefiles_containers"}
+
+class ExceptionRecord(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("record", ctypes.c_void_p), ("address", ctypes.c_void_p),
+                ("parameters", ctypes.c_uint32), ("information", ctypes.c_uint64 * 15)]
+
+
+class DebugInfo(ctypes.Union):
+    _fields_ = [("exception", ExceptionRecord), ("raw", ctypes.c_byte * 176)]
+
+
+class DebugEvent(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint32), ("process", ctypes.c_uint32), ("thread", ctypes.c_uint32), ("info", DebugInfo)]
+
+
+def run_under_debugger(converted, argument, out, env):
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    env = dict(env, ANYBOX_WAIT_DEBUGGER="30")
+    process = subprocess.Popen([str(converted), argument], cwd=out, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first = []
+    for line in process.stderr:
+        first.append(line)
+        if "waiting up to" in line:
+            break
+    assert kernel32.DebugActiveProcess(process.pid), f"DebugActiveProcess failed: {ctypes.get_last_error()}"
+    kernel32.DebugSetProcessKillOnExit(False)
+    breakpoints = 0
+    event = DebugEvent()
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if not kernel32.WaitForDebugEvent(ctypes.byref(event), 1000):
+            continue
+        status = 0x00010002
+        if event.code == 1:
+            if event.info.exception.code == 0x80000003:
+                breakpoints += 1
+            else:
+                status = 0x80010001
+        kernel32.ContinueDebugEvent(event.process, event.thread, status)
+        if event.code == 5:
+            break
+    stdout, stderr = process.communicate(timeout=60)
+    return SimpleNamespace(returncode=process.returncode, stdout=stdout, stderr="".join(first) + stderr, breakpoints=breakpoints)
+
+
 STOPPED_IN = {
     "stub": "XUserAddAsync",
+    "stub_debugger": "XUserAddAsync",
     "taskqueue_monitor_reentry": "XTaskQueueUnregisterMonitor",
     "taskqueue_terminate_reentry": "XTaskQueueTerminate",
     "device_none": "XSystemGetDeviceType",
@@ -144,7 +195,7 @@ def main():
     assert routes["xgameruntime.dll"]["target"] == "ab_xgameruntime.dll", routes
     assert (out / "ab_xgameruntime.dll").exists() and (out / "ab_runtime.dll").exists(), "libraries are copied"
 
-    argument = "device" if args.scenario in DEVICES else args.scenario
+    argument = "device" if args.scenario in DEVICES else "stub" if args.scenario == "stub_debugger" else args.scenario
     local = args.work / "localappdata"
     local.mkdir()
     saves = local / "AnyBox" / "1234ABCD" / "XGameSave"
@@ -156,7 +207,12 @@ def main():
             seed.parent.mkdir(parents=True)
             seed.write_bytes(b"seed")
     env = dict(os.environ, LOCALAPPDATA=str(local))
-    run = subprocess.run([str(converted), argument], cwd=out, env=env, capture_output=True, text=True, timeout=60)
+    if args.scenario == "stub_debugger":
+        run = run_under_debugger(converted, argument, out, env)
+        assert "debugger attached; breaking before the title starts" in run.stderr, run.stderr
+        assert run.breakpoints >= 2, f"{run.breakpoints} breakpoints: expected the start-up break and the break at the stop"
+    else:
+        run = subprocess.run([str(converted), argument], cwd=out, env=env, capture_output=True, text=True, timeout=60)
     print(run.stdout)
     print(run.stderr, file=sys.stderr)
     code, kind = EXPECTED[args.scenario]
@@ -211,9 +267,20 @@ def main():
         assert report["stop"]["library"] == "xgameruntime" and report["stop"]["function"] == STOPPED_IN[args.scenario], report["stop"]
     if args.scenario in STOP_MESSAGES:
         assert STOP_MESSAGES[args.scenario] in report["stop"]["message"], report["stop"]
+    if kind in ("not-implemented", "unsupported") and args.scenario in DIRECT_CALLS:
+        caller = report["stop"]["caller"]
+        assert caller is not None and caller["module"] == "title.exe" and caller["offset"].startswith("0x"), report["stop"]
+        assert report["stop"]["frames"][0]["module"].lower().startswith("ab_"), report["stop"]["frames"]
+        assert "called from title.exe+0x" in run.stderr, run.stderr
+    if args.scenario in WORKER_CALLS:
+        assert report["stop"]["caller"] is None and report["stop"]["frames"], report["stop"]
     if kind == "crash":
         assert report["stop"]["exception"]["code"] == "0xc0000005", report["stop"]
         assert report["stop"]["exception"]["module"] == "title.exe", report["stop"]
+        frames = report["stop"]["frames"]
+        assert frames and frames[0]["module"] == "title.exe" and frames[0]["offset"] == report["stop"]["exception"]["offset"], frames
+        assert report["stop"]["caller"] == frames[0], report["stop"]
+        assert "crashed in title.exe+0x" in run.stderr, run.stderr
 
     schema = Path(__file__).resolve().parents[3] / "docs" / "run-report.schema.json"
     try:

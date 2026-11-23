@@ -37,6 +37,7 @@ namespace {
 
 constexpr std::size_t MaxReportBytes = 65536;
 constexpr std::size_t MaxLibraries = 128;
+constexpr std::size_t MaxFrames = 32;
 
 std::array<std::atomic<const char*>, MaxLibraries> g_libraries{};
 std::atomic<std::size_t> g_libraryCount{0};
@@ -203,6 +204,83 @@ std::string ModuleOf(std::uint64_t address, std::uint64_t& offset) {
     return slash == std::string::npos ? full : full.substr(slash + 1);
 }
 
+std::string FrameText(std::uint64_t address, std::string* module = nullptr) {
+    std::uint64_t offset = 0;
+    const std::string name = ModuleOf(address, offset);
+    if (module != nullptr) *module = name;
+    return name.empty() ? std::format("0x{:x}", address) : std::format("{}+0x{:x}", name, offset);
+}
+
+bool IsAnyBoxModule(const std::string& module) {
+    return module.size() > 3 && std::tolower(static_cast<unsigned char>(module[0])) == 'a' && std::tolower(static_cast<unsigned char>(module[1])) == 'b' && module[2] == '_';
+}
+
+std::string FrameJson(std::uint64_t address) {
+    std::uint64_t offset = 0;
+    const std::string module = ModuleOf(address, offset);
+    return std::format("{{\"module\": {}, \"offset\": {}, \"address\": \"0x{:x}\"}}", JsonOrNull(module),
+        module.empty() ? "null" : std::format("\"0x{:x}\"", offset), address);
+}
+
+bool IsSystemModule(std::uint64_t address) {
+    static const std::wstring windows = [] {
+        wchar_t path[MAX_PATH];
+        const UINT length = GetSystemWindowsDirectoryW(path, MAX_PATH);
+        std::wstring text = length != 0 && length < MAX_PATH ? std::wstring(path, length) : std::wstring{};
+        if (!text.empty() && text.back() != L'\\') text += L'\\';
+        return text;
+    }();
+    HMODULE module = nullptr;
+    if (windows.empty() || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(static_cast<std::uintptr_t>(address)), &module)) {
+        return false;
+    }
+    wchar_t path[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    return length >= windows.size() && CompareStringOrdinal(path, static_cast<int>(windows.size()), windows.c_str(), static_cast<int>(windows.size()), TRUE) == CSTR_EQUAL;
+}
+
+std::size_t CallerFrame(const std::uint64_t* frames, std::size_t count) {
+    for (std::size_t index = 0; index < count; ++index) {
+        std::uint64_t offset = 0;
+        const std::string module = ModuleOf(frames[index], offset);
+        if (!module.empty() && !IsAnyBoxModule(module) && !IsSystemModule(frames[index])) return index;
+    }
+    return count;
+}
+
+std::size_t CaptureFrames(std::uint64_t* frames) {
+    void* raw[MaxFrames]{};
+    const USHORT count = RtlCaptureStackBackTrace(2, static_cast<DWORD>(MaxFrames), raw, nullptr);
+    for (USHORT index = 0; index < count; ++index) frames[index] = reinterpret_cast<std::uintptr_t>(raw[index]);
+    return count;
+}
+
+std::size_t UnwindFrames(const CONTEXT& start, std::uint64_t* frames) {
+    CONTEXT context = start;
+    const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const ULONG_PTR low = reinterpret_cast<ULONG_PTR>(tib->StackLimit);
+    const ULONG_PTR high = reinterpret_cast<ULONG_PTR>(tib->StackBase);
+    std::size_t count = 0;
+    while (count < MaxFrames && context.Rip != 0) {
+        frames[count++] = context.Rip;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (function != nullptr) {
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+        } else {
+            if (context.Rsp < low || context.Rsp + sizeof(DWORD64) > high) break;
+            context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+            context.Rsp += sizeof(DWORD64);
+        }
+        if (context.Rsp < low || context.Rsp > high) break;
+    }
+    return count;
+}
+
+
 std::string Libraries(bool& truncated, std::size_t budget) {
     std::string list = "[";
     const std::size_t count = (std::min)(g_libraryCount.load(), MaxLibraries);
@@ -256,10 +334,16 @@ std::string BuildReport(const AbxStop& stop) {
         UtcNow(), JsonOrNull(ANYBOX_COMMIT), JsonOrNull(ANYBOX_RELEASE), modified,
         JsonOrNull(title.titleId), JsonOrNull(Truncate(title.identityName.c_str(), 256)), JsonOrNull(title.version),
         JsonOrNull(Truncate(title.name.c_str(), 256)), JsonOrNull(OsVersion()), JsonOrNull(Truncate(CpuName().c_str(), 256)), RamGiB(), seconds);
+    std::string frames = "[";
+    const std::size_t frameCount = stop.frames != nullptr ? (std::min)(stop.frameCount, MaxFrames) : 0;
+    for (std::size_t index = 0; index < frameCount; ++index) frames += (index == 0 ? "" : ", ") + FrameJson(stop.frames[index]);
+    frames += "]";
+    const std::size_t caller = CallerFrame(stop.frames, frameCount);
+    const std::string callerJson = caller < frameCount ? FrameJson(stop.frames[caller]) : "null";
     const std::string tail = std::format(
-        "  \"stop\": {{\"kind\": \"{}\", \"library\": {}, \"function\": {}, \"location\": {}, \"message\": {}, \"exception\": {}}}\n}}\n",
+        "  \"stop\": {{\"kind\": \"{}\", \"library\": {}, \"function\": {}, \"location\": {}, \"message\": {}, \"exception\": {}, \"caller\": {}, \"frames\": {}}}\n}}\n",
         stop.kind, JsonOrNull(Truncate(stop.library, 256)), JsonOrNull(Truncate(stop.function, 256)), JsonOrNull(Truncate(location.c_str(), 512)),
-        JsonOrNull(Truncate(stop.message, 4096)), exception);
+        JsonOrNull(Truncate(stop.message, 4096)), exception, callerJson, frames);
     const std::size_t reserved = head.size() + tail.size() + 64;
     const std::string libraries = Libraries(truncated, reserved < MaxReportBytes ? MaxReportBytes - reserved : 0);
     return head + "  \"libraries\": " + libraries + ",\n  \"truncated\": " + (truncated ? "true" : "false") + ",\n" + tail;
@@ -287,6 +371,35 @@ void Emit(const std::string& line) {
     }
 }
 
+void EmitFrames(const char* what, const std::uint64_t* frames, std::size_t count) {
+    const std::size_t caller = CallerFrame(frames, count);
+    if (caller < count) Emit(std::format("[anybox] {} {}\n", what, FrameText(frames[caller])));
+    for (std::size_t index = 0; index < count; ++index) Emit(std::format("[anybox]   #{:02} {}\n", index, FrameText(frames[index])));
+}
+
+bool BreakEnabled() {
+    return IsDebuggerPresent() && Environment("ANYBOX_BREAK") != "0";
+}
+
+void WaitForDebugger() {
+    const std::string configured = Environment("ANYBOX_WAIT_DEBUGGER");
+    if (configured.empty()) {
+        return;
+    }
+    const unsigned long seconds = std::strtoul(configured.c_str(), nullptr, 10);
+    Emit(std::format("[anybox] waiting up to {} s for a debugger to attach to process {}\n", seconds, GetCurrentProcessId()));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (!IsDebuggerPresent() && std::chrono::steady_clock::now() < deadline) {
+        Sleep(100);
+    }
+    if (IsDebuggerPresent()) {
+        Emit("[anybox] debugger attached; breaking before the title starts\n");
+        DebugBreak();
+    } else {
+        Emit("[anybox] no debugger attached; continuing\n");
+    }
+}
+
 std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_previousFilter{};
 std::atomic<bool> g_inFilter{};
 std::atomic<DWORD> g_handledThread{};
@@ -303,6 +416,7 @@ LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
     const EXCEPTION_RECORD* record = pointers != nullptr ? pointers->ExceptionRecord : nullptr;
     AbxStop stop{};
     stop.kind = "crash";
+    std::uint64_t frames[MaxFrames]{};
     if (record != nullptr) {
         stop.hasException = true;
         stop.exceptionCode = record->ExceptionCode;
@@ -310,6 +424,12 @@ LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
         if (record->ExceptionCode == 0x20474343u) {
             stop.message = "uncaught C++ exception thrown by an AnyBox library";
         }
+        Emit(std::format("[anybox] crash 0x{:08x} at {}\n", stop.exceptionCode, FrameText(stop.exceptionAddress)));
+    }
+    if (pointers != nullptr && pointers->ContextRecord != nullptr) {
+        stop.frames = frames;
+        stop.frameCount = UnwindFrames(*pointers->ContextRecord, frames);
+        EmitFrames("crashed in", frames, stop.frameCount);
     }
     AbxWriteReport(&stop);
     const LPTOP_LEVEL_EXCEPTION_FILTER previous = g_previousFilter.load();
@@ -341,6 +461,7 @@ void Start() {
     }
     SetUnhandledExceptionFilter(UnhandledException);
     g_keepFilter = AddVectoredExceptionHandler(0, KeepFilter);
+    WaitForDebugger();
 }
 
 }
@@ -401,19 +522,25 @@ ABX_RUNTIME_API void AbxLog(const char* channel, const char* format, ...) {
 
 ABX_RUNTIME_API void AbxNotImplementedAt [[noreturn]] (const char* library, const char* function, const char* file, int line) {
     Emit(std::format("[anybox] not implemented: {}!{} ({}:{})\n", library, function, file, line));
+    std::uint64_t frames[MaxFrames]{};
     AbxStop stop{};
     stop.kind = "not-implemented";
     stop.library = library;
     stop.function = function;
     stop.file = file;
     stop.line = line;
+    stop.frames = frames;
+    stop.frameCount = CaptureFrames(frames);
+    EmitFrames("called from", frames, stop.frameCount);
     AbxWriteReport(&stop);
+    if (BreakEnabled()) DebugBreak();
     TerminateProcess(GetCurrentProcess(), AbxExitNotImplemented);
     std::abort();
 }
 
 ABX_RUNTIME_API void AbxUnsupportedAt [[noreturn]] (const char* library, const char* function, const char* message, const char* file, int line) {
     Emit(std::format("[anybox] unsupported: {}!{}: {} ({}:{})\n", library, function, message, file, line));
+    std::uint64_t frames[MaxFrames]{};
     AbxStop stop{};
     stop.kind = "unsupported";
     stop.library = library;
@@ -421,7 +548,11 @@ ABX_RUNTIME_API void AbxUnsupportedAt [[noreturn]] (const char* library, const c
     stop.file = file;
     stop.line = line;
     stop.message = message;
+    stop.frames = frames;
+    stop.frameCount = CaptureFrames(frames);
+    EmitFrames("called from", frames, stop.frameCount);
     AbxWriteReport(&stop);
+    if (BreakEnabled()) DebugBreak();
     TerminateProcess(GetCurrentProcess(), AbxExitUnsupported);
     std::abort();
 }
