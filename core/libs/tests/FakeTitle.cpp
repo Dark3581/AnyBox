@@ -1547,6 +1547,24 @@ int GameSaveEmptyFolder() {
 
 }
 
+int DynamicLoad() {
+    const HMODULE runtime = LoadLibraryExW(L"xgameruntime.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (runtime == nullptr) return Fail("dynamic load of xgameruntime.dll");
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(runtime, path, MAX_PATH);
+    const wchar_t* slash = wcsrchr(path, L'\\');
+    const wchar_t* base = slash != nullptr ? slash + 1 : path;
+    if (_wcsicmp(base, L"ab_xgameruntime.dll") != 0) return Fail("xgameruntime.dll loaded by name is not AnyBox's");
+    if (GetModuleHandleW(L"XGameRuntime.dll") != runtime) return Fail("GetModuleHandleW of the runtime");
+    HMODULE handle = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, "xgameruntime.dll", &handle) || handle != runtime) return Fail("GetModuleHandleExA of the runtime");
+    if (LoadLibraryA("xgameruntime") != runtime) return Fail("LoadLibraryA without an extension");
+    if (GetProcAddress(runtime, "XSystemGetDeviceType") == nullptr) return Fail("an export of the redirected runtime");
+    if (LoadLibraryW(L"kernel32.dll") != GetModuleHandleW(L"kernel32.dll")) return Fail("a DLL AnyBox does not serve loads unchanged");
+    std::printf("dynamic load ok\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const char* scenario = argc > 1 ? argv[1] : "taskqueue";
     if (std::strcmp(scenario, "stub") == 0) {
@@ -1579,6 +1597,9 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(scenario, "async") == 0) {
         return Async();
+    }
+    if (std::strcmp(scenario, "dynamic_load") == 0) {
+        return DynamicLoad();
     }
     if (std::strcmp(scenario, "gamesave") == 0) {
         return GameSave();

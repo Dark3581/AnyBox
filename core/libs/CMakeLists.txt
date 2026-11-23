@@ -18,12 +18,12 @@ else()
     set(modified_value ${ANYBOX_MODIFIED})
 endif()
 
-add_library(abx_runtime SHARED runtime/src/Runtime.cpp runtime/src/Settings.cpp runtime/src/TitleConfig.cpp)
+add_library(abx_runtime SHARED runtime/src/Runtime.cpp runtime/src/LoaderRedirect.cpp runtime/src/Settings.cpp runtime/src/TitleConfig.cpp)
 set_target_properties(abx_runtime PROPERTIES PREFIX "" OUTPUT_NAME ab_runtime
     RUNTIME_OUTPUT_DIRECTORY ${ANYBOX_LIBS_DIR} ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_definitions(abx_runtime PRIVATE ABX_RUNTIME_BUILD ABX_LIBRARY_NAME="runtime"
     ANYBOX_COMMIT="${ANYBOX_COMMIT}" ANYBOX_RELEASE="${ANYBOX_RELEASE}" ANYBOX_MODIFIED=${modified_value})
-target_include_directories(abx_runtime PUBLIC runtime/include PRIVATE runtime/src)
+target_include_directories(abx_runtime PUBLIC runtime/include PRIVATE runtime/src ${ANYBOX_GENERATED_DIR})
 anybox_static_runtime(abx_runtime)
 add_dependencies(libs abx_runtime)
 

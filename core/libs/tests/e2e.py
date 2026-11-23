@@ -55,6 +55,7 @@ EXPECTED = {
     "console_id": (0, "none"),
     "sandbox_id": (0, "none"),
     "async": (0, "none"),
+    "dynamic_load": (0, "none"),
     "gamesave": (0, "none"),
     "gamesavefiles": (0, "none"),
     "gamesavefiles_mismatch": (0, "none"),
@@ -231,6 +232,9 @@ def main():
         assert "sandbox id ok" in run.stdout
     if args.scenario == "async":
         assert "async ok" in run.stdout
+    if args.scenario == "dynamic_load":
+        assert "dynamic load ok" in run.stdout, (run.stdout, run.stderr)
+        assert "loader: LoadLibraryExW(xgameruntime.dll) from title.exe+0x" in run.stderr and "loads ab_xgameruntime.dll" in run.stderr, run.stderr
     if args.scenario == "startup":
         assert "startup ok" in run.stdout
     if args.scenario == "crash_chained":

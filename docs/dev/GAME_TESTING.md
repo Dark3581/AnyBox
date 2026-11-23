@@ -39,6 +39,7 @@ Attach `anybox-report.json` and the log. Never attach game files, executables, k
 | Stop | `anybox-report.json` `stop` | the library and function, or the crash module and offset |
 | Caller | `anybox-report.json` `stop.caller`, log line `called from` | where in the title the stop was reached: the first frame outside AnyBox and Windows, as `module+offset` (null when the title is not on the stack, for example on an AnyBox worker thread) |
 | Frames | `anybox-report.json` `stop.frames`, log lines `#00`, `#01`, ... | up to 32 frames of the stopping or crashing thread |
+| Run-time loads | log lines `loader: LoadLibraryExW(xgameruntime.dll) from game.exe+0x... loads ab_xgameruntime.dll` | a module loaded a DLL AnyBox serves by name at run time, and got AnyBox's library instead of whatever the search would have found |
 | Libraries | `anybox-report.json` `libraries` | which AnyBox DLLs the title loaded |
 | Log | stderr or `ANYBOX_LOG_FILE` | `[anybox] not implemented: lib!func (file:line)` |
 | Loader errors | message box at start-up | "The procedure entry point X could not be located in Y": a forwarded or host export the desktop lacks; report it as a library gap |

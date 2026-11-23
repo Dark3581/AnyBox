@@ -1,4 +1,5 @@
 #include "AbxRuntime.hpp"
+#include "LoaderRedirect.hpp"
 #include "Settings.hpp"
 #include "TitleConfig.hpp"
 
@@ -470,6 +471,7 @@ void Start() {
     }
     SetUnhandledExceptionFilter(UnhandledException);
     g_keepFilter = AddVectoredExceptionHandler(0, KeepFilter);
+    abx::InstallLoaderRedirect();
     WaitForDebugger();
 }
 
