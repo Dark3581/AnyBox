@@ -75,7 +75,7 @@ flowchart LR
   - `AbxTrace(format, ...)` logs through `AbxLog` on the library's channel when `ANYBOX_TRACE` lists that library (or `all`); each call site asks `AbxTraceEnabled` once, so a trace that is off costs one branch.
   - Each library registers itself at load ([`Registration.cpp`](../../core/libs/runtime/src/Registration.cpp)), so the report lists the libraries the title loaded.
   - The relinker only changes import tables, so a DLL a title loads by name at run time would bypass it: GDK modules load `xgameruntime.dll` with `LoadLibraryExW` and System32-only search, which on a PC with Gaming Services finds the desktop runtime. [`LoaderRedirect.cpp`](../../core/libs/runtime/src/LoaderRedirect.cpp) points the `LoadLibrary*` and `GetModuleHandle*` import slots of title-side modules (not AnyBox's `ab_*` libraries, not Windows modules) at functions that send any name AnyBox serves to its library beside `ab_runtime.dll`, using the same routes as the relinker; modules loaded later are patched from the loader's DLL notification. Each redirected name is logged once with its caller.
-- Libraries link their C++ runtime statically, so the output folder needs no MinGW DLLs.
+- Libraries link their C and C++ runtime statically, with MinGW and with MSVC (`CMAKE_MSVC_RUNTIME_LIBRARY`), so the output folder needs no compiler DLLs, and AnyBox never loads the console builds of `msvcp140.dll` and `vcruntime140.dll` that titles ship beside their executable.
 
 ## Graphics (d3d12_x)
 
