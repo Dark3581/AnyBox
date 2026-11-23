@@ -56,6 +56,7 @@ EXPECTED = {
     "sandbox_id": (0, "none"),
     "async": (0, "none"),
     "dynamic_load": (0, "none"),
+    "api_impl": (0xAB02, "unsupported"),
     "gamesave": (0, "none"),
     "gamesavefiles": (0, "none"),
     "gamesavefiles_mismatch": (0, "none"),
@@ -71,7 +72,7 @@ EXPECTED = {
     "thread_assert": (0xAB02, "unsupported"),
 }
 
-DIRECT_CALLS = {"stub", "stub_debugger", "device_none", "device_noexecutable", "device_unknown", "startup_options", "gamesave_folders"}
+DIRECT_CALLS = {"stub", "stub_debugger", "api_impl", "device_none", "device_noexecutable", "device_unknown", "startup_options", "gamesave_folders"}
 WORKER_CALLS = {"gamesavefiles_containers"}
 
 class ExceptionRecord(ctypes.Structure):
@@ -120,6 +121,7 @@ def run_under_debugger(converted, argument, out, env):
 STOPPED_IN = {
     "stub": "XUserAddAsync",
     "stub_debugger": "XUserAddAsync",
+    "api_impl": "QueryApiImpl",
     "taskqueue_monitor_reentry": "XTaskQueueUnregisterMonitor",
     "taskqueue_terminate_reentry": "XTaskQueueTerminate",
     "device_none": "XSystemGetDeviceType",
@@ -139,6 +141,7 @@ STOP_MESSAGES = {
     "gamesavefiles_containers": "holds XGameSave containers",
     "gamesave_folders": "holds XGameSaveFiles files",
     "gamesave_folders_async": "holds XGameSaveFiles files",
+    "api_impl": "interface {cafef00d-0102-0304-0506-0708090a0b0c} of provider {11111111-2222-3333-4455-66778899aabb} is not implemented",
 }
 
 SEEDS = {
@@ -232,6 +235,8 @@ def main():
         assert "sandbox id ok" in run.stdout
     if args.scenario == "async":
         assert "async ok" in run.stdout
+    if args.scenario == "api_impl":
+        assert "XErrorReport 0x89240107: fake title error report" in run.stderr, run.stderr
     if args.scenario == "dynamic_load":
         assert "dynamic load ok" in run.stdout, (run.stdout, run.stderr)
         assert "loader: LoadLibraryExW(xgameruntime.dll) from title.exe+0x" in run.stderr and "loads ab_xgameruntime.dll" in run.stderr, run.stderr

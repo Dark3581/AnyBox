@@ -9,6 +9,13 @@ ABX_API bool XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature);
 ABX_API void XGameRuntimeUninitialize();
 ABX_API HRESULT XGameGetXboxTitleId(std::uint32_t* titleId);
 
+ABX_API HRESULT QueryApiImpl(const GUID* providerId, const GUID* interfaceId, void** implementation);
+ABX_API HRESULT InitializeApiImpl(std::uint32_t first, std::uint32_t second);
+ABX_API HRESULT InitializeApiImplEx(std::uint64_t first, std::uint64_t second, std::uint64_t flags);
+ABX_API HRESULT InitializeApiImplEx2(std::uint64_t first, std::uint64_t second, std::uint64_t flags, void* extra);
+ABX_API HRESULT UninitializeApiImpl();
+ABX_API void XErrorReport(HRESULT result, const char* message);
+
 ABX_API HRESULT XTaskQueueCreate(XTaskQueueDispatchMode workDispatchMode, XTaskQueueDispatchMode completionDispatchMode, XTaskQueueHandle* queue);
 ABX_API HRESULT XTaskQueueDuplicateHandle(XTaskQueueHandle queue, XTaskQueueHandle* duplicated);
 ABX_API void XTaskQueueCloseHandle(XTaskQueueHandle queue);

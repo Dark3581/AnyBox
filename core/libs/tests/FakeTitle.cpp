@@ -1565,6 +1565,25 @@ int DynamicLoad() {
     return 0;
 }
 
+int ApiImpl() {
+    const HMODULE runtime = LoadLibraryExW(L"xgameruntime.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (runtime == nullptr) return Fail("dynamic load of xgameruntime.dll");
+    using ErrorReport = void (*)(HRESULT, const char*);
+    using QueryApi = HRESULT (*)(const GUID*, const GUID*, void**);
+    const auto report = reinterpret_cast<ErrorReport>(reinterpret_cast<void*>(GetProcAddress(runtime, "XErrorReport")));
+    const auto query = reinterpret_cast<QueryApi>(reinterpret_cast<void*>(GetProcAddress(runtime, "QueryApiImpl")));
+    for (const char* name : {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "UninitializeApiImpl"}) {
+        if (GetProcAddress(runtime, name) == nullptr) return Fail(name);
+    }
+    if (report == nullptr || query == nullptr) return Fail("XErrorReport or QueryApiImpl");
+    report(static_cast<HRESULT>(0x89240107), "fake title error report");
+    const GUID provider{0x11111111, 0x2222, 0x3333, {0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb}};
+    const GUID api{0xcafef00d, 0x0102, 0x0304, {0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c}};
+    void* implementation = reinterpret_cast<void*>(1);
+    query(&provider, &api, &implementation);
+    return Fail("QueryApiImpl returned");
+}
+
 int main(int argc, char** argv) {
     const char* scenario = argc > 1 ? argv[1] : "taskqueue";
     if (std::strcmp(scenario, "stub") == 0) {
@@ -1600,6 +1619,9 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(scenario, "dynamic_load") == 0) {
         return DynamicLoad();
+    }
+    if (std::strcmp(scenario, "api_impl") == 0) {
+        return ApiImpl();
     }
     if (std::strcmp(scenario, "gamesave") == 0) {
         return GameSave();
