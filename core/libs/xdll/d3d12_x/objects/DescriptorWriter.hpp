@@ -2,6 +2,7 @@
 
 #include "DescriptorHeap.hpp"
 #include "ImageDescriptor.hpp"
+#include "SamplerDescriptor.hpp"
 #include "Resource.hpp"
 #include "ViewDesc.hpp"
 
@@ -57,6 +58,8 @@ private:
     std::map<VkImageView, BoundImage> images_;
     std::map<std::uint32_t, std::uint32_t> nextImageSlot_;
     std::uint64_t nextImageBase_ = 1;
+    std::map<VkSampler, SamplerDescriptorWords> boundSamplers_;
+    std::uint32_t nextSamplerSlot_ = 1;
     mutable std::mutex samplerLock_;
     std::vector<std::pair<D3D12_SAMPLER_DESC, VkSampler>> samplers_;
 };

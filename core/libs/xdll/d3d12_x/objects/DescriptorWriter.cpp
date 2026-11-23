@@ -146,7 +146,7 @@ void DescriptorWriter::WriteImageView(Resource* resource, const std::optional<Im
             AbxUnsupported(function, ("the view needs the device feature " + feature + ", which this GPU or driver lacks").c_str());
         }
     }
-    const bool encode = target.heap->ShaderVisible() && context_.bindless != nullptr;
+    const bool encode = context_.bindless != nullptr;
     if (!encode) RequireImageWords(target, HeapEntry::Image, function);
     DescriptorRecord record;
     record.kind = HeapEntry::Image;
@@ -382,13 +382,41 @@ void DescriptorWriter::CreateSampler(const D3D12_SAMPLER_DESC* desc, D3D12_CPU_D
     if (desc == nullptr) {
         AbxUnsupported(function, "a sampler without a description");
     }
-    RequireImageWords(target, HeapEntry::Sampler, function);
+    const bool encode = context_.bindless != nullptr;
+    if (!encode) RequireImageWords(target, HeapEntry::Sampler, function);
     std::string error;
     DescriptorRecord record;
     record.kind = HeapEntry::Sampler;
     record.sampler = SamplerFor(*desc, error);
     Check(record.sampler != VK_NULL_HANDLE, function, error);
-    WriteWords(target, nullptr, 0);
+    if (!encode) {
+        WriteWords(target, nullptr, 0);
+        target.heap->Record(target.index) = record;
+        return;
+    }
+    SamplerDescriptorWords words{};
+    {
+        const std::lock_guard guard(imageLock_);
+        const auto known = boundSamplers_.find(record.sampler);
+        if (known != boundSamplers_.end()) {
+            words = known->second;
+        } else {
+            const std::uint32_t slot = nextSamplerSlot_;
+            const std::optional<SamplerDescriptorWords> encoded = EncodeSamplerDescriptor(*desc, slot);
+            if (!encoded) AbxUnsupported(function, "a sampler whose address modes or count do not fit the sampler descriptor");
+            Check(context_.bindless->WriteSampler(slot, record.sampler, error), function, error);
+            std::uint32_t source[4];
+            std::copy(encoded->begin(), encoded->end(), source);
+            if (!context_.bindless->Table().Insert(SamplerKey(source), slot)) {
+                AbxUnsupported(function, "the bindless descriptor table refused a new sampler key");
+            }
+            Check(context_.bindless->Upload(error), function, error);
+            ++nextSamplerSlot_;
+            words = *encoded;
+            boundSamplers_.emplace(record.sampler, words);
+        }
+    }
+    WriteWords(target, words.data(), sizeof(words));
     target.heap->Record(target.index) = record;
 }
 
@@ -437,7 +465,7 @@ void DescriptorWriter::CopyDescriptors(UINT destinationRanges, const D3D12_CPU_D
             const UINT target = to.index + destinationDone + step;
             const UINT origin = from.index + sourceDone + step;
             const DescriptorRecord record = from.heap->Record(origin);
-            RequireImageWords({to.heap, target}, record.kind, function);
+            if (context_.bindless == nullptr) RequireImageWords({to.heap, target}, record.kind, function);
             std::memmove(to.heap->Slot(target), from.heap->Slot(origin), to.heap->Increment());
             to.heap->Record(target) = record;
         }

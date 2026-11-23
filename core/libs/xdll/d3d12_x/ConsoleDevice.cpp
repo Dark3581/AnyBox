@@ -20,6 +20,7 @@
 #include "RootSignature.hpp"
 #include "TextureDesc.hpp"
 #include "TitleBufferWindow.hpp"
+#include "TitleMemoryRange.hpp"
 #include "VulkanDevice.hpp"
 
 #include <algorithm>
@@ -272,6 +273,74 @@ void STDMETHODCALLTYPE DeviceCreateShaderResourceViewAtAddress(ConsoleDevice* se
     self->descriptors->CreateShaderResourceViewAt(address, resource->Width, desc, destination);
 }
 
+struct ConsoleSamplerDesc {
+    std::uint32_t reserved;
+    std::uint32_t magFilter;
+    std::uint32_t minFilter;
+    std::uint32_t mipFilter;
+    std::uint32_t magFilterRepeat;
+    std::uint32_t reduction;
+    std::uint32_t addressU;
+    std::uint32_t addressV;
+    std::uint32_t addressW;
+    float minLod;
+    float maxLod;
+    std::uint32_t unknown2c;
+    float mipLodBias;
+    std::uint32_t maxAnisotropy;
+    std::uint32_t unknown38;
+    std::uint32_t unknown3c;
+    std::uint32_t comparisonFunc;
+    float borderColor[4];
+};
+static_assert(offsetof(ConsoleSamplerDesc, addressU) == 0x18 && offsetof(ConsoleSamplerDesc, mipLodBias) == 0x30 && offsetof(ConsoleSamplerDesc, comparisonFunc) == 0x40 &&
+              offsetof(ConsoleSamplerDesc, borderColor) == 0x44);
+
+void STDMETHODCALLTYPE DeviceCreateConsoleSampler(ConsoleDevice* self, const ConsoleSamplerDesc* console, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    constexpr std::uint32_t kAnisotropic = 3;
+    if (console == nullptr) {
+        AbxUnsupported("D3D12 device slot 61", "a null sampler description");
+    }
+    const bool anisotropic = console->magFilter == kAnisotropic && console->minFilter == kAnisotropic;
+    if (!anisotropic && ((console->magFilter != 1 && console->magFilter != 2) || (console->minFilter != 1 && console->minFilter != 2))) {
+        AbxUnsupported("D3D12 device slot 61", "min or mag filter values other than the measured 1, 2 and 3");
+    }
+    if ((console->mipFilter != 1 && console->mipFilter != 2) || console->reduction > 2) {
+        AbxUnsupported("D3D12 device slot 61", "mip filter or reduction values other than the measured ones");
+    }
+    UINT filter = 0;
+    if (anisotropic) {
+        filter = D3D12_ANISOTROPIC_FILTERING_BIT | (1u << D3D12_MIN_FILTER_SHIFT) | (1u << D3D12_MAG_FILTER_SHIFT);
+    } else {
+        filter |= (console->minFilter == 1 ? 1u : 0u) << D3D12_MIN_FILTER_SHIFT;
+        filter |= (console->magFilter == 1 ? 1u : 0u) << D3D12_MAG_FILTER_SHIFT;
+    }
+    filter |= (console->mipFilter == 2 ? 1u : 0u) << D3D12_MIP_FILTER_SHIFT;
+    const bool comparison = console->comparisonFunc > D3D12_COMPARISON_FUNC_NEVER;
+    const UINT reduction = comparison                  ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON
+                           : console->reduction == 1 ? D3D12_FILTER_REDUCTION_TYPE_MINIMUM
+                           : console->reduction == 2 ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM
+                                                     : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    filter |= reduction << D3D12_FILTER_REDUCTION_TYPE_SHIFT;
+    D3D12_SAMPLER_DESC desc{};
+    desc.Filter = static_cast<D3D12_FILTER>(filter);
+    desc.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(console->addressU);
+    desc.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(console->addressV);
+    desc.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(console->addressW);
+    desc.MipLODBias = console->mipLodBias;
+    desc.MaxAnisotropy = anisotropic ? (std::max)(console->maxAnisotropy, 1u) : 1u;
+    desc.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(console->comparisonFunc == 0 ? D3D12_COMPARISON_FUNC_NEVER : console->comparisonFunc);
+    std::memcpy(desc.BorderColor, console->borderColor, sizeof(desc.BorderColor));
+    desc.MinLOD = console->minLod;
+    desc.MaxLOD = console->maxLod;
+    self->descriptors->CreateSampler(&desc, destination);
+}
+
+void STDMETHODCALLTYPE DeviceCopyDescriptorsSimple(ConsoleDevice* self, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE destination, D3D12_CPU_DESCRIPTOR_HANDLE source,
+                                                   D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    self->descriptors->CopyDescriptorsSimple(count, destination, source, type);
+}
+
 UINT STDMETHODCALLTYPE DeviceGetDescriptorHandleIncrementSize(ConsoleDevice* self, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     std::string error;
     const std::optional<UINT> increment = abx::d3d12x::DescriptorIncrement(self->descriptorSizes, type, error);
@@ -356,6 +425,19 @@ HRESULT STDMETHODCALLTYPE DeviceCreateCommandSignature(ConsoleDevice* self, cons
     AbxTrace("CreateCommandSignature(stride %u, %u arguments)%s%s", desc->ByteStride, desc->NumArgumentDescs, created->Signature() ? "" : ": executing it stops, ",
              created->Unsupported().c_str());
     return Deliver(Kind::CommandSignature, inner, riid, signature);
+}
+
+HRESULT STDMETHODCALLTYPE DeviceRegisterTitleMemory(ConsoleDevice* self, void* address, std::uint32_t pages, void** handle) {
+    constexpr std::uint64_t kPageBytes = 64 * 1024;
+    if (address == nullptr || pages == 0 || handle == nullptr) {
+        AbxUnsupported("D3D12 device slot 74", "a null address, zero pages or no output");
+    }
+    const std::uint64_t start = reinterpret_cast<std::uint64_t>(address);
+    const std::uint64_t bytes = static_cast<std::uint64_t>(pages) * kPageBytes;
+    AbxLog("d3d12_x", "title memory 0x%llx..0x%llx (%u pages of 64 KiB) registered with the device: recorded, it has no Vulkan backing yet",
+           static_cast<unsigned long long>(start), static_cast<unsigned long long>(start + bytes), pages);
+    auto* range = new abx::d3d12x::TitleMemoryRange(AsParent(self), start, bytes);
+    return Deliver(Kind::TitleMemoryRange, range, __uuidof(ID3D12Pageable), handle);
 }
 
 HRESULT STDMETHODCALLTYPE DeviceCreateFence(ConsoleDevice* self, UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID riid, void** fence) {
@@ -522,6 +604,7 @@ std::array<const void*, kDeviceSlots> DeviceTable() {
     table[19] = reinterpret_cast<const void*>(&DeviceCreateUnorderedAccessView);
     table[20] = reinterpret_cast<const void*>(&DeviceCreateRenderTargetView);
     table[21] = reinterpret_cast<const void*>(&DeviceCreateDepthStencilView);
+    table[24] = reinterpret_cast<const void*>(&DeviceCopyDescriptorsSimple);
     table[25] = reinterpret_cast<const void*>(&DeviceGetResourceAllocationInfo);
     table[26] = reinterpret_cast<const void*>(&DeviceGetCustomHeapProperties);
     table[27] = reinterpret_cast<const void*>(&DeviceCreateCommittedResourceWithState);
@@ -529,9 +612,11 @@ std::array<const void*, kDeviceSlots> DeviceTable() {
     table[39] = reinterpret_cast<const void*>(&DeviceCreateQueryHeap);
     table[41] = reinterpret_cast<const void*>(&DeviceCreateCommandSignature);
     table[48] = reinterpret_cast<const void*>(&DeviceCreateConsoleQueue);
+    table[61] = reinterpret_cast<const void*>(&DeviceCreateConsoleSampler);
     table[62] = reinterpret_cast<const void*>(&DeviceCreateComputePipeline);
     table[70] = reinterpret_cast<const void*>(&DeviceCreateShaderResourceViewAtAddress);
     table[73] = reinterpret_cast<const void*>(&DeviceCreateConsoleCommandList);
+    table[74] = reinterpret_cast<const void*>(&DeviceRegisterTitleMemory);
     table[78] = reinterpret_cast<const void*>(&DeviceSetFrameInterval);
     table[79] = reinterpret_cast<const void*>(&DeviceScheduleFrameEvent);
     table[127] = reinterpret_cast<const void*>(&DeviceCreateCommittedResource);

@@ -62,6 +62,7 @@ const FacadeType& TypeOf(Kind kind) {
     static const FacadeType pipeline = MakeFacadeType("pipeline state", {__uuidof(ID3D12PipelineState)});
     static const FacadeType queries = MakeFacadeType("query heap", {__uuidof(ID3D12QueryHeap)});
     static const FacadeType indirect = MakeFacadeType("command signature", {__uuidof(ID3D12CommandSignature)});
+    static const FacadeType range = MakeFacadeType("registered title memory", {__uuidof(ID3D12Pageable)});
     switch (kind) {
     case Kind::CommandQueue: return queue;
     case Kind::CommandAllocator: return allocator;
@@ -73,6 +74,7 @@ const FacadeType& TypeOf(Kind kind) {
     case Kind::PipelineState: return pipeline;
     case Kind::QueryHeap: return queries;
     case Kind::CommandSignature: return indirect;
+    case Kind::TitleMemoryRange: return range;
     }
     return resource;
 }
