@@ -1,4 +1,5 @@
 #include "BindlessSet.hpp"
+#include "BufferArena.hpp"
 #include "BufferDescriptor.hpp"
 #include "CommandQueue.hpp"
 #include "CommandRecorder.hpp"
@@ -9,10 +10,12 @@
 #include "PipelineCompiler.hpp"
 #include "PipelineLibrary.hpp"
 #include "PipelineState.hpp"
+#include "Resource.hpp"
 #include "ResourceState.hpp"
 #include "RootSignatureLayout.hpp"
 #include "ShaderStore.hpp"
 #include "TextureDesc.hpp"
+#include "TitleBufferWindow.hpp"
 #include "VertexInput.hpp"
 #include "ViewDesc.hpp"
 #include "VulkanDevice.hpp"
@@ -2654,6 +2657,168 @@ int FenceGpu(bool validate) {
     return status;
 }
 
+int ArenaSelfTest() {
+    BufferArena arena(0x10000000ull + 0x1000, 1u << 20);
+    const std::optional<std::uint64_t> a = arena.Allocate(0x10000, 0x10000);
+    const std::optional<std::uint64_t> b = arena.Allocate(0x20000, 0x10000);
+    const std::optional<std::uint64_t> c = arena.Allocate(0x100, 0x100);
+    if (!a || !b || !c || (0x10001000ull + *a) % 0x10000 != 0 || (0x10001000ull + *b) % 0x10000 != 0 || *b < *a + 0x10000 || arena.Used() != 0x30100) return Fail("arena allocations");
+    if (arena.Allocate(0, 16) || arena.Allocate(16, 3) || arena.Allocate(2u << 20, 16)) return Fail("arena refusals");
+    if (!arena.Free(*b) || arena.Free(*b) || arena.Used() != 0x10100) return Fail("arena free");
+    const std::optional<std::uint64_t> again = arena.Allocate(0x20000, 0x10000);
+    if (!again || *again != *b) return Fail("arena reuses the freed range");
+    if (!arena.Free(*a) || !arena.Free(*again) || !arena.Free(*c) || arena.Used() != 0 || arena.FreeRanges() != 1) return Fail("arena coalesces back to one range");
+    const std::optional<std::uint64_t> whole = arena.Allocate(1u << 20, 16);
+    if (!whole || *whole != 0) return Fail("arena whole range after coalescing");
+    std::puts("PASS arena selftest");
+    return 0;
+}
+
+int ResourcesGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress"};
+    requirements.hostMemoryImport = true;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const std::unique_ptr<TitleBufferWindow> window = TitleBufferWindow::Create(*device, 64u << 20, error);
+    if (!window) return Fail("window: " + error);
+    BufferArena arena(window->Start(), window->Size());
+    const ResourceContext context{*device, *window, arena};
+    int status = 0;
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    const auto bufferDesc = [](UINT64 bytes) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = bytes;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc = {1, 0};
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return desc;
+    };
+    const auto heap = [](D3D12_HEAP_TYPE type) { return D3D12_HEAP_PROPERTIES{type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0}; };
+    const auto create = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE) {
+        ID3D12Resource* resource = nullptr;
+        const HRESULT result = Resource::CreateCommitted(context, nullptr, heap(type), flags, desc, state, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource), error);
+        return SUCCEEDED(result) ? resource : nullptr;
+    };
+    ID3D12Resource* upload = create(D3D12_HEAP_TYPE_UPLOAD, bufferDesc(1u << 20), D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* readback = create(D3D12_HEAP_TYPE_READBACK, bufferDesc(1u << 20), D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* local = create(D3D12_HEAP_TYPE_DEFAULT, bufferDesc(100000), D3D12_RESOURCE_STATE_COMMON);
+    expect(upload && readback && local, "create buffers: " + error);
+    if (status != 0) return status;
+    const D3D12_GPU_VIRTUAL_ADDRESS uploadAddress = upload->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS localAddress = local->GetGPUVirtualAddress();
+    expect(uploadAddress % kBufferPlacementAlignment == 0 && localAddress % kBufferPlacementAlignment == 0 && window->Contains(uploadAddress, 1u << 20) &&
+               window->Contains(localAddress, 100000) && uploadAddress != localAddress && uploadAddress < 0x100000000ull, "buffer addresses in the window, aligned and distinct");
+    const D3D12_RESOURCE_DESC localDesc = local->GetDesc();
+    expect(localDesc.Width == 100000 && localDesc.Alignment == kBufferPlacementAlignment && localDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER, "buffer description");
+    D3D12_HEAP_PROPERTIES properties{};
+    D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_DENY_BUFFERS;
+    expect(SUCCEEDED(upload->GetHeapProperties(&properties, &heapFlags)) && properties.Type == D3D12_HEAP_TYPE_UPLOAD && heapFlags == D3D12_HEAP_FLAG_NONE, "heap properties");
+    std::uint8_t* written = nullptr;
+    expect(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&written))) && written != nullptr, "map upload buffer");
+    for (std::uint32_t index = 0; index < 4096; ++index) written[index] = static_cast<std::uint8_t>(index * 7 + 1);
+    upload->Unmap(0, nullptr);
+    void* refused = nullptr;
+    expect(upload->Map(1, nullptr, &refused) == E_INVALIDARG, "map of subresource 1 refused");
+
+    D3D12_RESOURCE_DESC colorDesc = TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    ID3D12Resource* color = create(D3D12_HEAP_TYPE_DEFAULT, colorDesc, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12Resource* depth = create(D3D12_HEAP_TYPE_DEFAULT, TextureDesc2D(DXGI_FORMAT_D32_FLOAT, 32, 32, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), D3D12_RESOURCE_STATE_COPY_SOURCE);
+    expect(color && depth, "create textures: " + error);
+    if (status != 0) return status;
+    expect(color->GetGPUVirtualAddress() == 0 && color->Map(0, nullptr, &refused) == E_INVALIDARG, "textures have no address and cannot be mapped");
+    expect(color->GetDesc().Width == 64 && color->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM, "texture description");
+
+    Resource* uploadResource = dynamic_cast<Resource*>(upload);
+    Resource* readbackResource = dynamic_cast<Resource*>(readback);
+    Resource* colorResource = dynamic_cast<Resource*>(color);
+    Resource* depthResource = dynamic_cast<Resource*>(depth);
+    std::uint8_t* readBytes = nullptr;
+    readback->Map(0, nullptr, reinterpret_cast<void**>(&readBytes));
+    std::fill(readBytes, readBytes + (1u << 20), std::uint8_t{0xAB});
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT colorPrint{};
+    colorPrint.Offset = 0x10000;
+    colorPrint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT depthPrint{};
+    depthPrint.Offset = 0x20000;
+    depthPrint.Footprint = {DXGI_FORMAT_D32_FLOAT, 32, 32, 1, 256};
+    bool recorded = true;
+    const bool submitted = device->Submit(
+        [&](VkCommandBuffer commands) {
+            CommandRecorder recorder(*device, commands);
+            recorded = recorded && recorder.CopyBufferRegion(readbackResource->Buffer(), 0, uploadResource->Buffer(), 0, 4096, error);
+            recorded = recorded && recorder.CopyTextureToBuffer(readbackResource->Buffer(), colorPrint, colorResource->Texture(), D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error);
+            recorded = recorded && recorder.CopyTextureToBuffer(readbackResource->Buffer(), depthPrint, depthResource->Texture(), D3D12_RESOURCE_STATE_COPY_SOURCE, 0, nullptr, error);
+            VkMemoryBarrier2 host{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            host.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+            host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+            host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers = &host;
+            device->Vk().cmdPipelineBarrier2(commands, &dependency);
+        },
+        error);
+    expect(submitted && recorded, "copies between resources: " + error);
+    if (status == 0) {
+        bool same = true;
+        for (std::uint32_t index = 0; index < 4096 && same; ++index) same = readBytes[index] == static_cast<std::uint8_t>(index * 7 + 1);
+        expect(same, "a GPU copy between two buffer resources in the window");
+        bool zeroColor = true;
+        for (UINT row = 0; row < 64 && zeroColor; ++row) {
+            for (UINT byte = 0; byte < 64 * 4 && zeroColor; ++byte) zeroColor = readBytes[colorPrint.Offset + row * 256 + byte] == 0;
+        }
+        expect(zeroColor, "a new color texture reads back as zero");
+        float depthValue = 1.0f;
+        std::memcpy(&depthValue, readBytes + depthPrint.Offset + 5 * 256 + 5 * 4, sizeof(depthValue));
+        expect(depthValue == 0.0f, "a new depth texture reads back as zero");
+    }
+    readback->Unmap(0, nullptr);
+
+    const std::uint64_t usedBefore = arena.Used();
+    std::uint8_t* dirty = nullptr;
+    local->Map(0, nullptr, reinterpret_cast<void**>(&dirty));
+    std::fill(dirty, dirty + 100000, std::uint8_t{0x5C});
+    local->Unmap(0, nullptr);
+    local->Release();
+    local = create(D3D12_HEAP_TYPE_DEFAULT, bufferDesc(100000), D3D12_RESOURCE_STATE_COMMON);
+    std::uint8_t* fresh = nullptr;
+    expect(local && local->GetGPUVirtualAddress() == localAddress && SUCCEEDED(local->Map(0, nullptr, reinterpret_cast<void**>(&fresh))) && fresh[0] == 0 && fresh[99999] == 0 &&
+               arena.Used() == usedBefore, "a released buffer's range is reused and zeroed");
+
+    D3D12_RESOURCE_DESC oddBuffer = bufferDesc(256);
+    oddBuffer.Height = 2;
+    expect(!create(D3D12_HEAP_TYPE_DEFAULT, oddBuffer, D3D12_RESOURCE_STATE_COMMON) && error.find("height, depth and mips of 1") != std::string::npos, "a buffer with height 2 refused");
+    expect(!create(D3D12_HEAP_TYPE_UPLOAD, colorDesc, D3D12_RESOURCE_STATE_GENERIC_READ) && error.find("default heap") != std::string::npos, "a texture in an upload heap refused");
+    expect(!create(D3D12_HEAP_TYPE_DEFAULT, bufferDesc(256), D3D12_RESOURCE_STATE_COMMON, D3D12_HEAP_FLAG_SHARED) && error.find("heap flags") != std::string::npos, "a shared heap refused");
+    expect(!create(D3D12_HEAP_TYPE_DEFAULT, bufferDesc(128u << 20), D3D12_RESOURCE_STATE_COMMON) && error.find("no free range") != std::string::npos, "a buffer larger than the window refused");
+    for (ID3D12Resource* resource : {upload, readback, local, color, depth}) {
+        if (resource != nullptr) resource->Release();
+    }
+    expect(arena.Used() == 0, "every buffer range returned to the window");
+    std::printf("resources: %zu checks\n", checks);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS resources gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -2672,6 +2837,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "buffers-selftest") == 0) return BuffersSelfTest();
     if (argc == 2 && std::strcmp(argv[1], "rootsig-selftest") == 0) return RootSignatureSelfTest();
     if (argc >= 2 && std::strcmp(argv[1], "fence-gpu") == 0) return FenceGpu(HasFlag(argc, argv, "--validate"));
+    if (argc == 2 && std::strcmp(argv[1], "arena-selftest") == 0) return ArenaSelfTest();
+    if (argc >= 2 && std::strcmp(argv[1], "resources-gpu") == 0) return ResourcesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
@@ -2681,6 +2848,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate]");
     return 2;
 }

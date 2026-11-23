@@ -68,6 +68,7 @@ struct DeviceFunctions {
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
     PFN_vkCmdClearColorImage cmdClearColorImage = nullptr;
+    PFN_vkCmdClearDepthStencilImage cmdClearDepthStencilImage = nullptr;
     PFN_vkCmdBeginRendering cmdBeginRendering = nullptr;
     PFN_vkCmdEndRendering cmdEndRendering = nullptr;
     PFN_vkCmdClearAttachments cmdClearAttachments = nullptr;

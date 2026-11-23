@@ -498,6 +498,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdPushConstants = DeviceFunction<PFN_vkCmdPushConstants>(getDeviceProcAddr, device_, "vkCmdPushConstants");
     vk_.cmdDispatch = DeviceFunction<PFN_vkCmdDispatch>(getDeviceProcAddr, device_, "vkCmdDispatch");
     vk_.cmdClearColorImage = DeviceFunction<PFN_vkCmdClearColorImage>(getDeviceProcAddr, device_, "vkCmdClearColorImage");
+    vk_.cmdClearDepthStencilImage = DeviceFunction<PFN_vkCmdClearDepthStencilImage>(getDeviceProcAddr, device_, "vkCmdClearDepthStencilImage");
     vk_.cmdBeginRendering = DeviceFunction<PFN_vkCmdBeginRendering>(getDeviceProcAddr, device_, "vkCmdBeginRendering");
     vk_.cmdEndRendering = DeviceFunction<PFN_vkCmdEndRendering>(getDeviceProcAddr, device_, "vkCmdEndRendering");
     vk_.cmdClearAttachments = DeviceFunction<PFN_vkCmdClearAttachments>(getDeviceProcAddr, device_, "vkCmdClearAttachments");
