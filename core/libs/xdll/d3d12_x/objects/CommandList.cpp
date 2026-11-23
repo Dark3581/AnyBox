@@ -66,7 +66,24 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
     commands_ = commands;
     closed_ = false;
     states_.clear();
+    ResetBindings();
     return true;
+}
+
+void CommandList::ResetBindings() {
+    shaderResourceHeap_ = nullptr;
+    samplerHeap_ = nullptr;
+    renderTargets_.clear();
+    depthStencil_.reset();
+}
+
+const DescriptorRecord& CommandList::Attachment(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_DESCRIPTOR_HEAP_TYPE type, const char* function) const {
+    UINT index = 0;
+    const DescriptorHeap* heap = DescriptorHeap::Find(handle.ptr, index);
+    if (heap == nullptr || heap->Type() != type) {
+        AbxUnsupported(function, "a descriptor handle outside every render target or depth-stencil heap AnyBox created");
+    }
+    return heap->Record(index);
 }
 
 HRESULT STDMETHODCALLTYPE CommandList::Close() {
@@ -98,6 +115,7 @@ void STDMETHODCALLTYPE CommandList::ClearState(ID3D12PipelineState* state) {
     if (state != nullptr) {
         NotYet("ID3D12GraphicsCommandList::ClearState");
     }
+    ResetBindings();
 }
 
 Resource* CommandList::Ours(ID3D12Resource* resource, const char* function) const {
@@ -345,7 +363,31 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
 }
 
 void STDMETHODCALLTYPE CommandList::ExecuteBundle(ID3D12GraphicsCommandList*) { AbxUnsupported("ID3D12GraphicsCommandList::ExecuteBundle", "bundles"); }
-void STDMETHODCALLTYPE CommandList::SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) { NotYet("ID3D12GraphicsCommandList::SetDescriptorHeaps"); }
+void STDMETHODCALLTYPE CommandList::SetDescriptorHeaps(UINT count, ID3D12DescriptorHeap* const* heaps) {
+    const char* function = "ID3D12GraphicsCommandList::SetDescriptorHeaps";
+    Recorder(function);
+    if (count != 0 && heaps == nullptr) {
+        AbxUnsupported(function, "descriptor heaps without a heap array");
+    }
+    DescriptorHeap* shaderResource = nullptr;
+    DescriptorHeap* sampler = nullptr;
+    for (UINT index = 0; index < count; ++index) {
+        DescriptorHeap* heap = dynamic_cast<DescriptorHeap*>(heaps[index]);
+        if (heap == nullptr) {
+            AbxUnsupported(function, "a descriptor heap that AnyBox did not create");
+        }
+        if (!heap->ShaderVisible()) {
+            AbxUnsupported(function, "a descriptor heap that is not shader visible");
+        }
+        DescriptorHeap*& slot = heap->Type() == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? sampler : shaderResource;
+        if (slot != nullptr) {
+            AbxUnsupported(function, "two descriptor heaps of the same type");
+        }
+        slot = heap;
+    }
+    shaderResourceHeap_ = shaderResource;
+    samplerHeap_ = sampler;
+}
 void STDMETHODCALLTYPE CommandList::SetComputeRootSignature(ID3D12RootSignature*) { NotYet("ID3D12GraphicsCommandList::SetComputeRootSignature"); }
 void STDMETHODCALLTYPE CommandList::SetGraphicsRootSignature(ID3D12RootSignature*) { NotYet("ID3D12GraphicsCommandList::SetGraphicsRootSignature"); }
 void STDMETHODCALLTYPE CommandList::SetComputeRootDescriptorTable(UINT, D3D12_GPU_DESCRIPTOR_HANDLE) { NotYet("ID3D12GraphicsCommandList::SetComputeRootDescriptorTable"); }
@@ -386,14 +428,62 @@ void STDMETHODCALLTYPE CommandList::IASetVertexBuffers(UINT start, UINT count, c
 }
 
 void STDMETHODCALLTYPE CommandList::SOSetTargets(UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*) { AbxUnsupported("ID3D12GraphicsCommandList::SOSetTargets", "stream output"); }
-void STDMETHODCALLTYPE CommandList::OMSetRenderTargets(UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*) {
-    NotYet("ID3D12GraphicsCommandList::OMSetRenderTargets");
+void STDMETHODCALLTYPE CommandList::OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL singleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* depthStencil) {
+    const char* function = "ID3D12GraphicsCommandList::OMSetRenderTargets";
+    Recorder(function);
+    if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (count != 0 && targets == nullptr)) {
+        AbxUnsupported(function, "more than eight render targets, or render targets without a handle array");
+    }
+    std::vector<AttachmentRef> colors;
+    colors.reserve(count);
+    for (UINT index = 0; index < count; ++index) {
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = targets[singleRange ? 0 : index];
+        if (singleRange) {
+            UINT first = 0;
+            const DescriptorHeap* heap = DescriptorHeap::Find(handle.ptr, first);
+            if (heap == nullptr) {
+                AbxUnsupported(function, "a descriptor handle outside every render target heap AnyBox created");
+            }
+            handle.ptr += static_cast<SIZE_T>(index) * heap->Increment();
+        }
+        const DescriptorRecord& record = Attachment(handle, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, function);
+        colors.push_back(record.kind == HeapEntry::RenderTarget ? record.attachment : AttachmentRef{});
+    }
+    std::optional<AttachmentRef> depth;
+    if (depthStencil != nullptr) {
+        const DescriptorRecord& record = Attachment(*depthStencil, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, function);
+        if (record.kind == HeapEntry::DepthStencil) depth = record.attachment;
+    }
+    renderTargets_ = std::move(colors);
+    depthStencil_ = depth;
 }
-void STDMETHODCALLTYPE CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*) {
-    NotYet("ID3D12GraphicsCommandList::ClearDepthStencilView");
+
+void STDMETHODCALLTYPE CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT count, const D3D12_RECT* rects) {
+    const char* function = "ID3D12GraphicsCommandList::ClearDepthStencilView";
+    if (count != 0 && rects == nullptr) {
+        AbxUnsupported(function, "clear rectangles without a rectangle array");
+    }
+    const DescriptorRecord& record = Attachment(view, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, function);
+    if (record.kind != HeapEntry::DepthStencil) {
+        AbxUnsupported(function, "clearing a null depth-stencil view");
+    }
+    std::string error;
+    const std::vector<D3D12_RECT> list = count != 0 ? std::vector<D3D12_RECT>(rects, rects + count) : std::vector<D3D12_RECT>{};
+    Check(Recorder(function).ClearDepthStencil(record.attachment, flags, depth, stencil, list, error), function, error);
 }
-void STDMETHODCALLTYPE CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT[4], UINT, const D3D12_RECT*) {
-    NotYet("ID3D12GraphicsCommandList::ClearRenderTargetView");
+
+void STDMETHODCALLTYPE CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count, const D3D12_RECT* rects) {
+    const char* function = "ID3D12GraphicsCommandList::ClearRenderTargetView";
+    if (color == nullptr || (count != 0 && rects == nullptr)) {
+        AbxUnsupported(function, "a clear without a color, or clear rectangles without a rectangle array");
+    }
+    const DescriptorRecord& record = Attachment(view, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, function);
+    if (record.kind != HeapEntry::RenderTarget) {
+        AbxUnsupported(function, "clearing a null render target view");
+    }
+    std::string error;
+    const std::vector<D3D12_RECT> list = count != 0 ? std::vector<D3D12_RECT>(rects, rects + count) : std::vector<D3D12_RECT>{};
+    Check(Recorder(function).ClearRenderTarget(record.attachment, color, list, error), function, error);
 }
 void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT[4], UINT, const D3D12_RECT*) {
     NotYet("ID3D12GraphicsCommandList::ClearUnorderedAccessViewUint");

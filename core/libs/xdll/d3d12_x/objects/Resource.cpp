@@ -155,9 +155,48 @@ bool Resource::CreateTexture(D3D12_RESOURCE_STATES initial, std::string& error) 
 
 Resource::~Resource() {
     const DeviceFunctions& vk = context_.device.Vk();
+    for (const auto& [info, view] : views_) vk.destroyImageView(context_.device.Handle(), view, nullptr);
     if (texture_.image != VK_NULL_HANDLE) vk.destroyImage(context_.device.Handle(), texture_.image, nullptr);
     if (memory_ != VK_NULL_HANDLE) vk.freeMemory(context_.device.Handle(), memory_, nullptr);
     if (allocated_) context_.arena.Free(offset_);
+}
+
+namespace {
+
+bool SameView(const VkImageViewCreateInfo& a, const VkImageViewCreateInfo& b) {
+    const VkComponentMapping& x = a.components;
+    const VkComponentMapping& y = b.components;
+    const VkImageSubresourceRange& r = a.subresourceRange;
+    const VkImageSubresourceRange& s = b.subresourceRange;
+    return a.flags == b.flags && a.viewType == b.viewType && a.format == b.format && x.r == y.r && x.g == y.g && x.b == y.b && x.a == y.a && r.aspectMask == s.aspectMask &&
+           r.baseMipLevel == s.baseMipLevel && r.levelCount == s.levelCount && r.baseArrayLayer == s.baseArrayLayer && r.layerCount == s.layerCount;
+}
+
+}
+
+VkImageView Resource::View(const VkImageViewCreateInfo& info, std::string& error) {
+    if (IsBuffer() || info.pNext != nullptr) {
+        error = IsBuffer() ? "a buffer has no image views" : "image view extensions are not supported";
+        return VK_NULL_HANDLE;
+    }
+    std::lock_guard<std::mutex> guard(viewLock_);
+    for (const auto& [known, view] : views_) {
+        if (SameView(known, info)) return view;
+    }
+    VkImageViewCreateInfo create = info;
+    create.image = texture_.image;
+    VkImageView view = VK_NULL_HANDLE;
+    if (context_.device.Vk().createImageView(context_.device.Handle(), &create, nullptr, &view) != VK_SUCCESS) {
+        error = "vkCreateImageView failed";
+        return VK_NULL_HANDLE;
+    }
+    views_.emplace_back(create, view);
+    return view;
+}
+
+std::size_t Resource::Views() const {
+    std::lock_guard<std::mutex> guard(viewLock_);
+    return views_.size();
 }
 
 bool Resource::Implements(REFIID riid) const {

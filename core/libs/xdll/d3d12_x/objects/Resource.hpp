@@ -8,7 +8,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace abx::d3d12x {
 
@@ -44,6 +47,8 @@ public:
     BufferRef Buffer() const { return {context_.window.Buffer(), offset_, desc_.Width}; }
     const TextureRef& Texture() const { return texture_; }
     UINT Maps() const { return maps_; }
+    VkImageView View(const VkImageViewCreateInfo& info, std::string& error);
+    std::size_t Views() const;
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -64,6 +69,8 @@ private:
     TextureRef texture_;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     std::atomic<UINT> maps_{0};
+    mutable std::mutex viewLock_;
+    std::vector<std::pair<VkImageViewCreateInfo, VkImageView>> views_;
 };
 
 }

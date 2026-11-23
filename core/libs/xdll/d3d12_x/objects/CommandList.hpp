@@ -2,13 +2,16 @@
 
 #include "CommandAllocator.hpp"
 #include "CommandRecorder.hpp"
+#include "DescriptorHeap.hpp"
 #include "ObjectBase.hpp"
 #include "Resource.hpp"
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace abx::d3d12x {
 
@@ -73,6 +76,10 @@ public:
 
     VkCommandBuffer Commands() const { return commands_; }
     bool Closed() const { return closed_; }
+    DescriptorHeap* ShaderResourceHeap() const { return shaderResourceHeap_; }
+    DescriptorHeap* SamplerHeap() const { return samplerHeap_; }
+    const std::vector<AttachmentRef>& RenderTargets() const { return renderTargets_; }
+    const std::optional<AttachmentRef>& DepthStencil() const { return depthStencil_; }
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -85,12 +92,18 @@ private:
     void Check(bool ok, const char* function, const std::string& error) const;
     CommandRecorder Recorder(const char* function) const;
     BufferRef WindowRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 bytes, const char* function) const;
+    const DescriptorRecord& Attachment(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_DESCRIPTOR_HEAP_TYPE type, const char* function) const;
+    void ResetBindings();
 
     ResourceContext context_;
     D3D12_COMMAND_LIST_TYPE type_;
     VkCommandBuffer commands_ = VK_NULL_HANDLE;
     bool closed_ = true;
     std::map<std::pair<const Resource*, UINT>, D3D12_RESOURCE_STATES> states_;
+    DescriptorHeap* shaderResourceHeap_ = nullptr;
+    DescriptorHeap* samplerHeap_ = nullptr;
+    std::vector<AttachmentRef> renderTargets_;
+    std::optional<AttachmentRef> depthStencil_;
 };
 
 }

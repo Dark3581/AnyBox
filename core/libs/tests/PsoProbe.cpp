@@ -6,6 +6,9 @@
 #include "CommandQueue.hpp"
 #include "CommandRecorder.hpp"
 #include "CopyLayout.hpp"
+#include "DescriptorHeap.hpp"
+#include "DescriptorSizes.hpp"
+#include "DescriptorWriter.hpp"
 #include "Fence.hpp"
 #include "GraphicsPipeline.hpp"
 #include "GraphicsState.hpp"
@@ -3020,6 +3023,283 @@ int CommandListGpu(bool validate) {
     return status;
 }
 
+int DescriptorsGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress"};
+    requirements.hostMemoryImport = true;
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    const std::unique_ptr<TitleBufferWindow> window = TitleBufferWindow::Create(*device, 64u << 20, error);
+    if (!window) return Fail("window: " + error);
+    BufferArena arena(window->Start(), window->Size());
+    const ResourceContext context{*device, *window, arena};
+    int status = 0;
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+
+    DescriptorSizes sizes;
+    sizes.shaderResource = 32;
+    sizes.sampler = 16;
+    sizes.renderTarget = 64;
+    sizes.depthStencil = 64;
+    expect(!DescriptorIncrement(DescriptorSizes{}, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, error) && error.find("unknown") != std::string::npos, "an unset descriptor size is unknown, not zero");
+    DescriptorSizes narrow;
+    narrow.shaderResource = 16;
+    narrow.sampler = 18;
+    expect(!DescriptorIncrement(narrow, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, error), "a shader resource size below an image descriptor refused");
+    expect(!DescriptorIncrement(narrow, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, error), "a sampler size that is not a multiple of 4 refused");
+    expect(DescriptorIncrement(sizes, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, error) == 64u, "a set descriptor size");
+    expect(!DescriptorHeapBytes(0, 32, error) && !DescriptorHeapBytes(0xFFFFFFFFu, 64, error) && DescriptorHeapBytes(1000, 32, error) == 32000u, "descriptor heap byte counts");
+
+    const auto makeHeap = [&](D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count, D3D12_DESCRIPTOR_HEAP_FLAGS flags, const DescriptorSizes& with, HRESULT* result = nullptr) {
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{type, count, flags, 0};
+        ID3D12DescriptorHeap* heap = nullptr;
+        const HRESULT created = DescriptorHeap::Create(context, nullptr, desc, with, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&heap), error);
+        if (result != nullptr) *result = created;
+        return SUCCEEDED(created) ? heap : nullptr;
+    };
+    const std::uint64_t usedBefore = arena.Used();
+    ID3D12DescriptorHeap* visible = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, sizes);
+    ID3D12DescriptorHeap* staging = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, sizes);
+    ID3D12DescriptorHeap* rtvs = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, sizes);
+    ID3D12DescriptorHeap* dsvs = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, sizes);
+    ID3D12DescriptorHeap* samplers = makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, sizes);
+    expect(visible && staging && rtvs && dsvs && samplers, "create descriptor heaps: " + error);
+    if (status != 0) return status;
+    HRESULT refused = S_OK;
+    expect(!makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, sizes, &refused) && refused == E_INVALIDARG, "a shader-visible render target heap refused");
+    expect(!makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, DescriptorSizes{}, &refused) && refused == E_INVALIDARG && error.find("unknown") != std::string::npos,
+           "a heap whose descriptor size is unknown refused");
+    expect(!makeHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(0x10), sizes, &refused) && refused == E_INVALIDARG, "unknown heap flags refused");
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE visibleCpu = visible->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE visibleGpu = visible->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE stagingCpu = staging->GetCPUDescriptorHandleForHeapStart();
+    expect(visibleCpu.ptr == visibleGpu.ptr && window->Contains(visibleGpu.ptr, 64 * 32) && visibleGpu.ptr < 0x100000000ull, "a shader-visible heap sits in the buffer window");
+    expect(staging->GetGPUDescriptorHandleForHeapStart().ptr == 0 && arena.Used() > usedBefore, "a CPU-only heap has no GPU handle");
+    const D3D12_DESCRIPTOR_HEAP_DESC readBack = visible->GetDesc();
+    expect(readBack.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && readBack.NumDescriptors == 64 && readBack.Flags == D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, "heap description");
+    void* queried = nullptr;
+    expect(SUCCEEDED(visible->QueryInterface(__uuidof(ID3D12Pageable), &queried)) && queried == visible, "a heap is pageable");
+    if (queried != nullptr) static_cast<IUnknown*>(queried)->Release();
+    UINT found = 0;
+    expect(DescriptorHeap::Find(stagingCpu.ptr + 3 * 32, found) == dynamic_cast<DescriptorHeap*>(staging) && found == 3, "a handle resolves to its heap and index");
+    expect(!DescriptorHeap::Find(stagingCpu.ptr + 5, found) && !DescriptorHeap::Find(stagingCpu.ptr + 16 * 32, found), "misaligned and past-the-end handles resolve to nothing");
+
+    const auto create = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
+        const D3D12_HEAP_PROPERTIES heap{type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+        ID3D12Resource* resource = nullptr;
+        const HRESULT result = Resource::CreateCommitted(context, nullptr, heap, D3D12_HEAP_FLAG_NONE, desc, state, __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource), error);
+        return SUCCEEDED(result) ? resource : nullptr;
+    };
+    D3D12_RESOURCE_DESC bufferDesc{};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = 1u << 20;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.SampleDesc = {1, 0};
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* upload = create(D3D12_HEAP_TYPE_UPLOAD, bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* readback = create(D3D12_HEAP_TYPE_READBACK, bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* color = create(D3D12_HEAP_TYPE_DEFAULT, TextureDesc2D(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                                   D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12Resource* depth = create(D3D12_HEAP_TYPE_DEFAULT, TextureDesc2D(DXGI_FORMAT_D32_FLOAT, 32, 32, 1, 1, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
+                                   D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    expect(upload && readback && color && depth, "create resources: " + error);
+    if (status != 0) return status;
+    const D3D12_GPU_VIRTUAL_ADDRESS uploadAddress = upload->GetGPUVirtualAddress();
+    const auto at = [](D3D12_CPU_DESCRIPTOR_HANDLE start, UINT index, UINT increment) { return D3D12_CPU_DESCRIPTOR_HANDLE{start.ptr + static_cast<SIZE_T>(index) * increment}; };
+    const auto words = [](D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+        BufferDescriptorWords result{};
+        std::memcpy(result.data(), reinterpret_cast<const void*>(handle.ptr), sizeof(result));
+        return result;
+    };
+    const auto zeroTail = [](D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+        const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(handle.ptr);
+        return std::all_of(bytes + 16, bytes + 32, [](std::uint8_t byte) { return byte == 0; });
+    };
+    DescriptorHeap* stagingHeap = dynamic_cast<DescriptorHeap*>(staging);
+    DescriptorHeap* visibleHeap = dynamic_cast<DescriptorHeap*>(visible);
+    {
+        DescriptorWriter writer(context);
+        std::memset(reinterpret_cast<void*>(stagingCpu.ptr), 0x77, 16 * 32);
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{uploadAddress + 256, 512};
+        writer.CreateConstantBufferView(&cbv, at(stagingCpu, 3, 32));
+        D3D12_SHADER_RESOURCE_VIEW_DESC structured{};
+        structured.Format = DXGI_FORMAT_UNKNOWN;
+        structured.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        structured.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        structured.Buffer = {4, 10, 16, D3D12_BUFFER_SRV_FLAG_NONE};
+        writer.CreateShaderResourceView(upload, &structured, at(stagingCpu, 4, 32));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC raw{};
+        raw.Format = DXGI_FORMAT_R32_TYPELESS;
+        raw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        raw.Buffer = {0, 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+        writer.CreateUnorderedAccessView(upload, nullptr, &raw, at(stagingCpu, 5, 32));
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC nullCbv{0, 0};
+        writer.CreateConstantBufferView(&nullCbv, at(stagingCpu, 6, 32));
+        const BufferDescriptorFields cbvFields = DecodeBufferDescriptor(words(at(stagingCpu, 3, 32)));
+        const BufferDescriptorFields srvFields = DecodeBufferDescriptor(words(at(stagingCpu, 4, 32)));
+        const BufferDescriptorFields uavFields = DecodeBufferDescriptor(words(at(stagingCpu, 5, 32)));
+        expect(cbvFields.base == uploadAddress + 256 && zeroTail(at(stagingCpu, 3, 32)) && stagingHeap->Record(3).kind == HeapEntry::Buffer,
+               "a constant buffer view writes its buffer descriptor and clears the rest of the slot");
+        expect(srvFields.base == uploadAddress + 64 && srvFields.stride == 16 && srvFields.records == 10, "a structured buffer view starts at its first element");
+        expect(uavFields.base == uploadAddress && uavFields.bounds == BufferBounds::Raw && stagingHeap->Record(5).unorderedAccess, "a raw unordered access view");
+        const std::uint8_t* nullSlot = reinterpret_cast<const std::uint8_t*>(at(stagingCpu, 6, 32).ptr);
+        expect(std::all_of(nullSlot, nullSlot + 32, [](std::uint8_t byte) { return byte == 0; }) && stagingHeap->Record(6).kind == HeapEntry::Empty,
+               "a null constant buffer view is all zero");
+
+        writer.CopyDescriptorsSimple(3, at(visibleCpu, 10, 32), at(stagingCpu, 3, 32), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        expect(std::memcmp(reinterpret_cast<const void*>(at(visibleCpu, 10, 32).ptr), reinterpret_cast<const void*>(at(stagingCpu, 3, 32).ptr), 3 * 32) == 0 &&
+                   visibleHeap->Record(12).unorderedAccess,
+               "CopyDescriptorsSimple into the shader-visible heap");
+        const D3D12_CPU_DESCRIPTOR_HANDLE destinations[] = {at(visibleCpu, 20, 32), at(visibleCpu, 30, 32)};
+        const UINT destinationSizes[] = {2, 2};
+        const D3D12_CPU_DESCRIPTOR_HANDLE sources[] = {at(stagingCpu, 3, 32), at(stagingCpu, 4, 32)};
+        const UINT sourceSizes[] = {1, 3};
+        writer.CopyDescriptors(2, destinations, destinationSizes, 2, sources, sourceSizes, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const auto same = [&](UINT to, UINT from) {
+            return std::memcmp(reinterpret_cast<const void*>(at(visibleCpu, to, 32).ptr), reinterpret_cast<const void*>(at(stagingCpu, from, 32).ptr), 32) == 0 &&
+                   visibleHeap->Record(to).kind == stagingHeap->Record(from).kind;
+        };
+        expect(same(20, 3) && same(21, 4) && same(30, 5) && same(31, 6), "CopyDescriptors across ranges of different sizes");
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtvCpu = rtvs->GetCPUDescriptorHandleForHeapStart();
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsvCpu = dsvs->GetCPUDescriptorHandleForHeapStart();
+        D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
+        rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        writer.CreateRenderTargetView(color, &rtvDesc, at(rtvCpu, 0, 64));
+        writer.CreateRenderTargetView(color, &rtvDesc, at(rtvCpu, 1, 64));
+        writer.CreateRenderTargetView(nullptr, &rtvDesc, at(rtvCpu, 2, 64));
+        writer.CreateRenderTargetView(color, nullptr, at(rtvCpu, 3, 64));
+        writer.CreateDepthStencilView(depth, nullptr, at(dsvCpu, 0, 64));
+        const DescriptorHeap* rtvHeap = dynamic_cast<DescriptorHeap*>(rtvs);
+        const DescriptorHeap* dsvHeap = dynamic_cast<DescriptorHeap*>(dsvs);
+        const DescriptorRecord& target = rtvHeap->Record(1);
+        expect(target.kind == HeapEntry::RenderTarget && target.view != VK_NULL_HANDLE && target.view == rtvHeap->Record(0).view && target.attachment.extent.width == 64 &&
+                   target.attachment.layers == 1,
+               "render target views of the same subresource share one cached image view");
+        expect(rtvHeap->Record(3).view != target.view && dynamic_cast<Resource*>(color)->Views() == 2, "the default render target view is a 2D array view, cached separately");
+        expect(rtvHeap->Record(2).kind == HeapEntry::Empty, "a null render target view");
+        const DescriptorRecord& depthTarget = dsvHeap->Record(0);
+        expect(depthTarget.kind == HeapEntry::DepthStencil && depthTarget.attachment.aspects == VK_IMAGE_ASPECT_DEPTH_BIT && depthTarget.attachment.extent.height == 32,
+               "a depth-stencil view");
+        writer.CreateShaderResourceView(color, nullptr, at(stagingCpu, 7, 32));
+        writer.CopyDescriptorsSimple(1, at(stagingCpu, 8, 32), at(stagingCpu, 7, 32), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        expect(stagingHeap->Record(8).kind == HeapEntry::Image && stagingHeap->Record(8).view != VK_NULL_HANDLE && stagingHeap->Record(8).resource == dynamic_cast<Resource*>(color),
+               "a texture shader resource view in a CPU-only heap, copied");
+        D3D12_SAMPLER_DESC samplerDesc{};
+        samplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplerDesc.MaxAnisotropy = 1;
+        samplerDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        samplerDesc.MaxLOD = D3D12_FLOAT32_MAX;
+        const D3D12_CPU_DESCRIPTOR_HANDLE samplerCpu = samplers->GetCPUDescriptorHandleForHeapStart();
+        writer.CreateSampler(&samplerDesc, at(samplerCpu, 0, 16));
+        writer.CreateSampler(&samplerDesc, at(samplerCpu, 1, 16));
+        const DescriptorHeap* samplerHeap = dynamic_cast<DescriptorHeap*>(samplers);
+        expect(samplerHeap->Record(0).kind == HeapEntry::Sampler && samplerHeap->Record(0).sampler != VK_NULL_HANDLE &&
+                   samplerHeap->Record(0).sampler == samplerHeap->Record(1).sampler && writer.Samplers() == 1,
+               "identical samplers share one Vulkan sampler");
+
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12Fence* fence = nullptr;
+        ID3D12CommandAllocator* allocator = nullptr;
+        ID3D12GraphicsCommandList* list = nullptr;
+        const D3D12_COMMAND_QUEUE_DESC queueDesc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+        expect(SUCCEEDED(CommandQueue::Create(*device, nullptr, queueDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue), error)) &&
+                   SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence), error)) &&
+                   SUCCEEDED(CommandAllocator::Create(*device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&allocator),
+                                                      error)) &&
+                   SUCCEEDED(CommandList::Create(context, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                                 reinterpret_cast<void**>(&list), error)),
+               "create queue, fence, allocator and list: " + error);
+        if (status != 0) return status;
+        CommandList* recording = dynamic_cast<CommandList*>(list);
+        const D3D12_CPU_DESCRIPTOR_HANDLE oneTarget = at(rtvCpu, 1, 64);
+        const D3D12_CPU_DESCRIPTOR_HANDLE depthView = at(dsvCpu, 0, 64);
+        list->OMSetRenderTargets(1, &oneTarget, FALSE, &depthView);
+        expect(recording->RenderTargets().size() == 1 && recording->RenderTargets()[0].view == target.view && recording->DepthStencil().has_value() &&
+                   recording->DepthStencil()->view == depthTarget.view,
+               "OMSetRenderTargets reads the render target and depth-stencil descriptors");
+        list->OMSetRenderTargets(3, &rtvCpu, TRUE, nullptr);
+        expect(recording->RenderTargets().size() == 3 && recording->RenderTargets()[1].view == target.view && recording->RenderTargets()[2].view == VK_NULL_HANDLE &&
+                   !recording->DepthStencil().has_value(),
+               "OMSetRenderTargets with a single descriptor range and a null view");
+        ID3D12DescriptorHeap* shaderHeaps[] = {visible};
+        list->SetDescriptorHeaps(1, shaderHeaps);
+        expect(recording->ShaderResourceHeap() == visibleHeap && recording->SamplerHeap() == nullptr, "SetDescriptorHeaps");
+
+        const float clearColor[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+        const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+        const D3D12_RECT square{8, 8, 16, 16};
+        list->ClearRenderTargetView(oneTarget, clearColor, 0, nullptr);
+        list->ClearRenderTargetView(oneTarget, red, 1, &square);
+        list->ClearDepthStencilView(depthView, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0, nullptr);
+        D3D12_RESOURCE_BARRIER barriers[2]{};
+        barriers[0].Type = barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition = {color, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        barriers[1].Transition = {depth, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        list->ResourceBarrier(2, barriers);
+        D3D12_TEXTURE_COPY_LOCATION colorOut{};
+        colorOut.pResource = readback;
+        colorOut.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        colorOut.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256};
+        D3D12_TEXTURE_COPY_LOCATION depthOut = colorOut;
+        depthOut.PlacedFootprint.Offset = 0x10000;
+        depthOut.PlacedFootprint.Footprint = {DXGI_FORMAT_D32_FLOAT, 32, 32, 1, 256};
+        D3D12_TEXTURE_COPY_LOCATION colorIn{};
+        colorIn.pResource = color;
+        colorIn.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION depthIn = colorIn;
+        depthIn.pResource = depth;
+        list->CopyTextureRegion(&colorOut, 0, 0, 0, &colorIn, nullptr);
+        list->CopyTextureRegion(&depthOut, 0, 0, 0, &depthIn, nullptr);
+        expect(SUCCEEDED(list->Close()), "close the list");
+        ID3D12CommandList* lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        expect(SUCCEEDED(queue->Signal(fence, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, event)) && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0, "the list completes");
+        CloseHandle(event);
+        if (status == 0) {
+            std::uint8_t* pixels = nullptr;
+            readback->Map(0, nullptr, reinterpret_cast<void**>(&pixels));
+            const auto pixel = [&](UINT x, UINT y) { return pixels + y * 256 + x * 4; };
+            const auto within = [](std::uint8_t value, int expected) { return std::abs(static_cast<int>(value) - expected) <= 1; };
+            const std::uint8_t* corner = pixel(2, 2);
+            expect(within(corner[0], 64) && within(corner[1], 128) && within(corner[2], 191) && corner[3] == 255, "ClearRenderTargetView through an RTV descriptor");
+            const std::uint8_t* inside = pixel(10, 10);
+            const std::uint8_t* edge = pixel(16, 16);
+            expect(inside[0] == 255 && inside[1] == 0 && inside[2] == 0 && inside[3] == 255 && within(edge[0], 64), "a clear limited to a rectangle");
+            float depthValue = 0.0f;
+            std::memcpy(&depthValue, pixels + 0x10000 + 5 * 256 + 5 * 4, sizeof(depthValue));
+            expect(depthValue == 0.5f, "ClearDepthStencilView through a DSV descriptor");
+            readback->Unmap(0, nullptr);
+        }
+        for (IUnknown* object : std::initializer_list<IUnknown*>{list, allocator, queue, fence}) object->Release();
+    }
+    for (IUnknown* object : std::initializer_list<IUnknown*>{upload, readback, color, depth, visible, staging, rtvs, dsvs, samplers}) object->Release();
+    expect(arena.Used() == usedBefore, "releasing the heaps and buffers returns their window ranges");
+    std::printf("descriptors: %zu checks\n", checks);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS descriptors gpu");
+    return status;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -3041,6 +3321,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "arena-selftest") == 0) return ArenaSelfTest();
     if (argc >= 2 && std::strcmp(argv[1], "resources-gpu") == 0) return ResourcesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "commandlist-gpu") == 0) return CommandListGpu(HasFlag(argc, argv, "--validate"));
+    if (argc >= 2 && std::strcmp(argv[1], "descriptors-gpu") == 0) return DescriptorsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "indirect-gpu") == 0) return IndirectGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "draw-gpu") == 0) return DrawGpu(HasFlag(argc, argv, "--validate"));
@@ -3050,6 +3331,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate] | descriptors-gpu [--validate]");
     return 2;
 }
