@@ -7,6 +7,7 @@
 #include "CommandSignature.hpp"
 #include "CopyLayout.hpp"
 #include "ConsoleObjects.hpp"
+#include "xdll/xmem/include/GpuWatch.hpp"
 #include "DescriptorHeap.hpp"
 #include "DescriptorSizes.hpp"
 #include "DescriptorWriter.hpp"
@@ -55,6 +56,20 @@ constexpr std::size_t kFrameEventKinds = 8;
 constexpr GUID kConsoleDeviceInterface{0x5405c344, 0xd457, 0x444e, {0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39}};
 constexpr GUID kUnknownInterface{0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 
+using WatchFunction = void (*)(AbxGpuMemoryListener, void*);
+
+class TitleMemoryWatch {
+public:
+    TitleMemoryWatch(WatchFunction watch, abx::d3d12x::TitleAddressSpace* space) : watch_(watch) { watch_(&OnTitleGpuMemoryForward, space); }
+    ~TitleMemoryWatch() { watch_(nullptr, nullptr); }
+    TitleMemoryWatch(const TitleMemoryWatch&) = delete;
+    TitleMemoryWatch& operator=(const TitleMemoryWatch&) = delete;
+
+private:
+    static void OnTitleGpuMemoryForward(void* context, std::uint32_t event, std::uint64_t start, std::uint64_t bytes);
+    WatchFunction watch_;
+};
+
 struct ConsoleDevice {
     const void* const* table;
     std::atomic<ULONG> references{1};
@@ -64,6 +79,8 @@ struct ConsoleDevice {
     std::unique_ptr<VulkanDevice> vulkan;
     std::unique_ptr<abx::d3d12x::TitleBufferWindow> window;
     std::unique_ptr<abx::d3d12x::BufferArena> arena;
+    std::unique_ptr<abx::d3d12x::TitleAddressSpace> addresses;
+    std::unique_ptr<TitleMemoryWatch> watch;
     std::unique_ptr<abx::d3d12x::BindlessSet> bindless;
     std::unique_ptr<abx::d3d12x::ResourceContext> resources;
     std::unique_ptr<abx::d3d12x::DescriptorWriter> descriptors;
@@ -939,6 +956,19 @@ constexpr std::uint64_t kDescriptorHeapAllocator = 0x80;
 constexpr std::uint64_t kDescriptorHeapObjectType = 4;
 constexpr std::uint64_t kPageSize64KiB = 2;
 
+void OnTitleGpuMemory(void* context, std::uint32_t event, std::uint64_t start, std::uint64_t bytes) {
+    auto* space = static_cast<abx::d3d12x::TitleAddressSpace*>(context);
+    if (event != kAbxGpuMemoryAvailable) {
+        space->Release(start, bytes);
+        return;
+    }
+    std::string error;
+    if (!space->Import(start, bytes, error)) {
+        AbxLog("d3d12_x", "title memory 0x%llx..0x%llx stays invisible to the GPU (reads there return zero): %s", static_cast<unsigned long long>(start),
+               static_cast<unsigned long long>(start + bytes), error.c_str());
+    }
+}
+
 abx::d3d12x::TitleAllocator TitleMemory() {
     abx::d3d12x::TitleAllocator allocator;
     const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
@@ -953,6 +983,10 @@ abx::d3d12x::TitleAllocator TitleMemory() {
     allocator.descriptorHeapAttributes = (kDescriptorHeapAllocator << 16) | kDescriptorHeapObjectType;
     allocator.committedTextureAttributes = (kDescriptorHeapAllocator << 16) | (kPageSize64KiB << 14);
     return allocator;
+}
+
+void TitleMemoryWatch::OnTitleGpuMemoryForward(void* context, std::uint32_t event, std::uint64_t start, std::uint64_t bytes) {
+    OnTitleGpuMemory(context, event, start, bytes);
 }
 
 std::mutex g_deviceLock;
@@ -1010,13 +1044,27 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
         AbxUnsupported(__func__, ("the GPU buffer window could not be created: " + error).c_str());
     }
     created->arena = std::make_unique<abx::d3d12x::BufferArena>(created->window->Start(), created->window->Size());
+    created->addresses = abx::d3d12x::TitleAddressSpace::Create(*created->vulkan, error);
+    if (!created->addresses || !created->addresses->MapDevice(created->window->Start(), created->window->Size(), created->window->DeviceAddress(), created->window->Buffer(), error)) {
+        AbxUnsupported(__func__, ("the title address space could not be created: " + error).c_str());
+    }
+    {
+        const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+        const auto watch = xmem != nullptr ? reinterpret_cast<WatchFunction>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemWatchGpuMemory"))) : nullptr;
+        if (watch == nullptr) {
+            AbxUnsupported(__func__, "ab_xmem.dll does not export AbxXMemWatchGpuMemory, so title memory cannot reach the GPU");
+        }
+        created->watch = std::make_unique<TitleMemoryWatch>(watch, created->addresses.get());
+    }
+    AbxLog("d3d12_x", "title memory reaches shaders through a page table at 0x%llx; %llu MiB of GPU-visible title memory imported so far",
+           static_cast<unsigned long long>(created->addresses->RootTable()), static_cast<unsigned long long>(created->addresses->ImportedBytes() >> 20));
     created->titleMemory = TitleMemory();
     created->bindless = abx::d3d12x::BindlessSet::Create(*created->vulkan, error);
     if (!created->bindless) {
         AbxUnsupported(__func__, ("the bindless descriptor set could not be created: " + error).c_str());
     }
     created->resources =
-        std::make_unique<abx::d3d12x::ResourceContext>(abx::d3d12x::ResourceContext{*created->vulkan, *created->window, *created->arena, &created->titleMemory, created->bindless.get()});
+        std::make_unique<abx::d3d12x::ResourceContext>(abx::d3d12x::ResourceContext{*created->vulkan, *created->window, *created->arena, &created->titleMemory, created->bindless.get(), created->addresses.get()});
     created->descriptors = std::make_unique<abx::d3d12x::DescriptorWriter>(*created->resources);
     created->titleTextures = std::make_unique<abx::d3d12x::TitleTextures>(*created->resources, AsParent(created.get()));
     const char* cacheFile = AbxSetting("d3d12_x.pipeline_cache");

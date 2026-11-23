@@ -86,6 +86,7 @@ struct DeviceFunctions {
     PFN_vkCmdSetScissorWithCount cmdSetScissorWithCount = nullptr;
     PFN_vkCmdSetPrimitiveTopology cmdSetPrimitiveTopology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable cmdSetPrimitiveRestartEnable = nullptr;
+    PFN_vkCmdSetPolygonModeEXT cmdSetPolygonMode = nullptr;
     PFN_vkCmdSetBlendConstants cmdSetBlendConstants = nullptr;
     PFN_vkCmdSetStencilReference cmdSetStencilReference = nullptr;
     PFN_vkCmdBindVertexBuffers2 cmdBindVertexBuffers2 = nullptr;
@@ -108,6 +109,7 @@ struct DeviceFunctions {
     PFN_vkDestroyFence destroyFence = nullptr;
     PFN_vkWaitForFences waitForFences = nullptr;
     PFN_vkGetBufferDeviceAddress getBufferDeviceAddress = nullptr;
+    PFN_vkQueueWaitIdle queueWaitIdle = nullptr;
 };
 
 const std::vector<std::string>& KnownShaderFeatures();
@@ -132,6 +134,7 @@ public:
     VkDescriptorSetLayout TitleSetLayout() const { return setLayout_; }
     VkQueue Queue() const { return queue_; }
     bool BufferDeviceAddress() const { return bufferDeviceAddress_; }
+    bool RectangleFill() const { return rectangleFill_; }
     VkDeviceSize HostImportAlignment() const { return hostImportAlignment_; }
     PFN_vkGetMemoryHostPointerPropertiesEXT HostPointerProperties() const { return hostPointerProperties_; }
     std::optional<std::uint32_t> MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
@@ -181,6 +184,7 @@ private:
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     std::vector<std::string> enabled_;
+    bool rectangleFill_ = false;
     std::vector<std::string> extensions_;
 };
 

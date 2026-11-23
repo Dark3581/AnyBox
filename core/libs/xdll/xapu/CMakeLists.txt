@@ -1,1 +1,1 @@
-anybox_add_xdll(xapu SOURCES Inventory.cpp)
+anybox_add_xdll(xapu SOURCES Connection.cpp Inventory.cpp)

@@ -17,6 +17,7 @@ constexpr std::size_t kFilePieceBytes = std::size_t{64} << 20;
 std::optional<std::vector<char>> ReadWholeFile(const std::filesystem::path& path, std::size_t pieceBytes = kFilePieceBytes);
 bool WriteWholeFile(const std::filesystem::path& path, const std::vector<char>& data, std::size_t pieceBytes = kFilePieceBytes);
 std::optional<std::vector<std::uint32_t>> ReadSpirv(const std::filesystem::path& path, std::string& error);
+std::optional<std::vector<std::uint32_t>> ReadTitleModule(const std::filesystem::path& path, bool& usesCodeBase, std::string& error);
 bool CacheHeaderMatches(const std::vector<char>& data, std::uint32_t vendorId, std::uint32_t deviceId, const std::uint8_t (&uuid)[VK_UUID_SIZE]);
 
 class PipelineCache {

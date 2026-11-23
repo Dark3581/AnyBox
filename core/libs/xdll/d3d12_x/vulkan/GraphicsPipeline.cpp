@@ -163,6 +163,7 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
     colorBlend.attachmentCount = static_cast<std::uint32_t>(state.blend.size());
     colorBlend.pAttachments = state.blend.empty() ? nullptr : state.blend.data();
     std::vector<VkDynamicState> dynamicStates = GraphicsDynamicStates();
+    if (device.RectangleFill()) dynamicStates.push_back(VK_DYNAMIC_STATE_POLYGON_MODE_EXT);
     if (input.bindings.empty() || hasMesh) {
         dynamicStates.erase(std::remove(dynamicStates.begin(), dynamicStates.end(), VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE), dynamicStates.end());
     }

@@ -3,6 +3,7 @@
 #include "BufferArena.hpp"
 #include "CommandRecorder.hpp"
 #include "ObjectBase.hpp"
+#include "TitleAddressSpace.hpp"
 #include "TitleBufferWindow.hpp"
 #include "VulkanDevice.hpp"
 
@@ -30,6 +31,7 @@ struct ResourceContext {
     BufferArena& arena;
     const TitleAllocator* titleMemory = nullptr;
     BindlessSet* bindless = nullptr;
+    TitleAddressSpace* addresses = nullptr;
 };
 
 constexpr std::uint64_t kBufferPlacementAlignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;

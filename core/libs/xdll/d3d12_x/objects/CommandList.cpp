@@ -1,9 +1,13 @@
 #include "CommandList.hpp"
 
 #include "AbxApi.hpp"
+#include "BindlessSet.hpp"
 #include "CopyLayout.hpp"
 #include "ResourceState.hpp"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
@@ -16,6 +20,12 @@ namespace abx::d3d12x {
 namespace {
 
 constexpr UINT kAllSubresources = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+constexpr std::uint32_t kGraphicsFirstRootSgpr = 8;
+constexpr std::uint32_t kComputeFirstRootSgpr = 4;
+constexpr std::uint32_t kUserSgprs = 32;
+constexpr std::uint32_t kPageTableWord = 32;
+constexpr std::uint32_t kPushWords = 36;
+constexpr float kDefaultBlendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
 [[noreturn]] void RootMappingUnknown(const char* function) {
     AbxUnsupported(function, "how root arguments, descriptor heaps and the heap base reach the translated shader's user data is unknown until a title's calls show it");
@@ -69,12 +79,93 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
     closed_ = false;
     states_.clear();
     copied_ = false;
+    rendering_ = false;
+    rectangles_ = false;
+    graphicsSetBound_ = false;
+    computeSetBound_ = false;
     ResetBindings();
+    if (type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        CommandRecorder recorder = Recorder("ID3D12GraphicsCommandList::Reset");
+        recorder.SetBlendFactor(kDefaultBlendFactor);
+        recorder.SetStencilReference(0);
+    }
     if (initial != nullptr) BindPipeline(initial, "ID3D12GraphicsCommandList::Reset");
     return true;
 }
 
+void CommandList::EndPass() {
+    if (!rendering_) return;
+    Recorder("ID3D12GraphicsCommandList").EndRendering();
+    rendering_ = false;
+}
+
+void CommandList::BindTitleSet(VkPipelineBindPoint point) {
+    bool& bound = point == VK_PIPELINE_BIND_POINT_COMPUTE ? computeSetBound_ : graphicsSetBound_;
+    if (bound) return;
+    if (context_.bindless == nullptr) {
+        AbxUnsupported("ID3D12GraphicsCommandList", "a draw or dispatch on a device without the bindless descriptor set");
+    }
+    Recorder("ID3D12GraphicsCommandList").BindTitleSet(point, context_.bindless->Set());
+    bound = true;
+}
+
+void CommandList::PushUserData(const RootArguments& arguments, std::uint32_t firstSgpr, const char* function) {
+    std::array<std::uint32_t, kPushWords> block{};
+    const std::uint32_t words = arguments.signature != nullptr ? arguments.signature->Layout().words : 0;
+    if (words > kUserSgprs - firstSgpr) {
+        AbxUnsupported(function, "a root signature whose words do not fit in the user SGPRs after the driver's reserved ones; the console's spill layout is not measured");
+    }
+    std::copy_n(arguments.words.begin(), words, block.begin() + firstSgpr);
+    if (context_.addresses == nullptr) {
+        AbxUnsupported(function, "a draw or dispatch on a device without a title address space");
+    }
+    const std::uint64_t table = context_.addresses->RootTable();
+    block[kPageTableWord] = static_cast<std::uint32_t>(table);
+    block[kPageTableWord + 1] = static_cast<std::uint32_t>(table >> 32);
+    std::string error;
+    Check(Recorder(function).SetPushConstants(block.data(), static_cast<std::uint32_t>(block.size() * sizeof(std::uint32_t)), error), function, error);
+}
+
+void CommandList::PrepareDraw(const char* function) {
+    if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        AbxUnsupported(function, "a draw without a graphics pipeline state");
+    }
+    if (pipeline_->UsesCodeBase()) {
+        AbxUnsupported(function, "a pipeline whose shaders read constants from their own code; placing shader code in title memory is not implemented");
+    }
+    if (pipeline_->HasStage("ms")) {
+        AbxUnsupported(function, "a mesh pipeline: the mesh stage reads root words from s16 and the pixel stage from s8, which one push constant block cannot serve yet");
+    }
+    if (context_.device.RectangleFill()) {
+        Recorder(function).SetPolygonMode(rectangles_ ? VK_POLYGON_MODE_FILL_RECTANGLE_NV : pipeline_->PolygonMode());
+    } else if (rectangles_) {
+        AbxUnsupported(function, "a rectangle list on a device without VK_NV_fill_rectangle and dynamic polygon mode");
+    }
+    PushUserData(graphics_, kGraphicsFirstRootSgpr, function);
+    BindTitleSet(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    if (rendering_) return;
+    VkExtent2D extent{UINT32_MAX, UINT32_MAX};
+    std::uint32_t layers = UINT32_MAX;
+    bool any = false;
+    const auto include = [&](const AttachmentRef& attachment) {
+        if (attachment.view == VK_NULL_HANDLE) return;
+        extent.width = (std::min)(extent.width, attachment.extent.width);
+        extent.height = (std::min)(extent.height, attachment.extent.height);
+        layers = (std::min)(layers, attachment.layers);
+        any = true;
+    };
+    for (const AttachmentRef& color : renderTargets_) include(color);
+    if (depthStencil_) include(*depthStencil_);
+    if (!any) {
+        AbxUnsupported(function, "a draw with no render target and no depth-stencil view bound");
+    }
+    std::string error;
+    Check(Recorder(function).BeginRendering(renderTargets_, depthStencil_ ? &*depthStencil_ : nullptr, extent, layers, error), function, error);
+    rendering_ = true;
+}
+
 void CommandList::OrderCopy(const char* function) {
+    EndPass();
     Recorder(function);
     if (copied_) {
         VkMemoryBarrier2 order{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -152,11 +243,12 @@ void CommandList::SetConstants(RootArguments& arguments, UINT index, UINT count,
 
 void CommandList::SetRootView(RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address, const char* function) {
     const RootParameterLayout& parameter = Parameter(arguments, index, type, function);
-    if (address != 0 && !context_.window.Contains(address, 1)) {
-        char reason[160];
-        std::snprintf(reason, sizeof(reason), "a root view address 0x%llx outside the title buffer window 0x%llx..0x%llx", static_cast<unsigned long long>(address),
-                      static_cast<unsigned long long>(context_.window.Start()), static_cast<unsigned long long>(context_.window.Start() + context_.window.Size()));
-        AbxUnsupported(function, reason);
+    if (address != 0 && !context_.window.Contains(address, 1) && (context_.addresses == nullptr || !context_.addresses->Contains(address, 1))) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "%s: root view address 0x%llx is in no GPU-visible title memory; shader reads there return zero (later cases are not logged)", function,
+                   static_cast<unsigned long long>(address));
+        }
     }
     arguments.words[parameter.firstWord] = static_cast<std::uint32_t>(address);
     arguments.words[parameter.firstWord + 1] = static_cast<std::uint32_t>(address >> 32);
@@ -193,6 +285,7 @@ HRESULT STDMETHODCALLTYPE CommandList::Close() {
     if (closed_) {
         return E_FAIL;
     }
+    EndPass();
     closed_ = true;
     VkMemoryBarrier2 host{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     host.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -249,15 +342,74 @@ D3D12_RESOURCE_STATES CommandList::StateOf(const Resource* resource, UINT subres
 }
 
 BufferRef CommandList::WindowRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 bytes, const char* function) const {
-    if (!context_.window.Contains(address, bytes)) {
-        AbxUnsupported(function, "a buffer address outside the title buffer window");
+    if (context_.window.Contains(address, bytes)) return {context_.window.Buffer(), address - context_.window.Start(), bytes};
+    if (context_.addresses != nullptr) {
+        if (const std::optional<TitleAddressSpace::Location> found = context_.addresses->Locate(address, bytes)) return {found->buffer, found->offset, bytes};
     }
-    return {context_.window.Buffer(), address - context_.window.Start(), bytes};
+    char reason[128];
+    std::snprintf(reason, sizeof(reason), "a buffer range 0x%llx (+%llu bytes) that is neither in the buffer window nor in imported title memory",
+                  static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+    AbxUnsupported(function, reason);
 }
 
-void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT, UINT, UINT, UINT) { RootMappingUnknown("ID3D12GraphicsCommandList::DrawInstanced"); }
-void STDMETHODCALLTYPE CommandList::DrawIndexedInstanced(UINT, UINT, UINT, INT, UINT) { RootMappingUnknown("ID3D12GraphicsCommandList::DrawIndexedInstanced"); }
-void STDMETHODCALLTYPE CommandList::Dispatch(UINT, UINT, UINT) { RootMappingUnknown("ID3D12GraphicsCommandList::Dispatch"); }
+void CommandList::ReportRootState(const RootArguments& arguments, const char* function) const {
+    std::string text = "pipeline:";
+    if (pipeline_ != nullptr) {
+        for (const std::string& shader : pipeline_->Shaders()) text += " " + shader;
+    }
+    if (arguments.signature != nullptr) {
+        const RootSignatureLayout& layout = arguments.signature->Layout();
+        text += "; root signature " + std::to_string(layout.parameters.size()) + " parameters, " + std::to_string(layout.words) + " words:";
+        for (std::size_t index = 0; index < layout.parameters.size(); ++index) {
+            const RootParameterLayout& parameter = layout.parameters[index];
+            char line[96];
+            std::snprintf(line, sizeof(line), " [%zu type %d visibility %d register %u space %u words %u at %u]", index, static_cast<int>(parameter.type),
+                          static_cast<int>(parameter.visibility), parameter.shaderRegister, parameter.registerSpace, parameter.words, parameter.firstWord);
+            text += line;
+        }
+        text += "; words:";
+        for (std::uint32_t word = 0; word < layout.words; ++word) {
+            char value[16];
+            std::snprintf(value, sizeof(value), " %08x", arguments.words[word]);
+            text += value;
+        }
+    } else {
+        text += "; no root signature";
+    }
+    AbxLog("d3d12_x", "%s root state: %s", function, text.c_str());
+}
+
+void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance) {
+    const char* function = "ID3D12GraphicsCommandList::DrawInstanced";
+    PrepareDraw(function);
+    Recorder(function).Draw(vertices, instances, firstVertex, firstInstance);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) ReportRootState(graphics_, "first DrawInstanced");
+}
+
+void STDMETHODCALLTYPE CommandList::DrawIndexedInstanced(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance) {
+    const char* function = "ID3D12GraphicsCommandList::DrawIndexedInstanced";
+    PrepareDraw(function);
+    Recorder(function).DrawIndexed(indices, instances, firstIndex, baseVertex, firstInstance);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) ReportRootState(graphics_, "first DrawIndexedInstanced");
+}
+
+void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z) {
+    const char* function = "ID3D12GraphicsCommandList::Dispatch";
+    EndPass();
+    if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_COMPUTE) {
+        AbxUnsupported(function, "a dispatch without a compute pipeline state");
+    }
+    if (pipeline_->UsesCodeBase()) {
+        AbxUnsupported(function, "a compute shader that reads constants from its own code; placing shader code in title memory is not implemented");
+    }
+    PushUserData(compute_, kComputeFirstRootSgpr, function);
+    BindTitleSet(VK_PIPELINE_BIND_POINT_COMPUTE);
+    Recorder(function).Dispatch(x, y, z);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) ReportRootState(compute_, "first Dispatch");
+}
 
 void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* destination, UINT64 destinationOffset, ID3D12Resource* source, UINT64 sourceOffset, UINT64 bytes) {
     const char* function = "ID3D12GraphicsCommandList::CopyBufferRegion";
@@ -348,6 +500,7 @@ void STDMETHODCALLTYPE CommandList::CopyTiles(ID3D12Resource*, const D3D12_TILED
 
 void STDMETHODCALLTYPE CommandList::ResolveSubresource(ID3D12Resource* destination, UINT destinationSubresource, ID3D12Resource* source, UINT sourceSubresource, DXGI_FORMAT format) {
     const char* function = "ID3D12GraphicsCommandList::ResolveSubresource";
+    EndPass();
     Resource* to = Ours(destination, function);
     Resource* from = Ours(source, function);
     if (to->IsBuffer() || from->IsBuffer()) {
@@ -367,6 +520,7 @@ void STDMETHODCALLTYPE CommandList::IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOL
     const char* function = "ID3D12GraphicsCommandList::IASetPrimitiveTopology";
     std::string error;
     Check(Recorder(function).SetPrimitiveTopology(topology, false, error), function, error);
+    rectangles_ = topology == kConsoleRectangleList;
 }
 
 void STDMETHODCALLTYPE CommandList::RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) {
@@ -412,6 +566,7 @@ void STDMETHODCALLTYPE CommandList::SetPipelineState(ID3D12PipelineState* state)
 
 void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
     const char* function = "ID3D12GraphicsCommandList::ResourceBarrier";
+    EndPass();
     if (count != 0 && barriers == nullptr) {
         AbxUnsupported(function, "barriers without a barrier array");
     }
@@ -574,6 +729,7 @@ void STDMETHODCALLTYPE CommandList::IASetVertexBuffers(UINT start, UINT count, c
 void STDMETHODCALLTYPE CommandList::SOSetTargets(UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*) { AbxUnsupported("ID3D12GraphicsCommandList::SOSetTargets", "stream output"); }
 void STDMETHODCALLTYPE CommandList::OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL singleRange, const D3D12_CPU_DESCRIPTOR_HANDLE* depthStencil) {
     const char* function = "ID3D12GraphicsCommandList::OMSetRenderTargets";
+    EndPass();
     Recorder(function);
     if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (count != 0 && targets == nullptr)) {
         AbxUnsupported(function, "more than eight render targets, or render targets without a handle array");
@@ -604,6 +760,7 @@ void STDMETHODCALLTYPE CommandList::OMSetRenderTargets(UINT count, const D3D12_C
 
 void STDMETHODCALLTYPE CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT count, const D3D12_RECT* rects) {
     const char* function = "ID3D12GraphicsCommandList::ClearDepthStencilView";
+    EndPass();
     if (count != 0 && rects == nullptr) {
         AbxUnsupported(function, "clear rectangles without a rectangle array");
     }
@@ -618,6 +775,7 @@ void STDMETHODCALLTYPE CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_H
 
 void STDMETHODCALLTYPE CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count, const D3D12_RECT* rects) {
     const char* function = "ID3D12GraphicsCommandList::ClearRenderTargetView";
+    EndPass();
     if (color == nullptr || (count != 0 && rects == nullptr)) {
         AbxUnsupported(function, "a clear without a color, or clear rectangles without a rectangle array");
     }

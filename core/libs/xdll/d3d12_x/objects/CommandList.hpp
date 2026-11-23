@@ -109,6 +109,11 @@ private:
     void OrderCopy(const char* function);
     void BindPipeline(ID3D12PipelineState* state, const char* function);
     void SetSignature(RootArguments& arguments, ID3D12RootSignature* signature, const char* function);
+    void ReportRootState(const RootArguments& arguments, const char* function) const;
+    void EndPass();
+    void PrepareDraw(const char* function);
+    void PushUserData(const RootArguments& arguments, std::uint32_t firstSgpr, const char* function);
+    void BindTitleSet(VkPipelineBindPoint point);
     const RootParameterLayout& Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const;
     void SetConstants(RootArguments& arguments, UINT index, UINT count, const void* data, UINT offset, const char* function);
     void SetRootView(RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address, const char* function);
@@ -127,6 +132,10 @@ private:
     PipelineStateObject* pipeline_ = nullptr;
     RootArguments graphics_;
     RootArguments compute_;
+    bool rendering_ = false;
+    bool rectangles_ = false;
+    bool graphicsSetBound_ = false;
+    bool computeSetBound_ = false;
 };
 
 }

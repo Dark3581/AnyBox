@@ -46,6 +46,29 @@ RootSignature* PipelineStateObject::SignatureOf(ID3D12RootSignature* signature, 
     return ours;
 }
 
+namespace {
+
+const char* StageName(VkShaderStageFlagBits stage) {
+    switch (stage) {
+    case VK_SHADER_STAGE_VERTEX_BIT: return "vs";
+    case VK_SHADER_STAGE_FRAGMENT_BIT: return "ps";
+    case VK_SHADER_STAGE_GEOMETRY_BIT: return "gs";
+    case VK_SHADER_STAGE_MESH_BIT_EXT: return "ms";
+    case VK_SHADER_STAGE_TASK_BIT_EXT: return "as";
+    default: return "?";
+    }
+}
+
+}
+
+bool PipelineStateObject::HasStage(const char* stage) const {
+    const std::string prefix = std::string(stage) + " ";
+    for (const std::string& shader : shaders_) {
+        if (shader.rfind(prefix, 0) == 0) return true;
+    }
+    return false;
+}
+
 HRESULT PipelineStateObject::Finish(PipelineStateObject* created, REFIID riid, void** state, std::string& error) {
     const HRESULT result = created->QueryInterface(riid, state);
     created->Release();
@@ -73,7 +96,10 @@ HRESULT PipelineStateObject::CreateCompute(const PipelineContext& context, IUnkn
     if (FAILED(built)) {
         return built;
     }
-    return Finish(new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_COMPUTE, entry.pipeline, entry.origin, signature), riid, state, error);
+    PipelineStateObject* created = new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_COMPUTE, entry.pipeline, entry.origin, signature);
+    created->shaders_.push_back("cs " + source->key);
+    created->usesCodeBase_ = entry.usesCodeBase;
+    return Finish(created, riid, state, error);
 }
 
 HRESULT PipelineStateObject::CreateMesh(const PipelineContext& context, IUnknown* parent, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE& mesh,
@@ -96,7 +122,11 @@ HRESULT PipelineStateObject::CreateMesh(const PipelineContext& context, IUnknown
     if (FAILED(built)) {
         return built;
     }
-    return Finish(new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_GRAPHICS, entry.pipeline, entry.origin, signature), riid, state, error);
+    PipelineStateObject* created = new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_GRAPHICS, entry.pipeline, entry.origin, signature);
+    for (const GraphicsShaderSource& shader : request->shaders) created->shaders_.push_back(StageName(shader.stage) + std::string(" ") + shader.key);
+    created->usesCodeBase_ = entry.usesCodeBase;
+    created->polygonMode_ = request->state.polygonMode;
+    return Finish(created, riid, state, error);
 }
 
 HRESULT PipelineStateObject::CreateUnbuilt(IUnknown* parent, VkPipelineBindPoint point, ID3D12RootSignature* signature, std::string reason, REFIID riid, void** state,
@@ -135,7 +165,11 @@ HRESULT PipelineStateObject::CreateGraphics(const PipelineContext& context, IUnk
     if (FAILED(built)) {
         return built;
     }
-    return Finish(new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_GRAPHICS, entry.pipeline, entry.origin, signature), riid, state, error);
+    PipelineStateObject* created = new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_GRAPHICS, entry.pipeline, entry.origin, signature);
+    for (const GraphicsShaderSource& shader : request->shaders) created->shaders_.push_back(StageName(shader.stage) + std::string(" ") + shader.key);
+    created->usesCodeBase_ = entry.usesCodeBase;
+    created->polygonMode_ = request->state.polygonMode;
+    return Finish(created, riid, state, error);
 }
 
 }

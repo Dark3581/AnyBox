@@ -44,6 +44,7 @@ struct PipelineEntry {
     PipelineOrigin origin = PipelineOrigin::Failed;
     bool driverCacheHit = false;
     bool subgroupForced = false;
+    bool usesCodeBase = false;
     std::uintmax_t bytes = 0;
     double seconds = 0.0;
     std::string error;

@@ -50,6 +50,7 @@ std::optional<VkPrimitiveTopology> VulkanTopology(D3D_PRIMITIVE_TOPOLOGY topolog
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    case kConsoleRectangleList: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     default: return std::nullopt;
     }
 }
@@ -220,6 +221,14 @@ bool CommandRecorder::SetPushConstants(const void* data, std::uint32_t bytes, st
     }
     device_.Vk().cmdPushConstants(commands_, device_.TitlePipelineLayout(), VK_SHADER_STAGE_ALL, 0, bytes, data);
     return true;
+}
+
+void CommandRecorder::SetPolygonMode(VkPolygonMode mode) {
+    device_.Vk().cmdSetPolygonMode(commands_, mode);
+}
+
+void CommandRecorder::BindTitleSet(VkPipelineBindPoint point, VkDescriptorSet set) {
+    device_.Vk().cmdBindDescriptorSets(commands_, point, device_.TitlePipelineLayout(), 0, 1, &set, 0, nullptr);
 }
 
 void CommandRecorder::Draw(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance) {

@@ -316,6 +316,24 @@ const void* const kDisplayTable[] = {
 
 ApiObject g_display{kDisplayTable, &kDisplayInterface, "display"};
 
+constexpr GUID kOptionalFeatureProvider{0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
+constexpr GUID kOptionalFeatureInterface{0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
+
+HRESULT OptionalFeatureCreate(ApiObject*, void** created) {
+    if (created != nullptr) *created = nullptr;
+    AbxLog("xgameruntime", "provider {3e241977-6237-41e9-8559-102c2d9983f1} slot 9 (creates an object into its argument) answers E_NOTIMPL; its only caller treats any failure as the feature being absent");
+    return E_NOTIMPL;
+}
+
+const void* const kOptionalFeatureTable[] = {
+    Entry(&ObjectQueryInterface), Entry(&ObjectAddRef), Entry(&ObjectRelease), Entry(&Unmapped<3>),  Entry(&Unmapped<4>),  Entry(&Unmapped<5>),
+    Entry(&Unmapped<6>),          Entry(&Unmapped<7>),  Entry(&Unmapped<8>),   Entry(&OptionalFeatureCreate), Entry(&Unmapped<10>), Entry(&Unmapped<11>),
+    Entry(&Unmapped<12>),         Entry(&Unmapped<13>), Entry(&Unmapped<14>),  Entry(&Unmapped<15>), Entry(&Unmapped<16>), Entry(&Unmapped<17>),
+    Entry(&Unmapped<18>),         Entry(&Unmapped<19>), Entry(&Unmapped<20>),  Entry(&Unmapped<21>),
+};
+
+ApiObject g_optionalFeature{kOptionalFeatureTable, &kOptionalFeatureInterface, "provider 3e241977"};
+
 struct ApiInterface {
     const GUID& provider;
     const GUID& interfaceId;
@@ -329,6 +347,7 @@ const ApiInterface kInterfaces[] = {
     {kPackageProvider, kPackageInterface, g_package},
     {kPersistentStorageProvider, kPersistentStorageInterface, g_persistentStorage},
     {kDisplayProvider, kDisplayInterface, g_display},
+    {kOptionalFeatureProvider, kOptionalFeatureInterface, g_optionalFeature},
 };
 
 }

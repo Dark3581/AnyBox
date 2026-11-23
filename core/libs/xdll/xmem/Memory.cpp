@@ -1,5 +1,6 @@
 #include "xdll/xmem/xmem.hpp"
 #include "PhysicalMemory.hpp"
+#include "GpuVisible.hpp"
 
 #include <malloc.h>
 
@@ -186,9 +187,9 @@ ABX_API void* XMemVirtualAlloc(void* address, std::size_t size, std::uint32_t al
         }
         void* window = nullptr;
         if ((allocationType & abx::xmem::kReplacePlaceholder) != 0) {
-            window = abx::xmem::AdoptPhysicalWindow(address, size, protection);
+            window = abx::xmem::AdoptPhysicalWindow(address, size, protection, abx::xmem::IsGpuVisible(protect));
         } else if (address == nullptr) {
-            window = abx::xmem::ReservePhysicalWindow(size, protection);
+            window = abx::xmem::ReservePhysicalWindow(size, protection, abx::xmem::IsGpuVisible(protect));
         } else {
             AbxUnsupported(__func__, "a physical page window at a fixed address that is not a placeholder");
         }
@@ -198,6 +199,9 @@ ABX_API void* XMemVirtualAlloc(void* address, std::size_t size, std::uint32_t al
     }
     void* result = (allocationType & kPlaceholderTypes) != 0 ? abx::xmem::AllocateWithPlaceholders(address, size, allocationType & kDesktopAllocationTypes, protection)
                                                              : VirtualAlloc(address, size, allocationType & kDesktopAllocationTypes, protection);
+    if (result != nullptr && (allocationType & MEM_COMMIT) != 0 && abx::xmem::IsGpuVisible(protect)) {
+        abx::xmem::AnnounceAvailable(reinterpret_cast<std::uint64_t>(result), size);
+    }
     AbxTrace("XMemVirtualAlloc(%p, 0x%zx, type 0x%x, attributes 0x%llx, protect 0x%x) = %p (console-only type bits 0x%x and protection bits 0x%x dropped)", address, size,
              allocationType, static_cast<unsigned long long>(attributes), protect, result, allocationType & kConsoleOnlyAllocationTypes, protect & ~0xFFu);
     return result;

@@ -74,6 +74,7 @@ private:
     bool titleMemory_ = false;
     std::unique_ptr<std::uint8_t[]> host_;
     std::uint64_t offset_ = 0;
+    std::uint64_t gpuAlias_ = 0;
     bool allocated_ = false;
     bool registered_ = false;
     std::vector<DescriptorRecord> records_;

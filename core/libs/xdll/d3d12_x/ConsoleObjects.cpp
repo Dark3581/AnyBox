@@ -325,6 +325,39 @@ void STDMETHODCALLTYPE ListForward(Facade* self, Arguments... arguments) {
     (InnerOf<CommandList>(self)->*Method)(arguments...);
 }
 
+ID3D12Resource* ResourceArgument(void* resource, const char* function) {
+    if (resource == nullptr) return nullptr;
+    auto* inner = dynamic_cast<ID3D12Resource*>(FacadeInner(resource));
+    if (inner == nullptr) AbxUnsupported(function, "a resource argument that is not a resource AnyBox handed out");
+    return inner;
+}
+
+void STDMETHODCALLTYPE ListCopyBufferRegion(Facade* self, void* destination, UINT64 destinationOffset, void* source, UINT64 sourceOffset, UINT64 bytes) {
+    const char* function = "D3D12 command list slot 15";
+    InnerOf<CommandList>(self)->CopyBufferRegion(ResourceArgument(destination, function), destinationOffset, ResourceArgument(source, function), sourceOffset, bytes);
+}
+
+void STDMETHODCALLTYPE ListCopyTextureRegion(Facade* self, const D3D12_TEXTURE_COPY_LOCATION* destination, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* source,
+                                             const D3D12_BOX* box) {
+    const char* function = "D3D12 command list slot 16";
+    if (destination == nullptr || source == nullptr) AbxUnsupported(function, "a null copy location");
+    D3D12_TEXTURE_COPY_LOCATION to = *destination;
+    D3D12_TEXTURE_COPY_LOCATION from = *source;
+    to.pResource = ResourceArgument(to.pResource, function);
+    from.pResource = ResourceArgument(from.pResource, function);
+    InnerOf<CommandList>(self)->CopyTextureRegion(&to, x, y, z, &from, box);
+}
+
+void STDMETHODCALLTYPE ListCopyResource(Facade* self, void* destination, void* source) {
+    const char* function = "D3D12 command list slot 17";
+    InnerOf<CommandList>(self)->CopyResource(ResourceArgument(destination, function), ResourceArgument(source, function));
+}
+
+void STDMETHODCALLTYPE ListResolveSubresource(Facade* self, void* destination, UINT destinationSubresource, void* source, UINT sourceSubresource, DXGI_FORMAT format) {
+    const char* function = "D3D12 command list slot 19";
+    InnerOf<CommandList>(self)->ResolveSubresource(ResourceArgument(destination, function), destinationSubresource, ResourceArgument(source, function), sourceSubresource, format);
+}
+
 void STDMETHODCALLTYPE ListSetComputeRootSignature(Facade* self, void* signature) {
     auto* inner = dynamic_cast<RootSignature*>(FacadeInner(signature));
     if (signature != nullptr && inner == nullptr) AbxUnsupported("D3D12 command list slot 33", "a root signature argument that is not a root signature AnyBox handed out");
@@ -466,6 +499,13 @@ const FacadeType& TypeOf(Kind kind) {
     static const FacadeType list = [] {
         FacadeType type = MakeFacadeType("command list", {kCommandListInterface, __uuidof(ID3D12GraphicsCommandList)});
         Map(type, 9, &ListClose);
+        Map(type, 12, &ListForward<&CommandList::DrawInstanced, UINT, UINT, UINT, UINT>);
+        Map(type, 13, &ListForward<&CommandList::DrawIndexedInstanced, UINT, UINT, UINT, INT, UINT>);
+        Map(type, 14, &ListForward<&CommandList::Dispatch, UINT, UINT, UINT>);
+        Map(type, 15, &ListCopyBufferRegion);
+        Map(type, 16, &ListCopyTextureRegion);
+        Map(type, 17, &ListCopyResource);
+        Map(type, 19, &ListResolveSubresource);
         Map(type, 20, &ListSetPrimitiveTopology);
         Map(type, 21, &ListForward<&CommandList::RSSetViewports, UINT, const D3D12_VIEWPORT*>);
         Map(type, 22, &ListForward<&CommandList::RSSetScissorRects, UINT, const D3D12_RECT*>);

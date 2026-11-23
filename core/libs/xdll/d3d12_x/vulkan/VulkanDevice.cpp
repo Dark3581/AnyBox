@@ -18,6 +18,7 @@ struct FeatureChain {
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
 
     FeatureChain() = default;
     FeatureChain(const FeatureChain&) = delete;
@@ -36,6 +37,7 @@ struct FeatureChain {
         if (extensions.count(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) != 0) chain(interlock);
         if (extensions.count(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) != 0) chain(maintenance8);
         if (extensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) != 0) chain(maintenance5);
+        if (extensions.count(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) != 0) chain(dynamic3);
         *next = nullptr;
     }
 };
@@ -471,6 +473,14 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         enabled_.emplace_back("maintenance5");
         useExtensions.insert(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     }
+    if (bestExtensions.count(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) != 0 && bestExtensions.count(VK_NV_FILL_RECTANGLE_EXTENSION_NAME) != 0 &&
+        supported.dynamic3.extendedDynamicState3PolygonMode == VK_TRUE) {
+        enabled.dynamic3.extendedDynamicState3PolygonMode = VK_TRUE;
+        enabled_.emplace_back("rectangleFill");
+        useExtensions.insert(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+        useExtensions.insert(VK_NV_FILL_RECTANGLE_EXTENSION_NAME);
+        rectangleFill_ = true;
+    }
     if (requirements.maintenance8) {
         enabled.maintenance8.maintenance8 = VK_TRUE;
         enabled_.emplace_back("maintenance8");
@@ -562,6 +572,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdSetScissorWithCount = DeviceFunction<PFN_vkCmdSetScissorWithCount>(getDeviceProcAddr, device_, "vkCmdSetScissorWithCount");
     vk_.cmdSetPrimitiveTopology = DeviceFunction<PFN_vkCmdSetPrimitiveTopology>(getDeviceProcAddr, device_, "vkCmdSetPrimitiveTopology");
     vk_.cmdSetPrimitiveRestartEnable = DeviceFunction<PFN_vkCmdSetPrimitiveRestartEnable>(getDeviceProcAddr, device_, "vkCmdSetPrimitiveRestartEnable");
+    if (rectangleFill_) vk_.cmdSetPolygonMode = DeviceFunction<PFN_vkCmdSetPolygonModeEXT>(getDeviceProcAddr, device_, "vkCmdSetPolygonModeEXT");
     vk_.cmdSetBlendConstants = DeviceFunction<PFN_vkCmdSetBlendConstants>(getDeviceProcAddr, device_, "vkCmdSetBlendConstants");
     vk_.cmdSetStencilReference = DeviceFunction<PFN_vkCmdSetStencilReference>(getDeviceProcAddr, device_, "vkCmdSetStencilReference");
     vk_.cmdBindVertexBuffers2 = DeviceFunction<PFN_vkCmdBindVertexBuffers2>(getDeviceProcAddr, device_, "vkCmdBindVertexBuffers2");
@@ -584,6 +595,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.destroyFence = DeviceFunction<PFN_vkDestroyFence>(getDeviceProcAddr, device_, "vkDestroyFence");
     vk_.waitForFences = DeviceFunction<PFN_vkWaitForFences>(getDeviceProcAddr, device_, "vkWaitForFences");
     vk_.getBufferDeviceAddress = DeviceFunction<PFN_vkGetBufferDeviceAddress>(getDeviceProcAddr, device_, "vkGetBufferDeviceAddress");
+    vk_.queueWaitIdle = DeviceFunction<PFN_vkQueueWaitIdle>(getDeviceProcAddr, device_, "vkQueueWaitIdle");
     if (vk_.destroyDevice == nullptr) {
         error = "vkDestroyDevice is not available";
         return false;

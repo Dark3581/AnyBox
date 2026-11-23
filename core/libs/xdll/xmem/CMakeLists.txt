@@ -1,1 +1,1 @@
-anybox_add_xdll(xmem SOURCES Inventory.cpp Memory.cpp PhysicalMemory.cpp)
+anybox_add_xdll(xmem SOURCES GpuVisible.cpp Inventory.cpp Memory.cpp PhysicalMemory.cpp)

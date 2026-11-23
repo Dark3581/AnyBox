@@ -110,7 +110,7 @@ PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) co
         }
     };
     for (const GraphicsShaderSource& shader : request.shaders) {
-        const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(shader.module, entry.error);
+        const std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(shader.module, entry.usesCodeBase, entry.error);
         if (!words) {
             release();
             return finish();
@@ -175,7 +175,7 @@ PipelineEntry PipelineLibrary::Create(const PipelineSource& source) const {
         entry.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         return entry;
     };
-    const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(source.module, entry.error);
+    const std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(source.module, entry.usesCodeBase, entry.error);
     if (!words) {
         return finish();
     }

@@ -6,6 +6,7 @@
 #include "ShaderStore.hpp"
 
 #include <string>
+#include <vector>
 
 namespace abx::d3d12x {
 
@@ -31,6 +32,10 @@ public:
     RootSignature* Signature() const { return signature_; }
     PipelineOrigin Origin() const { return origin_; }
     const std::string& UnbuiltReason() const { return unbuilt_; }
+    const std::vector<std::string>& Shaders() const { return shaders_; }
+    bool UsesCodeBase() const { return usesCodeBase_; }
+    VkPolygonMode PolygonMode() const { return polygonMode_; }
+    bool HasStage(const char* stage) const;
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -46,6 +51,9 @@ private:
     PipelineOrigin origin_;
     RootSignature* signature_;
     std::string unbuilt_;
+    std::vector<std::string> shaders_;
+    bool usesCodeBase_ = false;
+    VkPolygonMode polygonMode_ = VK_POLYGON_MODE_FILL;
 };
 
 }

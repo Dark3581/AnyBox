@@ -39,6 +39,7 @@ struct VertexBufferRef {
 };
 
 std::optional<VkPrimitiveTopology> VulkanTopology(D3D_PRIMITIVE_TOPOLOGY topology);
+constexpr D3D_PRIMITIVE_TOPOLOGY kConsoleRectangleList = static_cast<D3D_PRIMITIVE_TOPOLOGY>(17);
 std::optional<VkViewport> VulkanViewport(const D3D12_VIEWPORT& viewport);
 
 class CommandRecorder {
@@ -68,12 +69,14 @@ public:
     bool SetViewports(const std::vector<D3D12_VIEWPORT>& viewports, std::string& error);
     bool SetScissors(const std::vector<D3D12_RECT>& rects, std::string& error);
     bool SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY topology, bool stripCut, std::string& error);
+    void SetPolygonMode(VkPolygonMode mode);
     void SetBlendFactor(const float factor[4]);
     void SetStencilReference(UINT reference);
     bool SetVertexBuffers(UINT firstSlot, const std::vector<VertexBufferRef>& buffers, std::string& error);
     bool SetIndexBuffer(const BufferRef& buffer, DXGI_FORMAT format, std::string& error);
     void BindPipeline(VkPipelineBindPoint point, VkPipeline pipeline);
     bool SetPushConstants(const void* data, std::uint32_t bytes, std::string& error);
+    void BindTitleSet(VkPipelineBindPoint point, VkDescriptorSet set);
     void Draw(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance);
     void DrawIndexed(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance);
     void Dispatch(UINT x, UINT y, UINT z);

@@ -1,6 +1,8 @@
 #include "xdll/xmem/xmem.hpp"
 #include "PhysicalMemory.hpp"
 
+#include "GpuVisible.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -52,6 +54,7 @@ struct Window {
     std::uintptr_t base;
     std::size_t slots;
     ULONG viewProtection;
+    bool gpu;
     std::vector<bool> boundary;
     std::vector<bool> mapped;
 };
@@ -120,13 +123,38 @@ bool MapSlot(Window& window, std::size_t slot, const PageRun& run, std::uintptr_
 
 }
 
-void RegisterWindow(void* base, std::size_t size, std::uint32_t protection) {
+void WithdrawMapped(const Window& window, std::size_t firstSlot, std::size_t count) {
+    if (!window.gpu) return;
+    std::size_t run = 0;
+    for (std::size_t slot = firstSlot; slot <= firstSlot + count; ++slot) {
+        if (slot < firstSlot + count && window.mapped[slot]) {
+            ++run;
+            continue;
+        }
+        if (run != 0) AnnounceWithdrawn(window.base + (slot - run) * kPhysicalPageSize, run * kPhysicalPageSize);
+        run = 0;
+    }
+}
+
+void AnnounceRuns(std::vector<std::uintptr_t>& addresses) {
+    std::sort(addresses.begin(), addresses.end());
+    std::size_t index = 0;
+    while (index < addresses.size()) {
+        std::size_t next = index + 1;
+        while (next < addresses.size() && addresses[next] == addresses[next - 1] + kPhysicalPageSize) ++next;
+        AnnounceAvailable(addresses[index], (next - index) * kPhysicalPageSize);
+        index = next;
+    }
+}
+
+void RegisterWindow(void* base, std::size_t size, std::uint32_t protection, bool gpu) {
     State& state = Physical();
     const std::lock_guard guard(state.lock);
     Window window;
     window.base = reinterpret_cast<std::uintptr_t>(base);
     window.slots = size / kPhysicalPageSize;
     window.viewProtection = protection == PAGE_NOACCESS ? PAGE_READWRITE : protection;
+    window.gpu = gpu;
     window.boundary.assign(window.slots + 1, false);
     window.boundary.front() = true;
     window.boundary.back() = true;
@@ -134,17 +162,17 @@ void RegisterWindow(void* base, std::size_t size, std::uint32_t protection) {
     state.windows.push_back(std::move(window));
 }
 
-void* ReservePhysicalWindow(std::size_t size, std::uint32_t protection) {
+void* ReservePhysicalWindow(std::size_t size, std::uint32_t protection, bool gpu) {
     if (size == 0 || size % kPhysicalPageSize != 0) {
         AbxUnsupported("XMemVirtualAlloc", "a physical page window whose size is not a whole number of 64 KiB pages");
     }
     void* const base = Placeholders().virtualAlloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | kReservePlaceholder, PAGE_NOACCESS, nullptr, 0);
     if (base == nullptr) return nullptr;
-    RegisterWindow(base, size, protection);
+    RegisterWindow(base, size, protection, gpu);
     return base;
 }
 
-void* AdoptPhysicalWindow(void* address, std::size_t size, std::uint32_t protection) {
+void* AdoptPhysicalWindow(void* address, std::size_t size, std::uint32_t protection, bool gpu) {
     const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(address);
     if (size == 0 || size % kPhysicalPageSize != 0 || start % kPhysicalPageSize != 0) {
         AbxUnsupported("XMemVirtualAlloc", "a physical page window over a placeholder that is not 64 KiB aligned or sized");
@@ -161,7 +189,7 @@ void* AdoptPhysicalWindow(void* address, std::size_t size, std::uint32_t protect
             AbxUnsupported("XMemVirtualAlloc", "a physical page window over a range that already is one");
         }
     }
-    RegisterWindow(address, size, protection);
+    RegisterWindow(address, size, protection, gpu);
     return address;
 }
 
@@ -231,6 +259,7 @@ ABX_API void* XMemMapPhysicalPages(void* address, std::size_t pageCount, const s
     if (pageCount > window->slots - firstSlot) {
         AbxUnsupported(__func__, "a page range that runs past the end of its physical page window");
     }
+    abx::xmem::WithdrawMapped(*window, firstSlot, pageCount);
     for (std::size_t index = 0; index < pageCount; ++index) {
         const std::size_t slot = firstSlot + index;
         if (pageArray == nullptr) {
@@ -243,6 +272,7 @@ ABX_API void* XMemMapPhysicalPages(void* address, std::size_t pageCount, const s
         }
         if (!abx::xmem::MapSlot(*window, slot, *run, pageArray[index])) return nullptr;
     }
+    if (window->gpu && pageArray != nullptr && pageCount != 0) abx::xmem::AnnounceAvailable(start, pageCount * kPhysicalPageSize);
     AbxTrace("XMemMapPhysicalPages(%p, %zu, %s)", address, pageCount, pageArray == nullptr ? "unmap" : "map");
     return address;
 }
@@ -254,6 +284,7 @@ ABX_API BOOL XMemMapPhysicalPagesScatter(void* const* addresses, std::size_t cou
     }
     auto& state = abx::xmem::Physical();
     const std::lock_guard guard(state.lock);
+    std::vector<std::uintptr_t> mapped;
     for (std::size_t index = 0; index < count; ++index) {
         const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(addresses[index]);
         if (start % kPhysicalPageSize != 0) {
@@ -264,6 +295,7 @@ ABX_API BOOL XMemMapPhysicalPagesScatter(void* const* addresses, std::size_t cou
             AbxUnsupported(__func__, "a target address outside every physical page window");
         }
         const std::size_t slot = (start - window->base) / kPhysicalPageSize;
+        abx::xmem::WithdrawMapped(*window, slot, 1);
         if (pageArray[index] == 0) {
             if (!abx::xmem::UnmapSlot(*window, slot)) return FALSE;
             continue;
@@ -273,7 +305,9 @@ ABX_API BOOL XMemMapPhysicalPagesScatter(void* const* addresses, std::size_t cou
             AbxUnsupported(__func__, "a page frame number that XMemAllocatePhysicalPages did not return");
         }
         if (!abx::xmem::MapSlot(*window, slot, *run, pageArray[index])) return FALSE;
+        if (window->gpu) mapped.push_back(start);
     }
+    abx::xmem::AnnounceRuns(mapped);
     AbxTrace("XMemMapPhysicalPagesScatter(%zu pages)", count);
     return TRUE;
 }

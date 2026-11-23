@@ -1,5 +1,7 @@
 #include "PipelineCompiler.hpp"
 
+#include "AddressTranslation.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -178,12 +180,25 @@ void ComputePipeline::Reset() {
     pipeline_ = VK_NULL_HANDLE;
 }
 
+std::optional<std::vector<std::uint32_t>> ReadTitleModule(const std::filesystem::path& path, bool& usesCodeBase, std::string& error) {
+    const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(path, error);
+    if (!words) return std::nullopt;
+    std::optional<AddressTranslation> translated = TranslateTitleAddresses(*words, error);
+    if (!translated) {
+        error = path.string() + ": " + error;
+        return std::nullopt;
+    }
+    usesCodeBase = usesCodeBase || translated->usesCodeBase;
+    return std::move(translated->words);
+}
+
 CompileOutcome CompileCompute(const VulkanDevice& device, VkPipelineCache cache, const ComputeJob& job, ComputePipeline* keep) {
     CompileOutcome outcome;
     outcome.name = job.name;
     std::error_code sizeError;
     outcome.bytes = std::filesystem::file_size(job.module, sizeError);
-    const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(job.module, outcome.error);
+    bool usesCodeBase = false;
+    const std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(job.module, usesCodeBase, outcome.error);
     if (!words) {
         return outcome;
     }

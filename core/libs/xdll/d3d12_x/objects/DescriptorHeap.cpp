@@ -61,6 +61,7 @@ HRESULT DescriptorHeap::Create(const ResourceContext& context, IUnknown* parent,
 
 D3D12_GPU_DESCRIPTOR_HANDLE DescriptorHeap::GpuStart() const {
     if (!ShaderVisible()) return {0};
+    if (gpuAlias_ != 0) return {gpuAlias_};
     if (titleMemory_) return {reinterpret_cast<UINT64>(memory_)};
     return {context_.window.Start() + offset_};
 }
@@ -75,6 +76,14 @@ bool DescriptorHeap::Allocate(std::string& error) {
             return false;
         }
         titleMemory_ = true;
+        if (ShaderVisible() && context_.addresses != nullptr) {
+            const std::optional<std::uint64_t> alias = context_.addresses->AliasBelow4GiB(reinterpret_cast<std::uint64_t>(memory_), bytes, error);
+            if (!alias) {
+                error = "the shader-visible descriptor heap needs a GPU address below 4 GiB: " + error;
+                return false;
+            }
+            gpuAlias_ = *alias;
+        }
     } else if (ShaderVisible()) {
         const std::optional<std::uint64_t> offset = context_.arena.Allocate(bytes, kBufferPlacementAlignment);
         if (!offset) {
@@ -103,6 +112,7 @@ DescriptorHeap::~DescriptorHeap() {
         registry.heaps.erase(reinterpret_cast<SIZE_T>(memory_));
     }
     if (allocated_) context_.arena.Free(offset_);
+    if (gpuAlias_ != 0 && context_.addresses != nullptr) context_.addresses->ReleaseAlias(gpuAlias_);
     if (titleMemory_) context_.titleMemory->release(memory_, context_.titleMemory->descriptorHeapAttributes);
 }
 
