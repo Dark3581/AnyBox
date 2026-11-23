@@ -78,6 +78,72 @@ bool PatchToJump(std::uint8_t* at, std::size_t length) {
     return true;
 }
 
+constexpr std::size_t kCacheLine = 64;
+
+void ReportOnce(std::atomic<bool>& reported, const char* text, std::uintptr_t offset) {
+    if (!reported.exchange(true)) {
+        AbxLog("runtime", "title+0x%llx: %s (later sites are handled the same way without a log line)", static_cast<unsigned long long>(offset), text);
+    }
+}
+
+std::uint64_t InsertBits(std::uint64_t destination, std::uint64_t source, std::uint32_t length, std::uint32_t index) {
+    length &= 0x3F;
+    index &= 0x3F;
+    const std::uint64_t mask = length == 0 ? ~std::uint64_t{0} : ((std::uint64_t{1} << length) - 1);
+    return (destination & ~(mask << index)) | ((source & mask) << index);
+}
+
+bool EmulateAmdOnly(const std::uint8_t* code, std::size_t available, CONTEXT& context, std::uintptr_t imageStart) {
+    static std::atomic<bool> zeroReported{false};
+    static std::atomic<bool> monitorReported{false};
+    static std::atomic<bool> insertReported{false};
+    const std::uintptr_t offset = context.Rip - imageStart;
+    if (available >= 3 && code[0] == 0x0F && code[1] == 0x01) {
+        if (code[2] == 0xFC) {
+            std::memset(reinterpret_cast<void*>(context.Rax & ~static_cast<std::uint64_t>(kCacheLine - 1)), 0, kCacheLine);
+            context.Rip += 3;
+            ReportOnce(zeroReported, "clzero is not supported by this CPU; the 64-byte line is zeroed by AnyBox", offset);
+            return true;
+        }
+        if (code[2] == 0xFA || code[2] == 0xFB) {
+            if (code[2] == 0xFB) YieldProcessor();
+            context.Rip += 3;
+            ReportOnce(monitorReported, "monitorx/mwaitx are not supported by this CPU; the wait returns at once, as a spurious wake-up may", offset);
+            return true;
+        }
+    }
+    if (available >= 5 && code[0] == 0xF2) {
+        std::size_t at = 1;
+        std::uint8_t rex = 0;
+        if ((code[at] & 0xF0) == 0x40) rex = code[at++];
+        if (available < at + 3 || code[at] != 0x0F || (code[at + 1] != 0x78 && code[at + 1] != 0x79)) return false;
+        const bool immediate = code[at + 1] == 0x78;
+        const std::uint8_t modrm = code[at + 2];
+        if ((modrm >> 6) != 3) return false;
+        const std::uint32_t destination = ((modrm >> 3) & 7) | ((rex & 0x4) != 0 ? 8u : 0u);
+        const std::uint32_t source = (modrm & 7) | ((rex & 0x1) != 0 ? 8u : 0u);
+        const std::size_t length = at + 3 + (immediate ? 2 : 0);
+        if (available < length) return false;
+        M128A* xmm = &context.Xmm0;
+        const std::uint64_t field = static_cast<std::uint64_t>(xmm[source].Low);
+        std::uint32_t bits = 0;
+        std::uint32_t index = 0;
+        if (immediate) {
+            bits = code[at + 3];
+            index = code[at + 4];
+        } else {
+            const std::uint64_t high = static_cast<std::uint64_t>(xmm[source].High);
+            bits = static_cast<std::uint32_t>(high & 0x3F);
+            index = static_cast<std::uint32_t>((high >> 8) & 0x3F);
+        }
+        xmm[destination].Low = InsertBits(static_cast<std::uint64_t>(xmm[destination].Low), field, bits, index);
+        context.Rip += length;
+        ReportOnce(insertReported, "insertq (SSE4a) is not supported by this CPU; AnyBox emulates it", offset);
+        return true;
+    }
+    return false;
+}
+
 LONG WINAPI OnIllegalInstruction(EXCEPTION_POINTERS* pointers) {
     if (pointers->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     const ImageRange image = TitleImage();
@@ -85,6 +151,7 @@ LONG WINAPI OnIllegalInstruction(EXCEPTION_POINTERS* pointers) {
     if (rip < image.start || rip >= image.end) return EXCEPTION_CONTINUE_SEARCH;
     auto* code = reinterpret_cast<std::uint8_t*>(rip);
     const std::size_t available = (std::min)(kMaxInstruction, static_cast<std::size_t>(image.end - rip));
+    if (EmulateAmdOnly(code, available, *pointers->ContextRecord, image.start)) return EXCEPTION_CONTINUE_EXECUTION;
     const std::lock_guard guard(g_patchLock);
     if (code[0] == kShortJump) return EXCEPTION_CONTINUE_EXECUTION;
     const std::size_t length = CacheLineWritebackLength(code, available);

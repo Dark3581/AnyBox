@@ -84,6 +84,7 @@ std::optional<VkFormat> VulkanFormat(DXGI_FORMAT format) {
     case DXGI_FORMAT_R16_SNORM: return VK_FORMAT_R16_SNORM;
     case DXGI_FORMAT_R16_SINT: return VK_FORMAT_R16_SINT;
     case DXGI_FORMAT_R8_UNORM: return VK_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_A8_UNORM: return VK_FORMAT_A8_UNORM_KHR;
     case DXGI_FORMAT_R8_UINT: return VK_FORMAT_R8_UINT;
     case DXGI_FORMAT_R8_SNORM: return VK_FORMAT_R8_SNORM;
     case DXGI_FORMAT_R8_SINT: return VK_FORMAT_R8_SINT;

@@ -7,6 +7,7 @@
 #include "ViewDesc.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -37,8 +38,7 @@ void Check(bool ok, const char* function, const std::string& error) {
 
 std::optional<std::uint32_t> ImageBinding(VkImageViewType type, ImageComponent component, bool storage) {
     const std::uint32_t offset = component == ImageComponent::Uint ? 1u : component == ImageComponent::Sint ? 2u : 0u;
-    if (!storage) {
-        if (component != ImageComponent::Float) return std::nullopt;
+    if (!storage && component == ImageComponent::Float) {
         switch (type) {
         case VK_IMAGE_VIEW_TYPE_1D: return 5u;
         case VK_IMAGE_VIEW_TYPE_2D: return 0u;
@@ -128,7 +128,11 @@ void DescriptorWriter::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW
         return;
     }
     if (!context_.window.Contains(desc->BufferLocation, desc->SizeInBytes)) {
-        AbxUnsupported(function, "a constant buffer outside the title buffer window");
+        if (context_.titleMemory == nullptr) {
+            AbxUnsupported(function, "a constant buffer outside the title buffer window");
+        }
+        AbxTrace("%s: constant buffer at title address 0x%llx (%u bytes) has no Vulkan backing yet", function, static_cast<unsigned long long>(desc->BufferLocation),
+                 desc->SizeInBytes);
     }
     std::string error;
     const std::optional<BufferDescriptorWords> words = ConstantBufferDescriptor(*desc, error);
@@ -168,15 +172,20 @@ ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkIma
     const auto known = images_.find(view);
     if (known != images_.end()) return known->second.words;
     const VkImageCreateInfo& image = resource->Texture().layout.info;
-    if (image.samples != VK_SAMPLE_COUNT_1_BIT) {
-        AbxUnsupported(function, "a multisampled image in a shader-visible heap: how its sample count goes in the image descriptor is not settled");
+    const bool multisampled = image.samples != VK_SAMPLE_COUNT_1_BIT;
+    std::optional<ImageFormatInfo> format = ImageFormatOf(info.format);
+    if (!format && (info.format == VK_FORMAT_D32_SFLOAT_S8_UINT || info.format == VK_FORMAT_D32_SFLOAT)) {
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) format = ImageFormatOf(VK_FORMAT_R32_SFLOAT);
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT) format = ImageFormatOf(VK_FORMAT_R8_UINT);
     }
-    const std::optional<ImageFormatInfo> format = ImageFormatOf(info.format);
     if (!format) {
         AbxUnsupported(function, ("Vulkan format " + std::to_string(static_cast<int>(info.format)) + " has no image descriptor format code AnyBox has sourced").c_str());
     }
-    const std::optional<std::uint32_t> binding = ImageBinding(info.viewType, format->component, unorderedAccess);
-    const std::optional<std::uint32_t> type = ImageType(info.viewType);
+    const bool cube = info.viewType == VK_IMAGE_VIEW_TYPE_CUBE || info.viewType == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    const VkImageViewType bindingType = cube ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : info.viewType;
+    const std::optional<std::uint32_t> binding = multisampled ? std::optional<std::uint32_t>(0u) : ImageBinding(bindingType, format->component, unorderedAccess);
+    std::optional<std::uint32_t> type = ImageType(info.viewType);
+    if (multisampled && type) type = *type == kImageType2DArray ? kImageType2DMsaaArray : kImageType2DMsaa;
     if (!binding || !type) {
         AbxUnsupported(function, ("an image view of type " + std::to_string(static_cast<int>(info.viewType)) + " with that component type has no bindless binding").c_str());
     }
@@ -202,11 +211,33 @@ ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkIma
     fields.type = *type;
     fields.baseArray = range.baseArrayLayer;
     fields.maxMip = image.mipLevels - 1;
+    if (multisampled) {
+        std::uint32_t log2 = 0;
+        while ((1u << (log2 + 1)) <= static_cast<std::uint32_t>(image.samples)) ++log2;
+        fields.baseLevel = 0;
+        fields.lastLevel = log2;
+        fields.maxMip = static_cast<std::uint32_t>(image.samples);
+    }
     const std::optional<ImageDescriptorWords> words = EncodeImageDescriptor(fields);
     if (!words) AbxUnsupported(function, "an image whose size, mips or layers do not fit the image descriptor");
+    if (multisampled) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "multisampled textures get image descriptor words but no bindless slot: the title layout has no multisampled image binding");
+        }
+        images_.emplace(view, BoundImage{*words});
+        return *words;
+    }
     std::uint32_t& slot = nextImageSlot_.try_emplace(*binding, 1u).first->second;
     std::string error;
-    Check(context_.bindless->WriteImage(*binding, slot, view, error), function, error);
+    VkImageView bound = view;
+    if (cube) {
+        VkImageViewCreateInfo layers = info;
+        layers.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        bound = resource->View(layers, error);
+        Check(bound != VK_NULL_HANDLE, function, error);
+    }
+    Check(context_.bindless->WriteImage(*binding, slot, bound, error), function, error);
     std::uint32_t source[8];
     std::copy(words->begin(), words->end(), source);
     if (!context_.bindless->Table().Insert(ImageKey(source), slot)) {

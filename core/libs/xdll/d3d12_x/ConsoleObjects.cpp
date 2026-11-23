@@ -1,16 +1,65 @@
 #include "ConsoleObjects.hpp"
 
 #include "AbxApi.hpp"
+#include "CommandAllocator.hpp"
 #include "CommandList.hpp"
+#include "PipelineObject.hpp"
+#include "Presenter.hpp"
+#include "Resource.hpp"
+#include "CommandQueue.hpp"
 #include "DescriptorHeap.hpp"
+#include "Fence.hpp"
 
 #include <atomic>
 #include <cstdint>
+#include <algorithm>
+#include <array>
 #include <cstring>
+#include <optional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <string>
 
 namespace abx::d3d12x::console {
 namespace {
+
+std::atomic<UINT64> g_timestampFrequency{0};
+std::atomic<const VulkanDevice*> g_vulkan{nullptr};
+
+struct Label {
+    std::uint64_t* address;
+    std::uint64_t value;
+};
+
+std::mutex g_labelLock;
+std::map<const CommandList*, std::vector<Label>> g_labels;
+
+void STDMETHODCALLTYPE ListWriteLabel(Facade* self, std::uint64_t* address, std::uint32_t stage, std::uint64_t value, std::uint32_t mode) {
+    if (address == nullptr || stage != 7 || mode != 1) {
+        AbxUnsupported("D3D12 command list slot 74", "arguments other than the measured (address, 7, value, 1)");
+    }
+    const std::lock_guard guard(g_labelLock);
+    g_labels[InnerOf<CommandList>(self)].push_back({address, value});
+}
+
+void ClearLabels(const CommandList* list) {
+    const std::lock_guard guard(g_labelLock);
+    g_labels.erase(list);
+}
+
+void WriteLabels(const CommandList* list) {
+    std::vector<Label> labels;
+    {
+        const std::lock_guard guard(g_labelLock);
+        const auto found = g_labels.find(list);
+        if (found == g_labels.end()) return;
+        labels = found->second;
+    }
+    for (const Label& label : labels) *label.address = label.value;
+}
 
 HRESULT STDMETHODCALLTYPE ListClose(Facade* self) {
     return InnerOf<CommandList>(self)->Close();
@@ -27,6 +76,297 @@ void STDMETHODCALLTYPE ListRecordedCommand(Facade*, std::uint32_t first, std::ui
     }
 }
 
+void STDMETHODCALLTYPE QueueExecuteCommandLists(Facade* self, UINT count, void* const* lists, std::uint64_t frameToken, std::uint32_t flags) {
+    constexpr UINT kMaxLists = 64;
+    if (count > kMaxLists || (count != 0 && lists == nullptr) || flags > 0xFF) {
+        AbxUnsupported("D3D12 command queue slot 35", "more than 64 lists, a null list array or flags above 0xff");
+    }
+    static std::array<std::atomic<bool>, 256> seenFlags{};
+    if (!seenFlags[flags].exchange(true)) {
+        AbxLog("d3d12_x", "ExecuteCommandLists flags 0x%x seen (recorded, their meaning is not measured)", flags);
+    }
+    ID3D12CommandList* inner[kMaxLists]{};
+    for (UINT index = 0; index < count; ++index) {
+        inner[index] = static_cast<CommandList*>(FacadeInner(lists[index]));
+        if (inner[index] == nullptr) AbxUnsupported("D3D12 command queue slot 35", "a command list that AnyBox did not hand out");
+    }
+    AbxTrace("ExecuteCommandLists(%u lists, frame token %llu)", count, static_cast<unsigned long long>(frameToken));
+    CommandQueue* queue = InnerOf<CommandQueue>(self);
+    queue->ExecuteCommandLists(count, inner);
+    bool labelled = false;
+    {
+        const std::lock_guard guard(g_labelLock);
+        for (UINT index = 0; index < count && !labelled; ++index) labelled = g_labels.count(static_cast<CommandList*>(inner[index])) != 0;
+    }
+    if (labelled) {
+        queue->Flush();
+        const VulkanDevice* device = g_vulkan.load();
+        std::string error;
+        if (device == nullptr || !device->Submit([](VkCommandBuffer) {}, error)) {
+            AbxUnsupported("D3D12 command queue slot 35", ("waiting for the GPU before writing labels failed: " + error).c_str());
+        }
+        for (UINT index = 0; index < count; ++index) WriteLabels(static_cast<CommandList*>(inner[index]));
+    }
+}
+
+HRESULT STDMETHODCALLTYPE QueueSignal(Facade* self, void* fence, UINT64 value) {
+    auto* inner = static_cast<Fence*>(FacadeInner(fence));
+    if (inner == nullptr) AbxUnsupported("D3D12 command queue slot 16", "a fence that AnyBox did not hand out");
+    return InnerOf<CommandQueue>(self)->Signal(inner, value);
+}
+
+std::mutex g_presentLock;
+std::unique_ptr<Presenter> g_presenter;
+
+HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std::uint8_t* planes, const void* parameters) {
+    constexpr std::size_t kPlaneResources = 0x10;
+    static_cast<void>(parameters);
+    if (planeCount == 0 || planes == nullptr) AbxUnsupported("D3D12 command queue slot 32", "a present without planes");
+    void* const* resources = nullptr;
+    std::memcpy(&resources, planes + kPlaneResources, sizeof(resources));
+    Resource* image = resources != nullptr ? static_cast<Resource*>(FacadeInner(resources[0])) : nullptr;
+    if (image == nullptr || image->IsBuffer()) AbxUnsupported("D3D12 command queue slot 32", "a present plane without a texture AnyBox handed out");
+    InnerOf<CommandQueue>(self)->Flush();
+    const std::lock_guard guard(g_presentLock);
+    std::string error;
+    if (!g_presenter) {
+        const VulkanDevice* device = g_vulkan.load();
+        const HWND window = FindProcessWindow();
+        if (device == nullptr || window == nullptr) AbxUnsupported("D3D12 command queue slot 32", "presenting before the title's window or the Vulkan device exists");
+        g_presenter = Presenter::Create(*device, window, error);
+        if (!g_presenter) AbxUnsupported("D3D12 command queue slot 32", ("the swapchain could not be created: " + error).c_str());
+        AbxLog("d3d12_x", "presenting to the title's window (%u plane(s); only the first is shown)", planeCount);
+    }
+    const D3D12_RESOURCE_DESC& desc = image->Texture().desc;
+    if (!g_presenter->Present(image->Texture().image, {static_cast<std::uint32_t>(desc.Width), desc.Height}, VK_IMAGE_LAYOUT_GENERAL, error)) {
+        AbxUnsupported("D3D12 command queue slot 32", ("presenting failed: " + error).c_str());
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE QueueGetTimestampFrequency(Facade* self, UINT64* frequency) {
+    return InnerOf<CommandQueue>(self)->GetTimestampFrequency(frequency);
+}
+
+HRESULT STDMETHODCALLTYPE AllocatorSetMemoryCallback(Facade*, void* callback, void* context) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "command allocator memory callback %p (context %p) recorded and not called: AnyBox records commands into Vulkan command buffers", callback, context);
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ListReset(Facade* self, void* allocator, void* initial, std::uint64_t extra) {
+    if (extra != 0) {
+        AbxUnsupported("D3D12 command list slot 139", "a nonzero third argument, which is not measured");
+    }
+    auto* inner = static_cast<ID3D12CommandAllocator*>(static_cast<CommandAllocator*>(FacadeInner(allocator)));
+    if (inner == nullptr) {
+        AbxUnsupported("D3D12 command list slot 139", "a command allocator that AnyBox did not hand out");
+    }
+    ID3D12PipelineState* state = nullptr;
+    if (initial != nullptr) {
+        state = static_cast<PipelineStateObject*>(FacadeInner(initial));
+        if (state == nullptr) AbxUnsupported("D3D12 command list slot 139", "a pipeline state that AnyBox did not hand out");
+    }
+    ClearLabels(InnerOf<CommandList>(self));
+    return InnerOf<CommandList>(self)->Reset(inner, state);
+}
+
+void STDMETHODCALLTYPE ListSetDescriptorHeaps(Facade* self, UINT count, void* const* heaps) {
+    constexpr UINT kMaxHeaps = 2;
+    if (count > kMaxHeaps || (count != 0 && heaps == nullptr)) {
+        AbxUnsupported("D3D12 command list slot 32", "more than two descriptor heaps or a null heap array");
+    }
+    ID3D12DescriptorHeap* inner[kMaxHeaps]{};
+    for (UINT index = 0; index < count; ++index) {
+        inner[index] = static_cast<DescriptorHeap*>(FacadeInner(heaps[index]));
+        if (inner[index] == nullptr) AbxUnsupported("D3D12 command list slot 32", "a descriptor heap that AnyBox did not hand out");
+    }
+    InnerOf<CommandList>(self)->SetDescriptorHeaps(count, inner);
+}
+
+void STDMETHODCALLTYPE ListWriteValue(Facade*, std::uint32_t* address, std::uint32_t value, std::uint64_t third, std::uint32_t fourth) {
+    if (address == nullptr || third != 0 || fourth != 0) {
+        AbxUnsupported("D3D12 command list slot 71", "a null address or nonzero third or fourth arguments, which are not measured");
+    }
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "command list slot 71 writes a 32-bit marker to title memory: AnyBox writes it when it is recorded, before the GPU would reach it");
+    }
+    *address = value;
+}
+
+
+
+void STDMETHODCALLTYPE ListWriteTimestamp(Facade*, std::uint64_t* address, std::uint64_t second, std::uint64_t third, std::uint32_t mode) {
+    if (address == nullptr || second != 0 || third != 0 || mode != 1) {
+        AbxUnsupported("D3D12 command list slot 72", "arguments other than the measured (address, 0, 0, 1)");
+    }
+    const UINT64 frequency = g_timestampFrequency.load();
+    LARGE_INTEGER now{};
+    LARGE_INTEGER ticks{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&ticks);
+    if (frequency == 0 || ticks.QuadPart == 0) {
+        AbxUnsupported("D3D12 command list slot 72", "a timestamp before the device reported its timestamp frequency");
+    }
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "command list slot 72 writes a 64-bit timestamp: AnyBox writes the CPU clock in GPU timestamp units when it is recorded");
+    }
+    const long double seconds = static_cast<long double>(now.QuadPart) / static_cast<long double>(ticks.QuadPart);
+    *address = static_cast<std::uint64_t>(seconds * static_cast<long double>(frequency));
+}
+
+std::optional<D3D12_RESOURCE_STATES> StateOfLayout(D3D12_BARRIER_LAYOUT layout) {
+    switch (layout) {
+    case D3D12_BARRIER_LAYOUT_UNDEFINED:
+    case D3D12_BARRIER_LAYOUT_COMMON:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON: return D3D12_RESOURCE_STATE_COMMON;
+    case D3D12_BARRIER_LAYOUT_GENERIC_READ:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ: return D3D12_RESOURCE_STATE_GENERIC_READ;
+    case D3D12_BARRIER_LAYOUT_RENDER_TARGET: return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE: return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ: return D3D12_RESOURCE_STATE_DEPTH_READ;
+    case D3D12_BARRIER_LAYOUT_SHADER_RESOURCE:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE: return D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    case D3D12_BARRIER_LAYOUT_COPY_SOURCE:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE: return D3D12_RESOURCE_STATE_COPY_SOURCE;
+    case D3D12_BARRIER_LAYOUT_COPY_DEST:
+    case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST:
+    case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST: return D3D12_RESOURCE_STATE_COPY_DEST;
+    case D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE: return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    case D3D12_BARRIER_LAYOUT_RESOLVE_DEST: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    default: return std::nullopt;
+    }
+}
+
+void STDMETHODCALLTYPE ListBarrier(Facade* self, UINT groupCount, const D3D12_BARRIER_GROUP* groups) {
+    const char* function = "D3D12 command list slot 146";
+    if (groupCount != 0 && groups == nullptr) AbxUnsupported(function, "barrier groups without an array");
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    for (UINT group = 0; group < groupCount; ++group) {
+        const D3D12_BARRIER_GROUP& entry = groups[group];
+        if (entry.Type == D3D12_BARRIER_TYPE_GLOBAL || entry.Type == D3D12_BARRIER_TYPE_BUFFER) {
+            D3D12_RESOURCE_BARRIER memory{};
+            memory.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barriers.push_back(memory);
+            continue;
+        }
+        if (entry.Type != D3D12_BARRIER_TYPE_TEXTURE) AbxUnsupported(function, ("barrier group type " + std::to_string(static_cast<int>(entry.Type))).c_str());
+        for (UINT index = 0; index < entry.NumBarriers; ++index) {
+            const D3D12_TEXTURE_BARRIER& texture = entry.pTextureBarriers[index];
+            Resource* resource = static_cast<Resource*>(FacadeInner(texture.pResource));
+            if (resource == nullptr) AbxUnsupported(function, "a texture that AnyBox did not hand out");
+            std::optional<D3D12_RESOURCE_STATES> before = StateOfLayout(texture.LayoutBefore);
+            std::optional<D3D12_RESOURCE_STATES> after = StateOfLayout(texture.LayoutAfter);
+            constexpr UINT kConsoleDisplayLayout = 31;
+            D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+            resource->GetHeapProperties(nullptr, &heapFlags);
+            if ((static_cast<UINT>(heapFlags) & D3D12_HEAP_FLAG_ALLOW_DISPLAY) != 0) {
+                static std::atomic<bool> reported{false};
+                if (static_cast<UINT>(texture.LayoutBefore) == kConsoleDisplayLayout) before = D3D12_RESOURCE_STATE_COMMON;
+                if (static_cast<UINT>(texture.LayoutAfter) == kConsoleDisplayLayout) after = D3D12_RESOURCE_STATE_COMMON;
+                if ((static_cast<UINT>(texture.LayoutBefore) == kConsoleDisplayLayout || static_cast<UINT>(texture.LayoutAfter) == kConsoleDisplayLayout) &&
+                    !reported.exchange(true)) {
+                    AbxLog("d3d12_x", "barrier layout 31 (console-only) on a display surface is treated as the present state");
+                }
+            }
+            if (!before || !after) {
+                AbxUnsupported(function, ("barrier layouts " + std::to_string(static_cast<int>(texture.LayoutBefore)) + " -> " +
+                                          std::to_string(static_cast<int>(texture.LayoutAfter)) + " that have no resource state")
+                                             .c_str());
+            }
+            D3D12_RESOURCE_BARRIER transition{};
+            transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            transition.Transition.pResource = resource;
+            transition.Transition.StateBefore = *before;
+            transition.Transition.StateAfter = *after;
+            const D3D12_BARRIER_SUBRESOURCE_RANGE& range = texture.Subresources;
+            if (range.NumMipLevels == 0) {
+                transition.Transition.Subresource = range.IndexOrFirstMipLevel;
+                barriers.push_back(transition);
+                continue;
+            }
+            const D3D12_RESOURCE_DESC& desc = resource->Texture().desc;
+            const UINT mips = resource->Texture().layout.info.mipLevels;
+            const UINT layers = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+            const UINT planes = (std::max)(range.NumPlanes, 1u);
+            for (UINT plane = range.FirstPlane; plane < range.FirstPlane + planes; ++plane) {
+                for (UINT slice = range.FirstArraySlice; slice < range.FirstArraySlice + (std::max)(range.NumArraySlices, 1u); ++slice) {
+                    for (UINT mip = range.IndexOrFirstMipLevel; mip < range.IndexOrFirstMipLevel + range.NumMipLevels; ++mip) {
+                        transition.Transition.Subresource = mip + slice * mips + plane * mips * layers;
+                        barriers.push_back(transition);
+                    }
+                }
+            }
+        }
+    }
+    if (!barriers.empty()) InnerOf<CommandList>(self)->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+}
+
+void STDMETHODCALLTYPE ListClearRenderTargetView(Facade* self, D3D12_CPU_DESCRIPTOR_HANDLE target, const FLOAT color[4], UINT rectCount, const D3D12_RECT* rects) {
+    InnerOf<CommandList>(self)->ClearRenderTargetView(target, color, rectCount, rects);
+}
+
+struct FenceMirror {
+    Fence* fence;
+    std::atomic<UINT64> value;
+};
+
+std::mutex g_mirrorLock;
+std::vector<std::unique_ptr<FenceMirror>> g_mirrors;
+std::once_flag g_mirrorThread;
+
+void MirrorFences() {
+    for (;;) {
+        {
+            const std::lock_guard guard(g_mirrorLock);
+            for (const auto& mirror : g_mirrors) mirror->value = mirror->fence->GetCompletedValue();
+        }
+        Sleep(1);
+    }
+}
+
+const std::atomic<UINT64>* FenceCompletedAddress(Facade* self) {
+    Fence* fence = InnerOf<Fence>(self);
+    std::call_once(g_mirrorThread, [] {
+        std::thread(&MirrorFences).detach();
+        AbxLog("d3d12_x", "fence slot 12 hands out a memory copy of each fence's completed value, refreshed about every millisecond");
+    });
+    const std::lock_guard guard(g_mirrorLock);
+    for (const auto& mirror : g_mirrors) {
+        if (mirror->fence == fence) return &mirror->value;
+    }
+    fence->AddRef();
+    auto mirror = std::make_unique<FenceMirror>();
+    mirror->fence = fence;
+    mirror->value = fence->GetCompletedValue();
+    g_mirrors.push_back(std::move(mirror));
+    return &g_mirrors.back()->value;
+}
+
+D3D12_RESOURCE_DESC* ResourceGetDesc(Facade* self, D3D12_RESOURCE_DESC* desc) {
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    InnerOf<Resource>(self)->GetDesc(desc);
+#else
+    *desc = InnerOf<Resource>(self)->GetDesc();
+#endif
+    return desc;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE ResourceGetGpuVirtualAddress(Facade* self) {
+    return InnerOf<Resource>(self)->GetGPUVirtualAddress();
+}
+
 SIZE_T HeapCpuStart(Facade* self) {
     return InnerOf<DescriptorHeap>(self)->CpuStart().ptr;
 }
@@ -41,23 +381,50 @@ void Map(FacadeType& type, std::size_t slot, Function function) {
 }
 
 const FacadeType& TypeOf(Kind kind) {
-    static const FacadeType queue = MakeFacadeType("command queue", {__uuidof(ID3D12CommandQueue)});
-    static const FacadeType allocator = MakeFacadeType("command allocator", {__uuidof(ID3D12CommandAllocator)});
+    static const FacadeType queue = [] {
+        FacadeType type = MakeFacadeType("command queue", {__uuidof(ID3D12CommandQueue)});
+        Map(type, 16, &QueueSignal);
+        Map(type, 18, &QueueGetTimestampFrequency);
+        Map(type, 32, &QueuePresent);
+        Map(type, 35, &QueueExecuteCommandLists);
+        return type;
+    }();
+    static const FacadeType allocator = [] {
+        FacadeType type = MakeFacadeType("command allocator", {__uuidof(ID3D12CommandAllocator)});
+        Map(type, 9, &AllocatorSetMemoryCallback);
+        return type;
+    }();
     static const FacadeType list = [] {
         FacadeType type = MakeFacadeType("command list", {kCommandListInterface, __uuidof(ID3D12GraphicsCommandList)});
         Map(type, 9, &ListClose);
+        Map(type, 32, &ListSetDescriptorHeaps);
+        Map(type, 52, &ListClearRenderTargetView);
+        Map(type, 71, &ListWriteValue);
+        Map(type, 72, &ListWriteTimestamp);
+        Map(type, 74, &ListWriteLabel);
+        Map(type, 139, &ListReset);
+        Map(type, 146, &ListBarrier);
         Map(type, 131, &ListRecordedCommand<131>);
         Map(type, 132, &ListRecordedCommand<132>);
         return type;
     }();
-    static const FacadeType fence = MakeFacadeType("fence", {__uuidof(ID3D12Fence)});
+    static const FacadeType fence = [] {
+        FacadeType type = MakeFacadeType("fence", {__uuidof(ID3D12Fence)});
+        Map(type, 12, &FenceCompletedAddress);
+        return type;
+    }();
     static const FacadeType heap = [] {
         FacadeType type = MakeFacadeType("descriptor heap", {__uuidof(ID3D12DescriptorHeap)});
         Map(type, 9, &HeapCpuStart);
         Map(type, 10, &HeapGpuStart);
         return type;
     }();
-    static const FacadeType resource = MakeFacadeType("resource", {__uuidof(ID3D12Resource)});
+    static const FacadeType resource = [] {
+        FacadeType type = MakeFacadeType("resource", {__uuidof(ID3D12Resource)});
+        Map(type, 10, &ResourceGetDesc);
+        Map(type, 11, &ResourceGetGpuVirtualAddress);
+        return type;
+    }();
     static const FacadeType signature = MakeFacadeType("root signature", {__uuidof(ID3D12RootSignature)});
     static const FacadeType pipeline = MakeFacadeType("pipeline state", {__uuidof(ID3D12PipelineState)});
     static const FacadeType queries = MakeFacadeType("query heap", {__uuidof(ID3D12QueryHeap)});
@@ -79,6 +446,14 @@ const FacadeType& TypeOf(Kind kind) {
     return resource;
 }
 
+}
+
+void SetVulkanDevice(const VulkanDevice* device) {
+    g_vulkan = device;
+}
+
+void SetTimestampFrequency(UINT64 frequency) {
+    g_timestampFrequency = frequency;
 }
 
 HRESULT Deliver(Kind kind, IUnknown* inner, REFIID riid, void** object) {

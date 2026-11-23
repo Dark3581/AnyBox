@@ -44,6 +44,7 @@ ImageFormatInfo Sint(std::uint32_t code) {
 std::optional<ImageFormatInfo> ImageFormatOf(VkFormat format) {
     switch (format) {
     case VK_FORMAT_R8_UNORM: return Float(1);
+    case VK_FORMAT_A8_UNORM_KHR: return Float(1);
     case VK_FORMAT_R8_SNORM: return Float(2);
     case VK_FORMAT_R8_UINT: return Uint(5);
     case VK_FORMAT_R8_SINT: return Sint(6);
@@ -65,6 +66,9 @@ std::optional<ImageFormatInfo> ImageFormatOf(VkFormat format) {
     case VK_FORMAT_R16G16_UINT: return Uint(27);
     case VK_FORMAT_R16G16_SINT: return Sint(28);
     case VK_FORMAT_R16G16_SFLOAT: return Float(29);
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return Float(43);
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return Float(44);
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return Uint(48);
     case VK_FORMAT_R8G8B8A8_UNORM: return Float(56);
     case VK_FORMAT_B8G8R8A8_UNORM: return Float(56);
     case VK_FORMAT_R8G8B8A8_SNORM: return Float(57);

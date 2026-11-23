@@ -19,6 +19,7 @@ struct DeviceRequirements {
     bool maintenance8 = false;
     bool validation = false;
     bool hostMemoryImport = false;
+    bool presentation = false;
     std::string preferredDevice;
 };
 
@@ -119,6 +120,10 @@ public:
     VulkanDevice& operator=(const VulkanDevice&) = delete;
 
     VkDevice Handle() const { return device_; }
+    VkInstance Instance() const { return instance_.Get(); }
+    VkPhysicalDevice Physical() const { return physical_; }
+    PFN_vkGetInstanceProcAddr InstanceLoader() const { return instanceLoader_; }
+    PFN_vkGetDeviceProcAddr DeviceLoader() const { return deviceLoader_; }
     const DeviceFunctions& Vk() const { return vk_; }
     const GpuCapabilities& Gpu() const { return gpu_; }
     const VkPhysicalDeviceProperties& Properties() const { return properties_; }
@@ -158,6 +163,8 @@ private:
     std::vector<std::string> validationMessages_;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
+    PFN_vkGetInstanceProcAddr instanceLoader_ = nullptr;
+    PFN_vkGetDeviceProcAddr deviceLoader_ = nullptr;
     DeviceFunctions vk_;
     GpuCapabilities gpu_;
     VkPhysicalDeviceProperties properties_{};

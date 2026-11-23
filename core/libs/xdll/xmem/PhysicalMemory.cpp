@@ -13,6 +13,7 @@ namespace abx::xmem {
 namespace {
 
 constexpr ULONG kPreservePlaceholder = 0x00000002;
+constexpr std::uintptr_t kFramesPerPage = 16;
 
 using VirtualAlloc2Function = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
 using MapViewOfFile3Function = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
@@ -59,7 +60,7 @@ struct State {
     std::mutex lock;
     std::vector<PageRun> runs;
     std::vector<Window> windows;
-    std::uintptr_t nextFrame = 1;
+    std::uintptr_t nextFrame = kFramesPerPage;
 };
 
 State& Physical() {
@@ -69,7 +70,7 @@ State& Physical() {
 
 const PageRun* FindRun(const State& state, std::uintptr_t frame) {
     for (const PageRun& run : state.runs) {
-        if (frame >= run.firstFrame && frame - run.firstFrame < run.count) return &run;
+        if (frame >= run.firstFrame && (frame - run.firstFrame) % kFramesPerPage == 0 && (frame - run.firstFrame) / kFramesPerPage < run.count) return &run;
     }
     return nullptr;
 }
@@ -107,7 +108,7 @@ bool UnmapSlot(Window& window, std::size_t slot) {
 bool MapSlot(Window& window, std::size_t slot, const PageRun& run, std::uintptr_t frame) {
     if (!UnmapSlot(window, slot) || !IsolateSlot(window, slot)) return false;
     void* const address = reinterpret_cast<void*>(window.base + slot * kPhysicalPageSize);
-    const ULONG64 offset = static_cast<ULONG64>(frame - run.firstFrame) * kPhysicalPageSize;
+    const ULONG64 offset = static_cast<ULONG64>((frame - run.firstFrame) / kFramesPerPage) * kPhysicalPageSize;
     void* const view = Placeholders().mapViewOfFile3(run.section, GetCurrentProcess(), address, offset, kPhysicalPageSize, kReplacePlaceholder, window.viewProtection, nullptr, 0);
     if (view != address) {
         AbxTrace("mapping physical page frame %zu at %p failed with %lu", static_cast<std::size_t>(frame), address, GetLastError());
@@ -205,10 +206,10 @@ ABX_API BOOL XMemAllocatePhysicalPages(std::uint64_t attributes, std::uintptr_t*
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
             return FALSE;
         }
-        state.nextFrame += count;
+        state.nextFrame += count * abx::xmem::kFramesPerPage;
     }
     for (std::uintptr_t index = 0; index < count; ++index) {
-        pageArray[index] = first + index;
+        pageArray[index] = first + index * abx::xmem::kFramesPerPage;
     }
     AbxTrace("XMemAllocatePhysicalPages(0x%llx, %zu pages of 64 KiB) -> frames %zu..%zu", static_cast<unsigned long long>(attributes), static_cast<std::size_t>(count),
              static_cast<std::size_t>(first), static_cast<std::size_t>(first + count - 1));
@@ -244,4 +245,35 @@ ABX_API void* XMemMapPhysicalPages(void* address, std::size_t pageCount, const s
     }
     AbxTrace("XMemMapPhysicalPages(%p, %zu, %s)", address, pageCount, pageArray == nullptr ? "unmap" : "map");
     return address;
+}
+
+ABX_API BOOL XMemMapPhysicalPagesScatter(void* const* addresses, std::size_t count, const std::uintptr_t* pageArray) {
+    if (addresses == nullptr || pageArray == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    auto& state = abx::xmem::Physical();
+    const std::lock_guard guard(state.lock);
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(addresses[index]);
+        if (start % kPhysicalPageSize != 0) {
+            AbxUnsupported(__func__, "a target address that is not 64 KiB aligned");
+        }
+        abx::xmem::Window* const window = abx::xmem::FindWindow(state, start);
+        if (window == nullptr) {
+            AbxUnsupported(__func__, "a target address outside every physical page window");
+        }
+        const std::size_t slot = (start - window->base) / kPhysicalPageSize;
+        if (pageArray[index] == 0) {
+            if (!abx::xmem::UnmapSlot(*window, slot)) return FALSE;
+            continue;
+        }
+        const abx::xmem::PageRun* const run = abx::xmem::FindRun(state, pageArray[index]);
+        if (run == nullptr) {
+            AbxUnsupported(__func__, "a page frame number that XMemAllocatePhysicalPages did not return");
+        }
+        if (!abx::xmem::MapSlot(*window, slot, *run, pageArray[index])) return FALSE;
+    }
+    AbxTrace("XMemMapPhysicalPagesScatter(%zu pages)", count);
+    return TRUE;
 }

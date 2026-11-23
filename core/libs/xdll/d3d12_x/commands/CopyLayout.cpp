@@ -88,6 +88,7 @@ std::optional<CopyBlock> CopyBlockOf(DXGI_FORMAT format) {
         return CopyBlock{1, 1, 2};
     case DXGI_FORMAT_R8_TYPELESS:
     case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_A8_UNORM:
     case DXGI_FORMAT_R8_UINT:
     case DXGI_FORMAT_R8_SNORM:
     case DXGI_FORMAT_R8_SINT:

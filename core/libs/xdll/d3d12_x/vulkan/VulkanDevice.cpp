@@ -17,6 +17,7 @@ struct FeatureChain {
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
 
     FeatureChain() = default;
     FeatureChain(const FeatureChain&) = delete;
@@ -34,6 +35,7 @@ struct FeatureChain {
         if (extensions.count(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) != 0) chain(barycentric);
         if (extensions.count(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) != 0) chain(interlock);
         if (extensions.count(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) != 0) chain(maintenance8);
+        if (extensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) != 0) chain(maintenance5);
         *next = nullptr;
     }
 };
@@ -278,6 +280,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     messengerInfo.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
     messengerInfo.pfnUserCallback = &VulkanDevice::OnMessage;
     messengerInfo.pUserData = this;
+    std::vector<const char*> instanceExtensions;
     if (requirements.validation) {
         const auto enumerateLayers = LoadInstanceFunction<PFN_vkEnumerateInstanceLayerProperties>(loader, VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties");
         std::uint32_t layerCount = 0;
@@ -296,10 +299,15 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         }
         instanceInfo.enabledLayerCount = 1;
         instanceInfo.ppEnabledLayerNames = &validationLayer;
-        instanceInfo.enabledExtensionCount = 1;
-        instanceInfo.ppEnabledExtensionNames = &debugExtension;
+        instanceExtensions.push_back(debugExtension);
         instanceInfo.pNext = &messengerInfo;
     }
+    if (requirements.presentation) {
+        instanceExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        instanceExtensions.push_back("VK_KHR_win32_surface");
+    }
+    instanceInfo.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+    instanceInfo.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
     VkInstance rawInstance = VK_NULL_HANDLE;
     const VkResult instanceResult = createInstance == nullptr ? VK_ERROR_INITIALIZATION_FAILED : createInstance(&instanceInfo, nullptr, &rawInstance);
     if (instanceResult != VK_SUCCESS) {
@@ -451,6 +459,18 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         getProperties2(physical_, &hostProperties);
         hostImportAlignment_ = host.minImportedHostPointerAlignment;
     }
+    if (requirements.presentation) {
+        if (bestExtensions.count(VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
+            error = "the device does not offer " VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+            return false;
+        }
+        useExtensions.insert(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
+    if (bestExtensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) != 0) {
+        enabled.maintenance5.maintenance5 = VK_TRUE;
+        enabled_.emplace_back("maintenance5");
+        useExtensions.insert(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    }
     if (requirements.maintenance8) {
         enabled.maintenance8.maintenance8 = VK_TRUE;
         enabled_.emplace_back("maintenance8");
@@ -480,6 +500,8 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         error = "vkCreateDevice failed with " + std::to_string(static_cast<int>(deviceResult));
         return false;
     }
+    instanceLoader_ = loader;
+    deviceLoader_ = getDeviceProcAddr;
     vk_.destroyDevice = DeviceFunction<PFN_vkDestroyDevice>(getDeviceProcAddr, device_, "vkDestroyDevice");
     vk_.getDeviceQueue = DeviceFunction<PFN_vkGetDeviceQueue>(getDeviceProcAddr, device_, "vkGetDeviceQueue");
     vk_.createShaderModule = DeviceFunction<PFN_vkCreateShaderModule>(getDeviceProcAddr, device_, "vkCreateShaderModule");

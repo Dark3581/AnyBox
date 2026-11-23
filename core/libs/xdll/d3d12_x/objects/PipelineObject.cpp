@@ -76,6 +76,29 @@ HRESULT PipelineStateObject::CreateCompute(const PipelineContext& context, IUnkn
     return Finish(new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_COMPUTE, entry.pipeline, entry.origin, signature), riid, state, error);
 }
 
+HRESULT PipelineStateObject::CreateMesh(const PipelineContext& context, IUnknown* parent, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE& mesh,
+                                        const D3D12_SHADER_BYTECODE& amplification, REFIID riid, void** state, std::string& error) {
+    if (state == nullptr) {
+        error = "no output for the pipeline state";
+        return E_POINTER;
+    }
+    *state = nullptr;
+    RootSignature* signature = SignatureOf(desc.pRootSignature, error);
+    if (signature == nullptr) {
+        return E_INVALIDARG;
+    }
+    const std::optional<GraphicsRequest> request = MeshPipelineRequest(desc, mesh, amplification, context.store, error);
+    if (!request) {
+        return E_INVALIDARG;
+    }
+    const PipelineEntry entry = context.library.Graphics(*request);
+    const HRESULT built = FromEntry(entry, error);
+    if (FAILED(built)) {
+        return built;
+    }
+    return Finish(new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_GRAPHICS, entry.pipeline, entry.origin, signature), riid, state, error);
+}
+
 HRESULT PipelineStateObject::CreateUnbuilt(IUnknown* parent, VkPipelineBindPoint point, ID3D12RootSignature* signature, std::string reason, REFIID riid, void** state,
                                            std::string& error) {
     if (state == nullptr) {

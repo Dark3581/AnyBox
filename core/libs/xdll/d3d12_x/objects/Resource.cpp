@@ -91,8 +91,8 @@ HRESULT Resource::CreateAtTitleAddress(const ResourceContext& context, IUnknown*
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         AbxUnsupported("ID3D12Device (resource at a title address)", "a texture at a title address: its tiling and Vulkan image are not mapped yet");
     }
-    if (address == 0 || address % kBufferPlacementAlignment != 0) {
-        error = "a title address of " + std::to_string(address) + " is null or not 64 KiB aligned";
+    if (address == 0) {
+        error = "a null title address";
         return E_INVALIDARG;
     }
     MEMORY_BASIC_INFORMATION region{};
@@ -286,7 +286,8 @@ void STDMETHODCALLTYPE Resource::Unmap(UINT subresource, const D3D12_RANGE*) {
 
 D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE Resource::GetGPUVirtualAddress() {
     if (titleAddress_ != 0) return titleAddress_;
-    return IsBuffer() ? context_.window.Start() + offset_ : 0;
+    if (!IsBuffer()) return textureAddress_;
+    return context_.window.Start() + offset_;
 }
 
 HRESULT STDMETHODCALLTYPE Resource::WriteToSubresource(UINT, const D3D12_BOX*, const void*, UINT, UINT) {

@@ -29,6 +29,13 @@ if(NOT ANYBOX_RELINKER_ONLY)
         message(FATAL_ERROR "3rdparty/Vulkan-Headers is missing: run git submodule update --init")
     endif()
     add_subdirectory(3rdparty/Vulkan-Headers EXCLUDE_FROM_ALL)
+    if(NOT EXISTS ${CMAKE_SOURCE_DIR}/3rdparty/zlib/inflate.c)
+        message(FATAL_ERROR "3rdparty/zlib is missing: run git submodule update --init")
+    endif()
+    add_library(abx_zlib STATIC
+        3rdparty/zlib/adler32.c 3rdparty/zlib/crc32.c 3rdparty/zlib/inffast.c 3rdparty/zlib/inflate.c 3rdparty/zlib/inftrees.c 3rdparty/zlib/zutil.c)
+    target_include_directories(abx_zlib PUBLIC ${CMAKE_SOURCE_DIR}/3rdparty/zlib)
+    set_target_properties(abx_zlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_subdirectory(core/libs)
 endif()
 

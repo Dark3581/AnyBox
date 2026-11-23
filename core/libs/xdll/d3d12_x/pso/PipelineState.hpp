@@ -13,5 +13,7 @@ namespace abx::d3d12x {
 
 std::optional<PipelineSource> ComputePipelineSource(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, const ShaderStore& store, std::string& error);
 std::optional<GraphicsRequest> GraphicsPipelineRequest(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const ShaderStore& store, std::string& error);
+std::optional<GraphicsRequest> MeshPipelineRequest(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE& mesh, const D3D12_SHADER_BYTECODE& amplification,
+                                                   const ShaderStore& store, std::string& error);
 
 }

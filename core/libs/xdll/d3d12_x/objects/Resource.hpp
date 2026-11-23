@@ -61,6 +61,7 @@ public:
     std::uint64_t TitleAddress() const { return titleAddress_; }
     std::uint64_t Width() const { return desc_.Width; }
     void AttachTitleMemory(void* memory, std::uint64_t attributes);
+    void RememberTitleAddress(std::uint64_t address) { textureAddress_ = address; }
     const TextureRef& Texture() const { return texture_; }
     UINT Maps() const { return maps_; }
     VkImageView View(const VkImageViewCreateInfo& info, std::string& error);
@@ -83,6 +84,7 @@ private:
     D3D12_RESOURCE_DESC desc_;
     std::uint64_t offset_ = 0;
     std::uint64_t titleAddress_ = 0;
+    std::uint64_t textureAddress_ = 0;
     void* titleMemory_ = nullptr;
     std::uint64_t titleMemoryAttributes_ = 0;
     bool allocated_ = false;
