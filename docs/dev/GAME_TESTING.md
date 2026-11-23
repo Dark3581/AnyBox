@@ -90,6 +90,16 @@ analyzeHeadless <project dir> anybox -import <package>\Bink2Scarlett.dll -script
 
 The output names each call site, its function and the argument setup, for example `RDX <- MOV EDX,0x5e50000` for the attributes passed to `XMemAlloc`. Use it to find which inputs a title exercises and to check a signature against real callers. Values seen in one title describe that title only: implement the function for every input, and put the call sites in the pull request, not in the repository.
 
+## GDK runtime method tables
+
+GDK modules do not import the runtime's functions: they load `xgameruntime.dll` at run time and call method tables that `QueryApiImpl` returns, so the run report names an interface and slot instead of a function. [`tools/api_impl_scan.py`](../../tools/api_impl_scan.py) lists, for one executable or DLL, every thunk the module contains (the GUID pair it passes to `QueryApiImpl` and the method slot it calls), and for the thunks the module's own code calls, how many call sites they have and which argument registers and stack slots each passes:
+
+```
+python tools/api_impl_scan.py <package>\game.exe --json game-apis.json
+```
+
+It needs GNU `objdump` on `PATH` (MinGW's works) or given with `--objdump`. A slot is only mapped in `ApiImpl.cpp` when call sites show what it is: argument shape, how the result is used, and an open-source caller or documented order that names it. Unmapped slots stop and name themselves, so a run and this listing together say which slot to measure next.
+
 ## Shader formats
 
 The D3D12.X design ([#4](https://github.com/dark3581/AnyBox/issues/4)) depends on what console shaders contain. [`tools/shader_scan.py`](../../tools/shader_scan.py) finds every DXBC container in a package, loose or embedded in another file, and counts them by kind (`dxil`, `dxbc`, `mixed`, `rootsig`, `other`) and by part tag:
