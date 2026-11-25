@@ -26,6 +26,7 @@ constexpr VkDeviceSize kPoolBlockBytes = 64ull << 20;
 constexpr VkDeviceSize kPooledLimit = 1ull << 20;
 
 struct PoolBlock {
+    const VulkanDevice* device = nullptr;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::uint32_t type = 0;
     std::map<VkDeviceSize, VkDeviceSize> free;
@@ -70,6 +71,7 @@ bool PoolAllocate(const VulkanDevice& device, std::uint32_t type, VkDeviceSize s
     allocate.allocationSize = kPoolBlockBytes;
     allocate.memoryTypeIndex = type;
     if (device.Vk().allocateMemory(device.Handle(), &allocate, nullptr, &block->memory) != VK_SUCCESS) return false;
+    block->device = &device;
     block->type = type;
     block->free[0] = kPoolBlockBytes;
     Stats().poolBlockBytes += kPoolBlockBytes;
@@ -104,6 +106,20 @@ void PoolFree(void* handle, VkDeviceSize offset, VkDeviceSize size) {
         free.erase(next);
     }
     free[start] = length;
+    PoolBlock* const emptied = static_cast<PoolBlock*>(handle);
+    if (start != 0 || length != kPoolBlockBytes) return;
+    const bool another = std::any_of(pool.blocks.begin(), pool.blocks.end(), [emptied](const std::unique_ptr<PoolBlock>& block) {
+        return block.get() != emptied && block->type == emptied->type && block->free.size() == 1 && block->free.begin()->second == kPoolBlockBytes;
+    });
+    if (!another) return;
+    emptied->device->Vk().freeMemory(emptied->device->Handle(), emptied->memory, nullptr);
+    Stats().poolBlockBytes -= kPoolBlockBytes;
+    pool.blocks.erase(std::find_if(pool.blocks.begin(), pool.blocks.end(), [emptied](const std::unique_ptr<PoolBlock>& block) { return block.get() == emptied; }));
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "an empty small-texture pool block is returned to the driver when another empty block of its memory type is kept (%llu MiB each)",
+               static_cast<unsigned long long>(kPoolBlockBytes >> 20));
+    }
 }
 
 }
