@@ -1,10 +1,14 @@
 #pragma once
 
 #include "DescriptorHeap.hpp"
+#include "ImageDescriptor.hpp"
+#include "SamplerDescriptor.hpp"
 #include "Resource.hpp"
 #include "ViewDesc.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -15,6 +19,8 @@ namespace abx::d3d12x {
 
 class DescriptorWriter {
 public:
+    static std::string DescribeImageWords(const std::uint32_t* words);
+    static void ForgetResource(const Resource* resource);
     explicit DescriptorWriter(const ResourceContext& context) : context_(context) {}
     ~DescriptorWriter();
     DescriptorWriter(const DescriptorWriter&) = delete;
@@ -22,6 +28,8 @@ public:
 
     void CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination);
     void CreateShaderResourceView(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination);
+    void CreateShaderResourceViewAt(std::uint64_t address, std::uint64_t bytes, const D3D12_SHADER_RESOURCE_VIEW_DESC& desc, D3D12_CPU_DESCRIPTOR_HANDLE destination);
+    void CreateUnorderedAccessViewAt(std::uint64_t address, std::uint64_t bytes, const D3D12_UNORDERED_ACCESS_VIEW_DESC& desc, D3D12_CPU_DESCRIPTOR_HANDLE destination);
     void CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination);
     void CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination);
     void CreateDepthStencilView(ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination);
@@ -42,9 +50,25 @@ private:
     static void WriteWords(const Target& target, const void* words, std::size_t bytes);
     static void RequireImageWords(const Target& target, HeapEntry kind, const char* function);
     void WriteImageView(Resource* resource, const std::optional<ImageView>& view, bool unorderedAccess, const Target& target, const char* function, std::string& error);
+    ImageDescriptorWords BindImage(Resource* resource, const VkImageViewCreateInfo& info, VkImageView view, bool unorderedAccess, const char* function);
     VkSampler SamplerFor(const D3D12_SAMPLER_DESC& desc, std::string& error);
 
     ResourceContext context_;
+    struct BoundImage {
+        ImageDescriptorWords words{};
+        Resource* resource = nullptr;
+        std::uint32_t binding = 0;
+        std::uint32_t slot = 0;
+        bool hasSlot = false;
+    };
+    std::map<std::uint32_t, std::vector<std::uint32_t>> freeImageSlots_;
+    std::uint64_t recycledImageSlots_ = 0;
+    std::mutex imageLock_;
+    std::map<VkImageView, BoundImage> images_;
+    std::map<std::uint32_t, std::uint32_t> nextImageSlot_;
+    std::uint64_t nextImageBase_ = 1;
+    std::map<VkSampler, SamplerDescriptorWords> boundSamplers_;
+    std::uint32_t nextSamplerSlot_ = 1;
     mutable std::mutex samplerLock_;
     std::vector<std::pair<D3D12_SAMPLER_DESC, VkSampler>> samplers_;
 };

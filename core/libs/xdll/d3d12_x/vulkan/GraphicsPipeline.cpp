@@ -44,6 +44,7 @@ std::string GraphicsStateKey(const GraphicsPipelineState& state, const VertexInp
     add(state.cullMode);
     add(state.frontFace);
     add(state.depthClamp);
+    add(state.conservative);
     add(state.depthBias);
     addFloat(state.depthBiasConstant);
     addFloat(state.depthBiasClamp);
@@ -107,6 +108,7 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
     std::vector<VkPipelineShaderStageCreateInfo> stageInfos(stages.size());
     std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> subgroups(stages.size());
     bool hasVertex = false;
+    bool hasMesh = false;
     for (std::size_t index = 0; index < stages.size(); ++index) {
         VkPipelineShaderStageCreateInfo& info = stageInfos[index];
         info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -114,14 +116,15 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
         info.module = stages[index].module;
         info.pName = "main";
         hasVertex = hasVertex || stages[index].stage == VK_SHADER_STAGE_VERTEX_BIT;
+        hasMesh = hasMesh || stages[index].stage == VK_SHADER_STAGE_MESH_BIT_EXT;
         if (stages[index].subgroupSize != 0 && device.CanRequireSubgroupSize(stages[index].subgroupSize, stages[index].stage)) {
             subgroups[index].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
             subgroups[index].requiredSubgroupSize = stages[index].subgroupSize;
             info.pNext = &subgroups[index];
         }
     }
-    if (!hasVertex) {
-        error = "the pipeline has no vertex shader";
+    if (hasVertex == hasMesh) {
+        error = hasVertex ? "the pipeline has both a vertex and a mesh shader" : "the pipeline has no vertex or mesh shader";
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -142,6 +145,9 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
     rasterization.depthBiasClamp = state.depthBiasClamp;
     rasterization.depthBiasSlopeFactor = state.depthBiasSlope;
     rasterization.lineWidth = 1.0f;
+    VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
+    conservative.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
+    if (state.conservative && device.ConservativeRasterization()) rasterization.pNext = &conservative;
     const VkSampleMask sampleMask = state.sampleMask;
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = state.samples;
@@ -161,8 +167,14 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
     colorBlend.attachmentCount = static_cast<std::uint32_t>(state.blend.size());
     colorBlend.pAttachments = state.blend.empty() ? nullptr : state.blend.data();
     std::vector<VkDynamicState> dynamicStates = GraphicsDynamicStates();
-    if (input.bindings.empty()) {
+    if (device.RectangleFill()) dynamicStates.push_back(VK_DYNAMIC_STATE_POLYGON_MODE_EXT);
+    if (input.bindings.empty() || hasMesh) {
         dynamicStates.erase(std::remove(dynamicStates.begin(), dynamicStates.end(), VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE), dynamicStates.end());
+    }
+    if (hasMesh) {
+        for (const VkDynamicState vertexOnly : {VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE}) {
+            dynamicStates.erase(std::remove(dynamicStates.begin(), dynamicStates.end(), vertexOnly), dynamicStates.end());
+        }
     }
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
@@ -176,8 +188,8 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
     info.flags = flags;
     info.stageCount = static_cast<std::uint32_t>(stageInfos.size());
     info.pStages = stageInfos.data();
-    info.pVertexInputState = &vertexInput;
-    info.pInputAssemblyState = &inputAssembly;
+    info.pVertexInputState = hasMesh ? nullptr : &vertexInput;
+    info.pInputAssemblyState = hasMesh ? nullptr : &inputAssembly;
     info.pViewportState = &viewport;
     info.pRasterizationState = &rasterization;
     info.pMultisampleState = &multisample;

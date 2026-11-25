@@ -1,5 +1,6 @@
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,13 @@ struct RegistrationToken {
     std::uint64_t token;
 };
 
+struct StorageSpace {
+    std::uint64_t availableFreeBytes;
+    std::uint64_t totalFreeBytes;
+    std::uint64_t usedBytes;
+    std::uint64_t totalBytes;
+};
+
 extern "C" {
 __declspec(dllimport) HRESULT XAsyncBegin(AsyncBlock* async, void* context, const void* identity, const char* identityName, AsyncProvider provider);
 __declspec(dllimport) HRESULT XAsyncSchedule(AsyncBlock* async, std::uint32_t delayMs);
@@ -75,7 +83,7 @@ __declspec(dllimport) HRESULT XTaskQueueRegisterMonitor(void* queue, void* conte
 __declspec(dllimport) void XTaskQueueUnregisterMonitor(void* queue, RegistrationToken token);
 __declspec(dllimport) HRESULT XTaskQueueRegisterWaiter(void* queue, std::uint32_t port, HANDLE waitHandle, void* context, void (*callback)(void*, bool), RegistrationToken* token);
 __declspec(dllimport) void XTaskQueueUnregisterWaiter(void* queue, RegistrationToken token);
-__declspec(dllimport) HRESULT XUserAddAsync();
+__declspec(dllimport) HRESULT XUserGetState();
 __declspec(dllimport) std::uint32_t XSystemGetDeviceType();
 __declspec(dllimport) bool XPackageIsPackagedProcess();
 __declspec(dllimport) HRESULT XGameRuntimeInitializeWithOptions(const void* options);
@@ -84,6 +92,11 @@ __declspec(dllimport) HRESULT XPackageGetCurrentProcessPackageIdentifier(std::si
 __declspec(dllimport) HRESULT XThreadSetTimeSensitive(bool isTimeSensitiveThread);
 __declspec(dllimport) bool XThreadIsTimeSensitive();
 __declspec(dllimport) void XThreadAssertNotTimeSensitive();
+__declspec(dllimport) HRESULT XPersistentLocalStorageGetPath(std::size_t pathSize, char* path, std::size_t* pathUsed);
+__declspec(dllimport) HRESULT XPersistentLocalStorageGetPathSize(std::size_t* pathSize);
+__declspec(dllimport) HRESULT XPersistentLocalStorageGetSpaceInfo(struct StorageSpace* info);
+__declspec(dllimport) HRESULT XPersistentLocalStoragePromptUserForSpaceAsync(std::uint64_t requestedBytes, AsyncBlock* async);
+__declspec(dllimport) HRESULT XPersistentLocalStoragePromptUserForSpaceResult(AsyncBlock* async);
 __declspec(dllimport) HRESULT XGameSaveInitializeProvider(void* user, const char* configurationId, bool syncOnDemand, void** provider);
 __declspec(dllimport) HRESULT XGameSaveInitializeProviderAsync(void* user, const char* configurationId, bool syncOnDemand, AsyncBlock* async);
 __declspec(dllimport) HRESULT XGameSaveInitializeProviderResult(AsyncBlock* async, void** provider);
@@ -1545,6 +1558,51 @@ int GameSaveEmptyFolder() {
     return 0;
 }
 
+int PersistentLocalStorage() {
+    constexpr HRESULT InsufficientBuffer = static_cast<HRESULT>(0x8007007Au);
+    std::uint32_t titleId = 0;
+    if (FAILED(XGameGetXboxTitleId(&titleId))) return Fail("XGameGetXboxTitleId");
+    wchar_t local[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return Fail("LOCALAPPDATA");
+    char utf8[MAX_PATH * 3] = {};
+    if (WideCharToMultiByte(CP_UTF8, 0, local, -1, utf8, sizeof(utf8), nullptr, nullptr) == 0) return Fail("LOCALAPPDATA as UTF-8");
+    char expected[MAX_PATH * 3 + 64] = {};
+    std::snprintf(expected, sizeof(expected), "%s\\AnyBox\\%08X\\PersistentLocalStorage\\", utf8, titleId);
+
+    std::size_t size = 0;
+    if (XPersistentLocalStorageGetPathSize(&size) != S_OK || size != std::strlen(expected) + 1) return Fail("path size");
+    std::vector<char> path(size + 8, '#');
+    std::size_t used = 12345;
+    if (XPersistentLocalStorageGetPath(size - 1, path.data(), &used) != InsufficientBuffer || used != 12345 || path[0] != '#') return Fail("path into a small buffer");
+    if (XPersistentLocalStorageGetPath(0, nullptr, &used) != InsufficientBuffer || used != 12345) return Fail("path into no buffer");
+    if (XPersistentLocalStorageGetPath(size, path.data(), &used) != S_OK || used != size || std::strcmp(path.data(), expected) != 0) return Fail("path");
+    std::fill(path.begin(), path.end(), '#');
+    if (XPersistentLocalStorageGetPath(path.size(), path.data(), nullptr) != S_OK || std::strcmp(path.data(), expected) != 0) return Fail("path without pathUsed");
+
+    const std::string root = path.data();
+    const DWORD attributes = GetFileAttributesA(root.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return Fail("path is a folder");
+    const bool present = GetFileAttributesA((root + "cache.bin").c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!WriteBytes(root + "cache.bin", 4096)) return Fail("write into the storage folder");
+    std::int64_t quota = 0;
+    if (XGameSaveFilesGetRemainingQuota(reinterpret_cast<void*>(1), Scid, &quota) != S_OK || quota != SaveQuota) return Fail("save quota after a storage write");
+
+    const std::string grown = root + "sub\\grown.bin";
+    DeleteFileA(grown.c_str());
+    if (!CreateDirectoryA((root + "sub").c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return Fail("create a storage subfolder");
+    StorageSpace before{};
+    if (XPersistentLocalStorageGetSpaceInfo(&before) != S_OK) return Fail("space info");
+    if (!WriteBytes(grown, 1234)) return Fail("write a second file");
+    StorageSpace space{};
+    if (XPersistentLocalStorageGetSpaceInfo(&space) != S_OK) return Fail("space info after a write");
+    if (space.usedBytes != before.usedBytes + 1234) return Fail("used bytes after a write");
+    if (space.totalFreeBytes != space.availableFreeBytes || space.usedBytes + space.availableFreeBytes != space.totalBytes) return Fail("space info sums");
+    std::printf("pls path %s cache %s used %llu total %llu free %llu\n", root.c_str(), present ? "present" : "absent", static_cast<unsigned long long>(space.usedBytes), static_cast<unsigned long long>(space.totalBytes), static_cast<unsigned long long>(space.availableFreeBytes));
+    std::printf("pls ok\n");
+    return 0;
+}
+
 }
 
 int DynamicLoad() {
@@ -1666,7 +1724,7 @@ int ApiUnmapped() {
 int main(int argc, char** argv) {
     const char* scenario = argc > 1 ? argv[1] : "taskqueue";
     if (std::strcmp(scenario, "stub") == 0) {
-        XUserAddAsync();
+        XUserGetState();
         return Fail("stub returned");
     }
     if (std::strcmp(scenario, "device") == 0) {
@@ -1743,6 +1801,19 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(scenario, "gamesave_empty_folder") == 0) {
         return GameSaveEmptyFolder();
+    }
+    if (std::strcmp(scenario, "pls") == 0) {
+        return PersistentLocalStorage();
+    }
+    if (std::strcmp(scenario, "pls_prompt") == 0) {
+        AsyncBlock block{};
+        XPersistentLocalStoragePromptUserForSpaceAsync(1, &block);
+        return Fail("prompt for space returned");
+    }
+    if (std::strcmp(scenario, "pls_prompt_result") == 0) {
+        AsyncBlock block{};
+        XPersistentLocalStoragePromptUserForSpaceResult(&block);
+        return Fail("prompt for space result returned");
     }
     if (std::strcmp(scenario, "async_null") == 0) {
         XAsyncGetStatus(nullptr, false);

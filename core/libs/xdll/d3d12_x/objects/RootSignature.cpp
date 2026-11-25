@@ -19,6 +19,7 @@ HRESULT RootSignature::Create(IUnknown* parent, const void* blob, SIZE_T bytes, 
     if (!layout) {
         return E_INVALIDARG;
     }
+    layout->heapIndexing = HeapIndexingOf(blob, bytes);
     RootSignature* created = new RootSignature(parent, std::move(*layout));
     const HRESULT result = created->QueryInterface(riid, signature);
     created->Release();

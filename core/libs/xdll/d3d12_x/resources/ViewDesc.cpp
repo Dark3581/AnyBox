@@ -1,5 +1,6 @@
 #include "ViewDesc.hpp"
 
+#include "CopyLayout.hpp"
 #include "GraphicsState.hpp"
 
 #include <algorithm>
@@ -68,16 +69,19 @@ std::optional<ViewFormat> ResolveFormat(const ViewTarget& target, DXGI_FORMAT re
         case DXGI_FORMAT_D32_FLOAT:
         case DXGI_FORMAT_D24_UNORM_S8_UINT:
         case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case kConsoleD16UnormS8Uint:
             view.aspect = depthView ? image.format.aspects : static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT);
             break;
         case DXGI_FORMAT_R16_UNORM:
         case DXGI_FORMAT_R32_FLOAT:
         case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
         case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case kConsoleR16UnormX8Typeless:
             view.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
             break;
         case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
         case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        case kConsoleX16TypelessG8Uint:
             view.aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
             break;
         default:
@@ -89,7 +93,7 @@ std::optional<ViewFormat> ResolveFormat(const ViewTarget& target, DXGI_FORMAT re
             return std::nullopt;
         }
         if (depthView && (format == DXGI_FORMAT_R16_UNORM || format == DXGI_FORMAT_R32_FLOAT || view.aspect == VK_IMAGE_ASPECT_STENCIL_BIT ||
-                          format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)) {
+                          format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS || format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || format == kConsoleR16UnormX8Typeless)) {
             error = "depth-stencil view format " + std::to_string(static_cast<int>(format)) + " is not a depth format";
             return std::nullopt;
         }
@@ -108,7 +112,13 @@ std::optional<ViewFormat> ResolveFormat(const ViewTarget& target, DXGI_FORMAT re
         error = "view format " + std::to_string(static_cast<int>(format)) + " is a depth format for a color texture";
         return std::nullopt;
     }
-    if (format != target.resource.Format && Family(format) != Family(target.resource.Format)) {
+    const auto sameTexel = [&] {
+        const std::optional<CopyBlock> view = CopyBlockOf(format);
+        const std::optional<CopyBlock> texture = CopyBlockOf(target.resource.Format);
+        return view && texture && view->width == 1 && view->height == 1 && texture->width == 1 && texture->height == 1 && view->bytes == texture->bytes &&
+               image.format.mutableFormat;
+    };
+    if (format != target.resource.Format && Family(format) != Family(target.resource.Format) && !sameTexel()) {
         error = "view format " + std::to_string(static_cast<int>(format)) + " is not in the format family of the texture's " + std::to_string(static_cast<int>(target.resource.Format));
         return std::nullopt;
     }
@@ -124,8 +134,8 @@ bool Range(UINT first, UINT count, UINT total, std::uint32_t& outCount) {
         return false;
     }
     const UINT available = total - first;
-    outCount = count == kAll ? available : count;
-    return outCount != 0 && outCount <= available;
+    outCount = (count == kAll || count == 0) ? available : (std::min)(count, available);
+    return true;
 }
 
 bool SetMips(VkImageViewCreateInfo& info, const TextureImage& image, UINT first, UINT count, std::string& error) {
@@ -336,12 +346,20 @@ std::optional<ImageView> ShaderResourceView(const D3D12_RESOURCE_DESC& resource,
 }
 
 std::optional<ImageView> UnorderedAccessView(const D3D12_RESOURCE_DESC& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* view, std::string& error) {
-    const std::optional<ViewTarget> target = Target(resource, error);
-    if (!target) {
+    const std::optional<TextureImage> image = TranslateTextureDesc(resource, error);
+    if (!image) {
         return std::nullopt;
     }
+    return UnorderedAccessView(*image, resource, view, error);
+}
+
+std::optional<ImageView> UnorderedAccessView(const TextureImage& image, const D3D12_RESOURCE_DESC& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* view, std::string& error) {
+    const std::optional<ViewTarget> target = ViewTarget{image, resource};
     if ((target->image.info.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
-        error = "an unordered access view of a texture without ALLOW_UNORDERED_ACCESS";
+        error = target->image.depthUnorderedAccess
+                    ? "an unordered access view of a depth texture, but the device offers no storage images of Vulkan depth format " +
+                          std::to_string(static_cast<int>(target->image.info.format))
+                    : "an unordered access view of a texture without ALLOW_UNORDERED_ACCESS";
         return std::nullopt;
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
@@ -407,6 +425,10 @@ std::optional<ImageView> UnorderedAccessView(const D3D12_RESOURCE_DESC& resource
 std::optional<ImageView> RenderTargetView(const D3D12_RESOURCE_DESC& resource, const D3D12_RENDER_TARGET_VIEW_DESC* view, std::string& error) {
     const std::optional<ViewTarget> target = Target(resource, error);
     if (!target) {
+        return std::nullopt;
+    }
+    if (target->image.depthRenderTarget) {
+        error = "a render target view of a depth texture; Vulkan depth formats cannot be color attachments";
         return std::nullopt;
     }
     if ((target->image.info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0) {

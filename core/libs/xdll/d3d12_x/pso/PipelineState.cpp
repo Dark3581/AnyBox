@@ -115,4 +115,48 @@ std::optional<GraphicsRequest> GraphicsPipelineRequest(const D3D12_GRAPHICS_PIPE
     return request;
 }
 
+std::optional<GraphicsRequest> MeshPipelineRequest(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE& mesh, const D3D12_SHADER_BYTECODE& amplification,
+                                                   const ShaderStore& store, std::string& error) {
+    if (mesh.pShaderBytecode == nullptr || mesh.BytecodeLength == 0) {
+        error = "the description has no mesh shader";
+        return std::nullopt;
+    }
+    if (amplification.pShaderBytecode != nullptr && amplification.BytecodeLength != 0) {
+        error = "amplification shaders are not in the shader store";
+        return std::nullopt;
+    }
+    if (desc.VS.pShaderBytecode != nullptr || desc.GS.pShaderBytecode != nullptr || desc.HS.pShaderBytecode != nullptr || desc.DS.pShaderBytecode != nullptr) {
+        error = "a mesh pipeline with vertex, geometry or tessellation shaders";
+        return std::nullopt;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC states = desc;
+    states.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    states.InputLayout = {};
+    std::optional<GraphicsPipelineState> state = TranslateGraphicsState(states, error);
+    if (!state) {
+        return std::nullopt;
+    }
+    state->features.insert("meshShader");
+    GraphicsRequest request;
+    const ShaderModule* meshModule = FindStage(mesh, store, "ms", "mesh shader", error);
+    if (meshModule == nullptr) {
+        return std::nullopt;
+    }
+    request.shaders.push_back({VK_SHADER_STAGE_MESH_BIT_EXT, meshModule->key, std::filesystem::path(meshModule->path), meshModule->subgroupSize});
+    if (desc.PS.pShaderBytecode != nullptr && desc.PS.BytecodeLength != 0) {
+        const ShaderModule* pixel = FindStage(desc.PS, store, "ps", "pixel shader", error);
+        if (pixel == nullptr) {
+            return std::nullopt;
+        }
+        request.shaders.push_back({VK_SHADER_STAGE_FRAGMENT_BIT, pixel->key, std::filesystem::path(pixel->path), pixel->subgroupSize});
+    }
+    request.state = std::move(*state);
+    request.key = "mesh:";
+    for (const GraphicsShaderSource& shader : request.shaders) {
+        request.key += shader.key + ":";
+    }
+    request.key += GraphicsStateKey(request.state, request.input);
+    return request;
+}
+
 }

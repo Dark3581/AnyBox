@@ -7,7 +7,7 @@ target_link_libraries(fake_title PRIVATE fake_xgameruntime)
 anybox_static_runtime(fake_title)
 
 if(Python3_FOUND)
-    foreach(scenario IN ITEMS taskqueue taskqueue_composite taskqueue_monitor taskqueue_monitor_reentry taskqueue_waiter taskqueue_terminate_reentry stub stub_debugger crash crash_chained crash_recovered device_scarlett device_durango device_pc device_default device_none device_noexecutable device_unknown console_id sandbox_id async dynamic_load api_impl api_threading api_unmapped gamesave gamesavefiles gamesavefiles_mismatch gamesavefiles_containers gamesave_folders gamesave_folders_async gamesave_empty_folder async_null async_terminated async_begin_terminated startup startup_options thread_assert)
+    foreach(scenario IN ITEMS taskqueue taskqueue_composite taskqueue_monitor taskqueue_monitor_reentry taskqueue_waiter taskqueue_terminate_reentry stub stub_debugger crash crash_chained crash_recovered device_scarlett device_durango device_pc device_default device_none device_noexecutable device_unknown console_id sandbox_id async dynamic_load api_impl api_threading api_unmapped gamesave gamesavefiles gamesavefiles_mismatch gamesavefiles_containers gamesave_folders gamesave_folders_async gamesave_empty_folder pls pls_prompt pls_prompt_result async_null async_terminated async_begin_terminated startup startup_options thread_assert)
         add_test(NAME e2e_${scenario}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/e2e.py
                 --relinker $<TARGET_FILE:relinker> --title $<TARGET_FILE:fake_title> --libs ${ANYBOX_LIBS_DIR}
@@ -62,6 +62,21 @@ if(Python3_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/shader_store_test.py
             --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR} --tool ${CMAKE_SOURCE_DIR}/tools/shader_store.py --work ${CMAKE_CURRENT_BINARY_DIR}/shader_store)
 endif()
+
+add_executable(gfx10_tiling_test Gfx10TilingTest.cpp)
+target_link_libraries(gfx10_tiling_test PRIVATE gfx10_tiling)
+anybox_static_runtime(gfx10_tiling_test)
+add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
+
+add_executable(gameinput_test GameInputTest.cpp)
+target_link_libraries(gameinput_test PRIVATE gameinput_core)
+anybox_static_runtime(gameinput_test)
+add_test(NAME gameinput COMMAND gameinput_test)
+
+add_executable(xg_layout_test XgLayoutTest.cpp)
+target_link_libraries(xg_layout_test PRIVATE gfx10_tiling)
+anybox_static_runtime(xg_layout_test)
+add_test(NAME xg_layout COMMAND xg_layout_test)
 
 add_executable(pso_probe PsoProbe.cpp)
 target_link_libraries(pso_probe PRIVATE d3d12_x_pso)

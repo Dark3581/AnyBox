@@ -9,7 +9,7 @@
 
 namespace abx::d3d12x {
 
-enum class IndirectKind { Draw, DrawIndexed, Dispatch };
+enum class IndirectKind { Draw, DrawIndexed, Dispatch, DispatchMesh };
 
 struct IndirectSignature {
     IndirectKind kind = IndirectKind::Draw;

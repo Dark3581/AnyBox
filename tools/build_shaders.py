@@ -2,11 +2,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import embedded_shaders
 import shader_store
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -14,6 +16,11 @@ FORMAT = "anybox-shader-build"
 VERSION = 1
 SUMMARY = "build.json"
 TRANSLATOR_ENTRY = "make_game.py"
+TRANSLATOR_TOOLS = "tools"
+UNPACK_TOOL = "fssm_unpack.py"
+DISASSEMBLY_TOOL = "shader_disasm.py"
+TRANSLATION_TOOL = "rdna2spirv.py"
+NATIVE_TARGET = "gfx1013"
 STEPS = ("translate", "store", "pipelines")
 WAVE64_MODES = ("auto", "on", "off")
 
@@ -32,14 +39,25 @@ class BuildError(Exception):
 def layout(out):
     work = out / "work"
     return {"work": work, "carved": work / "shaders" / "dxbc", "translated": work / "shaders" / "spirv", "store": out / "store",
+            "embedded_carved": work / "embedded" / "shaders" / "dxbc", "embedded_translated": work / "embedded" / "shaders" / "spirv",
             "cache": out / "pipeline_cache.bin", "summary": out / SUMMARY, "translate_log": out / "translate.log",
-            "pipelines_logs": out / "pipelines"}
+            "embedded_log": out / "embedded.log", "pipelines_logs": out / "pipelines"}
 
 
 def translator_command(translator, package, paths, jobs, wave64):
     command = [sys.executable, "-I", str(translator / TRANSLATOR_ENTRY), "--game", str(package), "--work", str(paths["work"]),
                "--out", str(paths["work"] / "port"), "--stages", "shaders", "--wave64-emulate", wave64]
     return command + (["--jobs", str(jobs)] if jobs else [])
+
+
+def embedded_commands(translator, paths, jobs, wave64):
+    tools = translator / TRANSLATOR_TOOLS
+    carved, translated = paths["embedded_carved"], paths["embedded_translated"]
+    disassembly = carved / "disasm"
+    jobs_argument = ["--jobs", str(jobs)] if jobs else []
+    return [[sys.executable, "-I", str(tools / UNPACK_TOOL), str(carved)],
+            [sys.executable, "-I", str(tools / DISASSEMBLY_TOOL), str(carved / "fssm"), "--out", str(disassembly), "--mcpu", NATIVE_TARGET, *jobs_argument],
+            [sys.executable, "-I", str(tools / TRANSLATION_TOOL), str(disassembly), "--out", str(translated), "--no-asm", *(["--wave64-emulate"] if wave64 else [])]]
 
 
 def pipeline_command(checker, paths, jobs, start, count, max_bytes=0):
@@ -118,9 +136,9 @@ def pipelines_passed(result):
             and not any(problem["kind"] in ("pipeline_fail", "module_fail", "big_skip") for problem in result["problems"]))
 
 
-def run_logged(command, log, env=None):
+def run_logged(command, log, env=None, append=False):
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "w", encoding="utf-8", newline="\n") as handle:
+    with open(log, "a" if append else "w", encoding="utf-8", newline="\n") as handle:
         handle.write("$ " + subprocess.list2cmdline([str(part) for part in command]) + "\n")
         with subprocess.Popen([str(part) for part in command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               encoding="utf-8", errors="replace", env=env) as process:
@@ -163,13 +181,45 @@ def count_shaders(paths):
             "wave64_emulate": mode.read_text(encoding="utf-8").strip() if mode.is_file() else None}
 
 
+def translate_embedded(package, translator, paths, jobs):
+    for folder in (paths["embedded_carved"], paths["embedded_translated"]):
+        if folder.exists():
+            shutil.rmtree(folder)
+    index = embedded_shaders.carve(package, paths["embedded_carved"])
+    paths["embedded_log"].parent.mkdir(parents=True, exist_ok=True)
+    paths["embedded_log"].write_text("", encoding="utf-8")
+    if not index:
+        return {"carved": 0, "translated": 0, "untranslated": []}
+    for tool in (UNPACK_TOOL, DISASSEMBLY_TOOL, TRANSLATION_TOOL):
+        if not (translator / TRANSLATOR_TOOLS / tool).is_file():
+            raise BuildError(f"{translator} holds no {TRANSLATOR_TOOLS}/{tool} for the {len(index)} shaders embedded in the package's modules")
+    mode = paths["translated"] / "wave64_emulate.txt"
+    wave64 = mode.is_file() and mode.read_text(encoding="utf-8").strip() == "on"
+    for command in embedded_commands(translator, paths, jobs, wave64):
+        code = run_logged(command, paths["embedded_log"], append=True)
+        if code != 0:
+            raise BuildError(f"{Path(command[2]).name} exited with {code} on the embedded shaders; see {paths['embedded_log']}")
+    translation = read_json(paths["embedded_translated"] / "index.json")
+    if not isinstance(translation, dict):
+        raise BuildError("the embedded shader translation left no index.json map")
+    untranslated = sorted(entry["name"] for entry in index if entry["name"] not in translation)
+    return {"carved": len(index), "translated": len(translation), "untranslated": untranslated}
+
+
 def build_store(paths):
     modules, duplicates, problems = shader_store.collect(paths["carved"].resolve(), paths["translated"].resolve())
     if not modules:
         raise BuildError("no shader could be stored")
-    shader_store.write(paths["store"].resolve(), modules, paths["translated"].resolve())
-    return {"modules": len(modules), "duplicates": duplicates, "missing": len(problems["missing"]),
-            "invalid": len(problems["invalid"]), "conflicts": len(problems["conflicts"])}
+    embedded = None
+    if (paths["embedded_carved"] / "index.json").is_file() and (paths["embedded_translated"] / "index.json").is_file():
+        extra, extra_duplicates, extra_problems = shader_store.collect(paths["embedded_carved"].resolve(), paths["embedded_translated"].resolve())
+        modules, shared, conflicts = shader_store.merge(modules, extra)
+        embedded = {"modules": len(extra), "duplicates": extra_duplicates + shared, "untranslated": sorted(extra_problems["missing"]),
+                    "invalid": sorted(extra_problems["invalid"]), "conflicts": len(extra_problems["conflicts"]) + len(conflicts)}
+    shader_store.write(paths["store"].resolve(), modules)
+    result = {"modules": len(modules), "duplicates": duplicates, "missing": len(problems["missing"]),
+              "invalid": len(problems["invalid"]), "conflicts": len(problems["conflicts"])}
+    return {**result, "embedded": embedded} if embedded is not None else result
 
 
 def store_passed(store):
@@ -229,6 +279,11 @@ def main(argv=None):
                 save(paths, summary)
                 raise BuildError(f"the translator exited with {code}; see {paths['translate_log']}")
             summary["translation"] = {"exit_code": 0, **count_shaders(paths)}
+            embedded = translate_embedded(package, translator, paths, args.jobs)
+            summary["translation"]["embedded"] = embedded
+            print(f"build_shaders: {embedded['translated']} of {embedded['carved']} shaders embedded in the package's modules translated", flush=True)
+            for name in embedded["untranslated"]:
+                print(f"build_shaders:   not translated: {name}", flush=True)
             summary.pop("store", None)
             summary.pop("pipelines", None)
             save(paths, summary)
@@ -238,6 +293,10 @@ def main(argv=None):
             store = summary["store"]
             print(f"build_shaders: {store['modules']} modules stored, {store['duplicates']} duplicates, {store['missing']} missing, "
                   f"{store['invalid']} invalid, {store['conflicts']} conflicts", flush=True)
+            if store.get("embedded"):
+                extra = store["embedded"]
+                print(f"build_shaders: {extra['modules']} of them embedded in the package's modules; {len(extra['untranslated'])} embedded shaders have no translation "
+                      f"(their pipelines stay unbuilt), {len(extra['invalid'])} invalid, {extra['conflicts']} conflicts", flush=True)
             if not store_passed(store):
                 raise BuildError("the store is incomplete")
         if "pipelines" in steps:

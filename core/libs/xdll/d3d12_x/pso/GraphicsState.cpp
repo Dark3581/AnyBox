@@ -73,6 +73,7 @@ std::optional<VkFormat> VulkanFormat(DXGI_FORMAT format) {
     case DXGI_FORMAT_R32_UINT: return VK_FORMAT_R32_UINT;
     case DXGI_FORMAT_R32_SINT: return VK_FORMAT_R32_SINT;
     case DXGI_FORMAT_D24_UNORM_S8_UINT: return VK_FORMAT_D24_UNORM_S8_UINT;
+    case kConsoleD16UnormS8Uint: return VK_FORMAT_D32_SFLOAT_S8_UINT;
     case DXGI_FORMAT_R8G8_UNORM: return VK_FORMAT_R8G8_UNORM;
     case DXGI_FORMAT_R8G8_UINT: return VK_FORMAT_R8G8_UINT;
     case DXGI_FORMAT_R8G8_SNORM: return VK_FORMAT_R8G8_SNORM;
@@ -84,6 +85,7 @@ std::optional<VkFormat> VulkanFormat(DXGI_FORMAT format) {
     case DXGI_FORMAT_R16_SNORM: return VK_FORMAT_R16_SNORM;
     case DXGI_FORMAT_R16_SINT: return VK_FORMAT_R16_SINT;
     case DXGI_FORMAT_R8_UNORM: return VK_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_A8_UNORM: return VK_FORMAT_A8_UNORM_KHR;
     case DXGI_FORMAT_R8_UINT: return VK_FORMAT_R8_UINT;
     case DXGI_FORMAT_R8_SNORM: return VK_FORMAT_R8_SNORM;
     case DXGI_FORMAT_R8_SINT: return VK_FORMAT_R8_SINT;
@@ -98,7 +100,7 @@ std::optional<VkFormat> VulkanFormat(DXGI_FORMAT format) {
 }
 
 bool FormatHasStencil(DXGI_FORMAT format) {
-    return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || format == kConsoleD16UnormS8Uint;
 }
 
 std::optional<VkBlendFactor> VulkanBlendFactor(D3D12_BLEND blend) {
@@ -189,7 +191,8 @@ std::optional<VkPrimitiveTopology> VulkanTopologyClass(D3D12_PRIMITIVE_TOPOLOGY_
     switch (type) {
     case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE:
+    case kConsoleRectangleTopologyType: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     default: return std::nullopt;
     }
 }
@@ -272,10 +275,7 @@ std::optional<GraphicsPipelineState> TranslateGraphicsState(const D3D12_GRAPHICS
         error = "a forced sample count is not supported";
         return std::nullopt;
     }
-    if (raster.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF) {
-        error = "conservative rasterization is not supported";
-        return std::nullopt;
-    }
+    state.conservative = raster.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
 
     const std::optional<VkSampleCountFlagBits> samples = VulkanSampleCount(desc.SampleDesc.Count);
     if (!samples) {
@@ -354,7 +354,7 @@ std::optional<GraphicsPipelineState> TranslateGraphicsState(const D3D12_GRAPHICS
     if (desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
         const std::optional<VkFormat> format = VulkanFormat(desc.DSVFormat);
         if (!format || (desc.DSVFormat != DXGI_FORMAT_D16_UNORM && desc.DSVFormat != DXGI_FORMAT_D24_UNORM_S8_UINT && desc.DSVFormat != DXGI_FORMAT_D32_FLOAT &&
-                        desc.DSVFormat != DXGI_FORMAT_D32_FLOAT_S8X24_UINT)) {
+                        desc.DSVFormat != DXGI_FORMAT_D32_FLOAT_S8X24_UINT && desc.DSVFormat != kConsoleD16UnormS8Uint)) {
             error = "depth format " + std::to_string(static_cast<int>(desc.DSVFormat)) + " is not a depth format with a Vulkan mapping";
             return std::nullopt;
         }

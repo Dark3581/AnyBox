@@ -18,6 +18,7 @@ struct GraphicsPipelineState {
     VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT;
     VkFrontFace frontFace = VK_FRONT_FACE_CLOCKWISE;
     bool depthClamp = false;
+    bool conservative = false;
     bool depthBias = false;
     float depthBiasConstant = 0.0f;
     float depthBiasClamp = 0.0f;

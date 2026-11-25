@@ -10,6 +10,11 @@
 
 namespace abx::d3d12x {
 
+constexpr D3D12_PRIMITIVE_TOPOLOGY_TYPE kConsoleRectangleTopologyType = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(19);
+constexpr DXGI_FORMAT kConsoleD16UnormS8Uint = static_cast<DXGI_FORMAT>(118);
+constexpr DXGI_FORMAT kConsoleR16UnormX8Typeless = static_cast<DXGI_FORMAT>(119);
+constexpr DXGI_FORMAT kConsoleX16TypelessG8Uint = static_cast<DXGI_FORMAT>(120);
+
 std::optional<VkFormat> VulkanFormat(DXGI_FORMAT format);
 bool FormatHasStencil(DXGI_FORMAT format);
 std::optional<VkBlendFactor> VulkanBlendFactor(D3D12_BLEND blend);

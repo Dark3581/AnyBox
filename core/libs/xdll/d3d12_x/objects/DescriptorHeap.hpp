@@ -28,6 +28,8 @@ public:
     static HRESULT Create(const ResourceContext& context, IUnknown* parent, const D3D12_DESCRIPTOR_HEAP_DESC& desc, const DescriptorSizes& sizes, REFIID riid, void** heap,
                           std::string& error);
     static DescriptorHeap* Find(SIZE_T cpu, UINT& index);
+    static void ReportForeignDescriptors();
+    static const std::uint8_t* AtGpuAddress(std::uint64_t gpu, UINT& increment);
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
     D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE GetDesc(D3D12_DESCRIPTOR_HEAP_DESC* desc) override {
@@ -49,7 +51,7 @@ public:
 #endif
 
     D3D12_CPU_DESCRIPTOR_HANDLE CpuStart() const { return {reinterpret_cast<SIZE_T>(memory_)}; }
-    D3D12_GPU_DESCRIPTOR_HANDLE GpuStart() const { return {ShaderVisible() ? context_.window.Start() + offset_ : 0}; }
+    D3D12_GPU_DESCRIPTOR_HANDLE GpuStart() const;
     D3D12_DESCRIPTOR_HEAP_TYPE Type() const { return desc_.Type; }
     bool ShaderVisible() const { return (desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0; }
     UINT Count() const { return desc_.NumDescriptors; }
@@ -71,8 +73,10 @@ private:
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
     UINT increment_;
     std::uint8_t* memory_ = nullptr;
+    bool titleMemory_ = false;
     std::unique_ptr<std::uint8_t[]> host_;
     std::uint64_t offset_ = 0;
+    std::uint64_t gpuAlias_ = 0;
     bool allocated_ = false;
     bool registered_ = false;
     std::vector<DescriptorRecord> records_;

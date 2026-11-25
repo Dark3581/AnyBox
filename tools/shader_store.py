@@ -110,13 +110,33 @@ def collect(carved, translated):
     return modules, duplicates, problems
 
 
-def write(store, modules, translated):
+def same_module(first, second):
+    first["sha256"] = first["sha256"] or digest(first["file"])
+    second["sha256"] = second["sha256"] or digest(second["file"])
+    return first["stage"] == second["stage"] and first["subgroup"] == second["subgroup"] and first["sha256"] == second["sha256"]
+
+
+def merge(modules, extra):
+    merged = dict(modules)
+    duplicates, conflicts = 0, []
+    for key, record in extra.items():
+        if key not in merged:
+            merged[key] = record
+            continue
+        duplicates += 1
+        if not same_module(merged[key], record):
+            conflicts.append(key)
+    for key in conflicts:
+        merged.pop(key, None)
+    return merged, duplicates, conflicts
+
+
+def write(store, modules):
     store.mkdir(parents=True, exist_ok=True)
-    root = os.path.relpath(translated, store)
     lines, details, inputs = [], {}, []
     for key in sorted(modules):
         module = modules[key]
-        path = Path(root) / module["file"].name
+        path = Path(os.path.relpath(module["file"], store))
         if "\t" in str(path) or "\n" in str(path):
             raise StoreError(f"{module['name']}: path holds a tab or newline")
         lines.append(f"{key}\t{module['stage']}\t{module['subgroup']}\t{path.as_posix()}\n")
@@ -141,7 +161,7 @@ def build(args):
     modules, duplicates, problems = collect(args.carved.resolve(), args.translated.resolve())
     if not modules:
         raise StoreError("no shader could be stored")
-    write(args.store.resolve(), modules, args.translated.resolve())
+    write(args.store.resolve(), modules)
     print(f"{len(modules)} modules stored in {args.store / INDEX}; {duplicates} containers duplicate another, "
           f"{len(problems['missing'])} have no translation, {len(problems['invalid'])} are invalid, "
           f"{len(problems['conflicts'])} hashes dropped because their copies translate differently")

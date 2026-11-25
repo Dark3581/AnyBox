@@ -14,8 +14,8 @@ HRESULT Fence::Create(const VulkanDevice& device, IUnknown* parent, UINT64 initi
         return E_POINTER;
     }
     *fence = nullptr;
-    if (flags != D3D12_FENCE_FLAG_NONE) {
-        error = "fence flags " + std::to_string(static_cast<int>(flags)) + " (shared or cross-adapter fences) are not supported";
+    if ((flags & ~D3D12_FENCE_FLAG_SHARED) != 0) {
+        error = "fence flags " + std::to_string(static_cast<int>(flags)) + " (cross-adapter or non-monitored fences) are not supported";
         return E_INVALIDARG;
     }
     Fence* created = new Fence(device, parent, flags);

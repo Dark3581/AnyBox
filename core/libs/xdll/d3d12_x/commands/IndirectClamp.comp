@@ -1,0 +1,41 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint v[];
+};
+
+layout(push_constant, std430) uniform Push {
+    Words arguments;
+    Words stats;
+    uint records;
+    uint strideWords;
+    uint maxX;
+    uint maxY;
+    uint maxZ;
+    uint maxGroups;
+} push;
+
+void main() {
+    for (uint record = 0; record < push.records; ++record) {
+        uint base = record * push.strideWords;
+        uint x = push.arguments.v[base];
+        uint y = push.arguments.v[base + 1];
+        uint z = push.arguments.v[base + 2];
+        bool sane = x <= push.maxX && y <= push.maxY && z <= push.maxZ;
+        if (sane && x != 0 && y != 0 && z != 0) {
+            sane = y <= push.maxGroups / x && z <= push.maxGroups / (x * y);
+        }
+        if (!sane) {
+            push.stats.v[0] += 1;
+            push.stats.v[1] = x;
+            push.stats.v[2] = y;
+            push.stats.v[3] = z;
+            push.arguments.v[base] = 0;
+            push.arguments.v[base + 1] = 0;
+            push.arguments.v[base + 2] = 0;
+        }
+    }
+}

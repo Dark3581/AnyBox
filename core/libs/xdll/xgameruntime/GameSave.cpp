@@ -1,4 +1,5 @@
 #include "xdll/xgameruntime/xgameruntime.hpp"
+#include "xdll/xgameruntime/TitleFolder.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -448,28 +449,8 @@ HRESULT Used(const std::wstring& root, std::int64_t& used, const char* function)
 }
 
 HRESULT OpenRoot(std::wstring& root, const char* function) {
-    const char* titleId = AbxTitleId();
-    if (titleId == nullptr) {
-        AbxUnsupported(function, "MicrosoftGame.config beside the executable has no valid <TitleId>");
-    }
-    wchar_t base[MAX_PATH];
-    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-        AbxUnsupported(function, "LOCALAPPDATA is not set, so there is no folder for the title's saves");
-    }
-    std::wstring title;
-    for (const char* c = titleId; *c != '\0'; ++c) {
-        title += static_cast<wchar_t>(*c);
-    }
-    root = std::wstring(L"\\\\?\\") + base;
-    for (const wchar_t* part : {L"AnyBox", title.c_str(), L"XGameSave"}) {
-        root += L"\\";
-        root += part;
-        if (!CreateDirectoryW(root.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
-            return FromWin32(GetLastError());
-        }
-    }
-    return S_OK;
+    const DWORD error = abx::xgameruntime::OpenTitleFolder(L"XGameSave", root, function);
+    return error == ERROR_SUCCESS ? S_OK : FromWin32(error);
 }
 
 HRESULT InitializeProvider(const char* configurationId, std::unique_ptr<XGameSaveProvider>& provider, const char* function) {
@@ -535,16 +516,10 @@ HRESULT SaveFilesFolder(std::string& folder, const char* function) {
     if (containers) {
         AbxUnsupported(function, "the save folder holds XGameSave containers, and presenting them as XGameSaveFiles folders and files is not implemented");
     }
-    const std::wstring path = root.substr(std::wcslen(L"\\\\?\\")) + L"\\";
-    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (size == 0) {
-        return FromWin32(GetLastError());
+    const DWORD error = abx::xgameruntime::TitleFolderPath(root, folder);
+    if (error != ERROR_SUCCESS) {
+        return FromWin32(error);
     }
-    folder.resize(static_cast<std::size_t>(size));
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path.c_str(), -1, folder.data(), size, nullptr, nullptr) != size) {
-        return FromWin32(GetLastError());
-    }
-    folder.pop_back();
     return Claim(SaveSystem::GameSaveFiles) ? S_OK : ProviderMismatch;
 }
 

@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -78,6 +79,34 @@ ps: 17500 modules ok, 0 failed
 ps pipelines: 17500 ok, 0 failed, 0 skipped
 wall time: 5.0s on 6 threads
 """
+
+
+FAKE_TOOL = r'''
+import json, os, sys
+from pathlib import Path
+tool = Path(sys.argv[0]).name
+print(tool, " ".join(sys.argv[1:]))
+if tool == "rdna2spirv.py":
+    source = Path(sys.argv[1])
+    out = Path(sys.argv[sys.argv.index("--out") + 1])
+    out.mkdir(parents=True, exist_ok=True)
+    index = json.loads((source.parent / "index.json").read_text(encoding="utf-8"))
+    skip = os.environ.get("FAKE_EMBEDDED_SKIP", "")
+    translated = {}
+    for number, entry in enumerate(index):
+        if entry["name"] == skip:
+            continue
+        (out / (entry["name"] + ".spv")).write_bytes(b"\x03\x02\x23\x07" + bytes([0x40 + number]) * 8)
+        translated[entry["name"]] = {"stage": entry["stage"], "wave64": "--wave64-emulate" in sys.argv}
+    (out / "index.json").write_text(json.dumps(translated), encoding="utf-8")
+'''
+
+
+def native_container(version, fill):
+    payload = struct.pack("<II4sIII", version, 0, b"DXIL", 0x106, 16, 4) + b"NOBC" + b"XDAT" + bytes([fill]) * 8 + b"XBCH"
+    table = 36
+    size = table + 8 + len(payload)
+    return b"DXBC" + b"\0" * 16 + struct.pack("<HHII", 1, 0, size, 1) + struct.pack("<I", table) + b"DXIL" + struct.pack("<I", len(payload)) + payload
 
 
 def quiet(function, *args, **kwargs):
@@ -192,11 +221,45 @@ class BuildTest(unittest.TestCase):
         self.assertIn("jobs=3", output)
         summary = self.summary()
         self.assertEqual(summary["format"], "anybox-shader-build")
-        self.assertEqual(summary["translation"], {"exit_code": 0, "carved": 3, "translated": 3, "wave64_emulate": "on"})
+        self.assertEqual(summary["translation"], {"exit_code": 0, "carved": 3, "translated": 3, "wave64_emulate": "on",
+                                                  "embedded": {"carved": 0, "translated": 0, "untranslated": []}})
         self.assertEqual(summary["store"], {"modules": 2, "duplicates": 1, "missing": 0, "invalid": 0, "conflicts": 0})
         self.assertNotIn("pipelines", summary)
         self.assertEqual(len((self.out / "store" / "modules.txt").read_text(encoding="utf-8").splitlines()), 2)
         self.assertIn("translated 3 shaders", (self.out / "translate.log").read_text(encoding="utf-8"))
+
+    def add_embedded(self):
+        tools = self.translator / "tools"
+        tools.mkdir()
+        for name in ("fssm_unpack.py", "shader_disasm.py", "rdna2spirv.py"):
+            (tools / name).write_text(FAKE_TOOL, encoding="utf-8")
+        (self.package / "Builder.dll").write_bytes(native_container(0x50065, 1) + native_container(0x50065, 2))
+
+    def test_embedded_shaders_join_the_store(self):
+        self.add_embedded()
+        os.environ["FAKE_EMBEDDED_SKIP"] = "Builder_00000000"
+        try:
+            code, output, errors = self.build("--wave64-emulate", "on")
+        finally:
+            del os.environ["FAKE_EMBEDDED_SKIP"]
+        self.assertEqual(code, 0, errors)
+        summary = self.summary()
+        self.assertEqual(summary["translation"]["embedded"], {"carved": 2, "translated": 1, "untranslated": ["Builder_00000000"]})
+        self.assertEqual(summary["store"]["modules"], 3)
+        self.assertEqual(summary["store"]["embedded"], {"modules": 1, "duplicates": 0, "untranslated": ["Builder_00000000"], "invalid": [], "conflicts": 0})
+        self.assertIn("not translated: Builder_00000000", output)
+        lines = (self.out / "store" / "modules.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(sum("work/embedded/shaders/spirv/" in line for line in lines), 1)
+        log = (self.out / "embedded.log").read_text(encoding="utf-8")
+        self.assertIn("fssm_unpack.py", log)
+        self.assertIn("--mcpu gfx1013", log)
+        self.assertIn("--wave64-emulate", log)
+
+    def test_embedded_shaders_need_the_translator_tools(self):
+        (self.package / "Builder.dll").write_bytes(native_container(0x50065, 1))
+        code, _, errors = self.build()
+        self.assertEqual(code, 1)
+        self.assertIn("holds no tools/fssm_unpack.py for the 1 shaders embedded", errors)
 
     def test_translator_failure_is_reported(self):
         os.environ["FAKE_TRANSLATOR_EXIT"] = "5"

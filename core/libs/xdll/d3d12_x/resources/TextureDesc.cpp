@@ -1,4 +1,5 @@
 #include "TextureDesc.hpp"
+#include "ImageDescriptor.hpp"
 
 #include "GraphicsState.hpp"
 
@@ -35,6 +36,7 @@ std::optional<TextureFormat> TypelessOrBlock(DXGI_FORMAT format, bool depthStenc
     case DXGI_FORMAT_B8G8R8A8_TYPELESS: return Color(VK_FORMAT_B8G8R8A8_UNORM, true);
     case DXGI_FORMAT_B8G8R8X8_TYPELESS: return Color(VK_FORMAT_B8G8R8A8_UNORM, true);
     case DXGI_FORMAT_B8G8R8X8_UNORM: return Color(VK_FORMAT_B8G8R8A8_UNORM);
+    case DXGI_FORMAT_A8_UNORM: return Color(VK_FORMAT_A8_UNORM_KHR);
     case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return Color(VK_FORMAT_B8G8R8A8_SRGB);
     case DXGI_FORMAT_BC1_TYPELESS: return Color(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, true, true);
     case DXGI_FORMAT_BC1_UNORM: return Color(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, false, true);
@@ -77,6 +79,7 @@ std::optional<TextureFormat> TextureStorageFormat(DXGI_FORMAT format, bool depth
         return Depth(*direct, false);
     case DXGI_FORMAT_D24_UNORM_S8_UINT:
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case kConsoleD16UnormS8Uint:
         return Depth(*direct, true);
     default:
         return Color(*direct);
@@ -150,10 +153,8 @@ std::optional<TextureImage> TranslateTextureDesc(const D3D12_RESOURCE_DESC& desc
                              : "depth format " + std::to_string(static_cast<int>(desc.Format)) + " without ALLOW_DEPTH_STENCIL";
         return std::nullopt;
     }
-    if (isDepth && (renderTarget || unorderedAccess)) {
-        error = "a depth-stencil texture cannot also allow render target or unordered access";
-        return std::nullopt;
-    }
+    image.depthRenderTarget = isDepth && renderTarget;
+    image.depthUnorderedAccess = isDepth && unorderedAccess;
     if (denyShaderResource && !depthStencil) {
         error = "DENY_SHADER_RESOURCE without ALLOW_DEPTH_STENCIL";
         return std::nullopt;
@@ -182,12 +183,17 @@ std::optional<TextureImage> TranslateTextureDesc(const D3D12_RESOURCE_DESC& desc
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (info.format == VK_FORMAT_A8_UNORM_KHR) image.features.insert("maintenance5");
     info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!denyShaderResource) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (renderTarget) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (renderTarget && !isDepth) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (depthStencil) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if (unorderedAccess) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-    if (format->mutableFormat) info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    if (unorderedAccess && !isDepth) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    const std::optional<ImageFormatInfo> component = ImageFormatOf(info.format);
+    if (!denyShaderResource && component && component->component != ImageComponent::Float) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (!isDepth) {
+        info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Width == desc.Height && desc.DepthOrArraySize % 6 == 0 && *samples == VK_SAMPLE_COUNT_1_BIT) {
         info.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
@@ -198,6 +204,7 @@ std::optional<TextureImage> TranslateTextureDesc(const D3D12_RESOURCE_DESC& desc
         image.features.insert("textureCompressionBC");
     }
     image.format = *format;
+    if (!isDepth) image.format.mutableFormat = true;
     return image;
 }
 

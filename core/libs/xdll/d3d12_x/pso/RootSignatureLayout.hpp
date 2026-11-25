@@ -37,10 +37,16 @@ struct RootSignatureLayout {
     std::vector<RootParameterLayout> parameters;
     std::vector<StaticSamplerLayout> staticSamplers;
     std::uint32_t words = 0;
+    std::uint32_t heapIndexing = 0;
 };
 
 std::optional<D3D12_SAMPLER_DESC> StaticSamplerDesc(const D3D12_STATIC_SAMPLER_DESC& desc, std::string& error);
 std::optional<RootSignatureLayout> BuildRootSignatureLayout(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc, std::string& error);
+constexpr std::uint32_t kHeapIndexingFlags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+
+void RememberHeapIndexing(const void* blob, std::size_t bytes, std::uint32_t flags);
+std::uint32_t HeapIndexingOf(const void* blob, std::size_t bytes);
+
 std::optional<RootSignatureLayout> DeserializeRootSignature(const void* blob, std::size_t bytes, std::string& error);
 
 }

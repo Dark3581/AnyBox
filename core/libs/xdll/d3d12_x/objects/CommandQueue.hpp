@@ -3,6 +3,7 @@
 #include "ObjectBase.hpp"
 #include "VulkanDevice.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -38,7 +39,23 @@ public:
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
 #endif
 
+    struct MemoryWait {
+        const volatile std::uint8_t* address = nullptr;
+        std::uint64_t titleAddress = 0;
+        bool narrow = false;
+        std::uint32_t comparison = 0;
+        std::uint64_t value = 0;
+        std::uint64_t mask = ~std::uint64_t{0};
+    };
+
+    struct MemoryLabel {
+        volatile std::uint64_t* address = nullptr;
+        std::uint64_t value = 0;
+    };
+
+    void ExecuteOrdered(UINT count, ID3D12CommandList* const* lists, std::vector<MemoryWait> waits, std::vector<MemoryLabel> labels);
     void Flush();
+    bool Drain(std::chrono::milliseconds limit);
     std::size_t Pending() const;
 
 protected:
@@ -50,6 +67,9 @@ private:
         Fence* fence = nullptr;
         UINT64 value = 0;
         std::vector<VkCommandBuffer> commands;
+        std::vector<MemoryWait> waits;
+        std::vector<MemoryLabel> labels;
+        std::chrono::steady_clock::time_point blockedSince{};
     };
 
     CommandQueue(const VulkanDevice& device, IUnknown* parent, const D3D12_COMMAND_QUEUE_DESC& desc) : DeviceChildBase(parent), device_(device), desc_(desc) {}
@@ -63,6 +83,7 @@ private:
     std::deque<Operation> pending_;
     bool flushing_ = false;
     bool again_ = false;
+    bool memoryBlocked_ = false;
 };
 
 }

@@ -67,7 +67,7 @@ class ShaderStoreTest(unittest.TestCase):
             carved, translated = shader_set(root, [("a", container(1), "ps", b"A", 64), ("b c", container(2), "ms", b"B")])
             modules, _, _ = shader_store.collect(carved, translated)
             store = root / "store"
-            shader_store.write(store, modules, translated)
+            shader_store.write(store, modules)
             entries = shader_store.read_index(store)
             self.assertEqual({(e["stage"], e["subgroup"]) for e in entries.values()}, {("ps", 64), ("ms", 0)})
             for key, entry in entries.items():
@@ -111,7 +111,7 @@ class ShaderStoreTest(unittest.TestCase):
             (translated / "index.json").write_text(json.dumps(index), encoding="utf-8")
             modules, _, problems = shader_store.collect(carved, translated)
             store = root / "store"
-            shader_store.write(store, modules, translated)
+            shader_store.write(store, modules)
             lines = (store / "inputs.txt").read_text(encoding="utf-8").splitlines()
             key = hashlib.sha256(container(1)).hexdigest()
             self.assertEqual(lines, [f"{key}\t0\tPOSITION\t0\tfloat\t7", f"{key}\t1\tTEXCOORD\t2\tfloat\t3"])

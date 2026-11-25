@@ -12,3 +12,13 @@ ABX_API void* XMemAlloc(std::size_t size, std::uint64_t attributes);
 ABX_API void XMemFree(void* address, std::uint64_t attributes);
 ABX_API BOOL XMemVirtualQuery(HANDLE process, const void* address, XMemVirtualQueryInfo* info);
 ABX_API BOOL XMemGetWorkingSetStatistics(std::uint32_t request, void* statistics);
+
+ABX_API void* XMemAllocDefault(std::size_t size, std::uint64_t attributes);
+ABX_API BOOL XMemAllocatePhysicalPages(std::uint64_t attributes, std::uintptr_t* pageCount, std::uintptr_t* pageArray);
+ABX_API void XMemFreeDefault(void* address, std::uint64_t attributes);
+ABX_API BOOL XMemFreePhysicalPages(std::uintptr_t pageCount, const std::uintptr_t* pageArray);
+ABX_API BOOL XMemIsToolsMemAvailable();
+ABX_API void* XMemMapPhysicalPages(void* address, std::size_t pageCount, const std::uintptr_t* pageArray);
+ABX_API BOOL XMemMapPhysicalPagesScatter(void* const* addresses, std::size_t count, const std::uintptr_t* pageArray);
+ABX_API BOOL XMemTransferMemory(std::uint32_t direction, std::size_t bytes);
+ABX_API void* XMemVirtualAlloc(void* address, std::size_t size, std::uint32_t allocationType, std::uint64_t attributes, std::uint32_t protect);

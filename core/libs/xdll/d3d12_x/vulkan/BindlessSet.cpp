@@ -132,6 +132,7 @@ BindlessSet::~BindlessSet() {
     const DeviceFunctions& vk = device_.Vk();
     const VkDevice device = device_.Handle();
     DestroyBuffer(device_, tableBuffer_);
+    for (DeviceBuffer& retired : retiredTables_) DestroyBuffer(device_, retired);
     for (Fallback& fallback : fallbacks_) {
         if (fallback.view != VK_NULL_HANDLE) vk.destroyImageView(device, fallback.view, nullptr);
         if (fallback.image != VK_NULL_HANDLE) vk.destroyImage(device, fallback.image, nullptr);
@@ -302,7 +303,7 @@ bool BindlessSet::Upload(std::string& error) {
         if (!CreateHostBuffer(device_, std::max<VkDeviceSize>(bytes, tableBuffer_.size * 2), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, grown, error)) {
             return false;
         }
-        DestroyBuffer(device_, tableBuffer_);
+        if (tableBuffer_.buffer != VK_NULL_HANDLE) retiredTables_.push_back(tableBuffer_);
         tableBuffer_ = grown;
         WriteTableBinding();
     }

@@ -26,6 +26,8 @@ struct TextureImage {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     TextureFormat format;
     std::set<std::string> features;
+    bool depthRenderTarget = false;
+    bool depthUnorderedAccess = false;
 };
 
 std::optional<TextureImage> TranslateTextureDesc(const D3D12_RESOURCE_DESC& desc, std::string& error);

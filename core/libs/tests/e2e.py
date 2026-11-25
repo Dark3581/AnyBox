@@ -66,6 +66,9 @@ EXPECTED = {
     "gamesave_folders": (0xAB02, "unsupported"),
     "gamesave_folders_async": (0xAB02, "unsupported"),
     "gamesave_empty_folder": (0, "none"),
+    "pls": (0, "none"),
+    "pls_prompt": (0xAB02, "unsupported"),
+    "pls_prompt_result": (0xAB02, "unsupported"),
     "async_null": (0xAB02, "unsupported"),
     "async_terminated": (0xAB02, "unsupported"),
     "async_begin_terminated": (0xAB02, "unsupported"),
@@ -74,7 +77,7 @@ EXPECTED = {
     "thread_assert": (0xAB02, "unsupported"),
 }
 
-DIRECT_CALLS = {"stub", "stub_debugger", "api_impl", "api_unmapped", "device_none", "device_noexecutable", "device_unknown", "startup_options", "gamesave_folders"}
+DIRECT_CALLS = {"stub", "stub_debugger", "api_impl", "api_unmapped", "device_none", "device_noexecutable", "device_unknown", "startup_options", "gamesave_folders", "pls_prompt", "pls_prompt_result"}
 WORKER_CALLS = {"gamesavefiles_containers"}
 
 class ExceptionRecord(ctypes.Structure):
@@ -121,8 +124,8 @@ def run_under_debugger(converted, argument, out, env):
 
 
 STOPPED_IN = {
-    "stub": "XUserAddAsync",
-    "stub_debugger": "XUserAddAsync",
+    "stub": "XUserGetState",
+    "stub_debugger": "XUserGetState",
     "api_impl": "QueryApiImpl",
     "api_unmapped": "QueryApiImpl",
     "taskqueue_monitor_reentry": "XTaskQueueUnregisterMonitor",
@@ -138,12 +141,16 @@ STOPPED_IN = {
     "gamesavefiles_containers": "XGameSaveFilesGetFolderWithUiAsync",
     "gamesave_folders": "XGameSaveInitializeProvider",
     "gamesave_folders_async": "XGameSaveInitializeProviderAsync",
+    "pls_prompt": "XPersistentLocalStoragePromptUserForSpaceAsync",
+    "pls_prompt_result": "XPersistentLocalStoragePromptUserForSpaceResult",
 }
 
 STOP_MESSAGES = {
     "gamesavefiles_containers": "holds XGameSave containers",
     "gamesave_folders": "holds XGameSaveFiles files",
     "gamesave_folders_async": "holds XGameSaveFiles files",
+    "pls_prompt": "no system UI to ask the user to free space",
+    "pls_prompt_result": "no prompt for space can have started",
     "api_unmapped": "slot 20 of the GDK API interface {073b7dcb-1fcf-4030-94be-e3c9eb623428} (threading: XAsync and XTaskQueue) is not mapped",
     "api_impl": "interface {cafef00d-0102-0304-0506-0708090a0b0c} of provider {11111111-2222-3333-4455-66778899aabb} is not implemented",
 }
@@ -154,6 +161,34 @@ SEEDS = {
     "gamesave_folders_async": "slot1/deep/state.dat",
     "gamesave_empty_folder": "slot1/deep/",
 }
+
+
+def check_storage_run(run, local, title_id, cache):
+    assert (run.returncode & 0xFFFFFFFF) == 0 and "pls ok" in run.stdout, (run.returncode, run.stdout, run.stderr)
+    line = next(line for line in run.stdout.splitlines() if line.startswith("pls path "))
+    words = line.split(" ")
+    folder = local / "AnyBox" / title_id / "PersistentLocalStorage"
+    assert " ".join(words[2:-8]) == str(folder) + "\\", (line, folder)
+    assert words[-8:-6] == ["cache", cache], line
+    used, total, free = int(words[-5]), int(words[-3]), int(words[-1])
+    assert (folder / "cache.bin").stat().st_size == 4096 and (folder / "sub" / "grown.bin").stat().st_size == 1234
+    assert used == sum(path.stat().st_size for path in folder.rglob("*") if path.is_file()), (used, list(folder.rglob("*")))
+    assert total == used + free, (used, total, free)
+    available = ctypes.c_ulonglong()
+    assert ctypes.WinDLL("kernel32", use_last_error=True).GetDiskFreeSpaceExW(ctypes.c_wchar_p(str(folder) + "\\"), ctypes.byref(available), None, None), ctypes.get_last_error()
+    assert abs(free - available.value) < 1024 ** 3, (free, available.value)
+
+
+def check_persistent_local_storage(run, converted, out, env, local):
+    check_storage_run(run, local, "1234ABCD", "absent")
+    assert sorted(path.name for path in (local / "AnyBox" / "1234ABCD").iterdir()) == ["PersistentLocalStorage", "T", "XGameSave"]
+    assert list((local / "AnyBox" / "1234ABCD" / "XGameSave").iterdir()) == []
+    again = subprocess.run([str(converted), "pls"], cwd=out, env=env, capture_output=True, text=True, timeout=60)
+    check_storage_run(again, local, "1234ABCD", "present")
+    config = out / "MicrosoftGame.config"
+    config.write_text(config.read_text(encoding="utf-8").replace("<TitleId>1234abcd</TitleId>", "<TitleId>5678ef01</TitleId>"), encoding="utf-8")
+    other = subprocess.run([str(converted), "pls"], cwd=out, env=env, capture_output=True, text=True, timeout=60)
+    check_storage_run(other, local, "5678EF01", "absent")
 
 
 def subsystem_offset(data):
@@ -305,6 +340,8 @@ def main():
         print("jsonschema not installed; schema check skipped")
     else:
         jsonschema.validate(report, json.loads(schema.read_text(encoding="utf-8")))
+    if args.scenario == "pls":
+        check_persistent_local_storage(run, converted, out, env, local)
     print(f"PASS {args.scenario}")
 
 

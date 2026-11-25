@@ -35,15 +35,28 @@ struct GraphicsRequest {
     VertexInput input;
 };
 
-enum class PipelineOrigin { Ready, Compiled, Refused, Failed };
+enum class PipelineOrigin { Ready, Compiled, Refused, Failed, Deferred };
 
 const char* PipelineOriginName(PipelineOrigin origin);
+
+class CacheOnlyBuilds {
+public:
+    explicit CacheOnlyBuilds(bool enabled);
+    ~CacheOnlyBuilds();
+    CacheOnlyBuilds(const CacheOnlyBuilds&) = delete;
+    CacheOnlyBuilds& operator=(const CacheOnlyBuilds&) = delete;
+    static bool Active();
+
+private:
+    bool previous_;
+};
 
 struct PipelineEntry {
     VkPipeline pipeline = VK_NULL_HANDLE;
     PipelineOrigin origin = PipelineOrigin::Failed;
     bool driverCacheHit = false;
     bool subgroupForced = false;
+    bool usesCodeBase = false;
     std::uintmax_t bytes = 0;
     double seconds = 0.0;
     std::string error;

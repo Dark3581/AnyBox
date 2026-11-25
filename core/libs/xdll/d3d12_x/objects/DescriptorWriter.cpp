@@ -1,10 +1,13 @@
 #include "DescriptorWriter.hpp"
 
 #include "AbxApi.hpp"
+#include "BindlessSet.hpp"
 #include "BufferDescriptor.hpp"
+#include "ImageDescriptor.hpp"
 #include "ViewDesc.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -15,6 +18,8 @@ namespace {
 
 const char* const kImageWordsUnknown =
     "image and sampler descriptor words in a shader-visible heap need the console's image (T#) and sampler (S#) descriptor layouts, which are not sourced yet";
+
+std::atomic<DescriptorWriter*> g_writer{nullptr};
 
 Resource* Ours(ID3D12Resource* resource, const char* function) {
     if (resource == nullptr) {
@@ -30,6 +35,39 @@ Resource* Ours(ID3D12Resource* resource, const char* function) {
 void Check(bool ok, const char* function, const std::string& error) {
     if (!ok) {
         AbxUnsupported(function, error.c_str());
+    }
+}
+
+std::optional<std::uint32_t> ImageBinding(VkImageViewType type, ImageComponent component, bool storage) {
+    const std::uint32_t offset = component == ImageComponent::Uint ? 1u : component == ImageComponent::Sint ? 2u : 0u;
+    if (!storage && component == ImageComponent::Float) {
+        switch (type) {
+        case VK_IMAGE_VIEW_TYPE_1D: return 5u;
+        case VK_IMAGE_VIEW_TYPE_2D: return 0u;
+        case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return 3u;
+        case VK_IMAGE_VIEW_TYPE_3D: return 6u;
+        default: return std::nullopt;
+        }
+    }
+    switch (type) {
+    case VK_IMAGE_VIEW_TYPE_2D: return 8u + offset;
+    case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return 11u + offset;
+    case VK_IMAGE_VIEW_TYPE_3D: return 14u + offset;
+    case VK_IMAGE_VIEW_TYPE_1D: return 17u + offset;
+    default: return std::nullopt;
+    }
+}
+
+std::optional<std::uint32_t> ImageType(VkImageViewType type) {
+    switch (type) {
+    case VK_IMAGE_VIEW_TYPE_1D: return kImageType1D;
+    case VK_IMAGE_VIEW_TYPE_2D: return kImageType2D;
+    case VK_IMAGE_VIEW_TYPE_3D: return kImageType3D;
+    case VK_IMAGE_VIEW_TYPE_CUBE: return kImageTypeCube;
+    case VK_IMAGE_VIEW_TYPE_1D_ARRAY: return kImageType1DArray;
+    case VK_IMAGE_VIEW_TYPE_2D_ARRAY: return kImageType2DArray;
+    case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: return kImageTypeCube;
+    default: return std::nullopt;
     }
 }
 
@@ -92,7 +130,11 @@ void DescriptorWriter::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW
         return;
     }
     if (!context_.window.Contains(desc->BufferLocation, desc->SizeInBytes)) {
-        AbxUnsupported(function, "a constant buffer outside the title buffer window");
+        if (context_.titleMemory == nullptr) {
+            AbxUnsupported(function, "a constant buffer outside the title buffer window");
+        }
+        AbxTrace("%s: constant buffer at title address 0x%llx (%u bytes) has no Vulkan backing yet", function, static_cast<unsigned long long>(desc->BufferLocation),
+                 desc->SizeInBytes);
     }
     std::string error;
     const std::optional<BufferDescriptorWords> words = ConstantBufferDescriptor(*desc, error);
@@ -110,28 +152,176 @@ void DescriptorWriter::WriteImageView(Resource* resource, const std::optional<Im
             AbxUnsupported(function, ("the view needs the device feature " + feature + ", which this GPU or driver lacks").c_str());
         }
     }
-    RequireImageWords(target, HeapEntry::Image, function);
+    const bool encode = context_.bindless != nullptr;
+    if (!encode) RequireImageWords(target, HeapEntry::Image, function);
     DescriptorRecord record;
     record.kind = HeapEntry::Image;
     record.unorderedAccess = unorderedAccess;
     record.resource = resource;
     record.view = resource->View(view->info, error);
     Check(record.view != VK_NULL_HANDLE, function, error);
-    WriteWords(target, nullptr, 0);
+    if (encode) {
+        const ImageDescriptorWords words = BindImage(resource, view->info, record.view, unorderedAccess, function);
+        WriteWords(target, words.data(), sizeof(words));
+    } else {
+        WriteWords(target, nullptr, 0);
+    }
     target.heap->Record(target.index) = record;
+}
+
+ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkImageViewCreateInfo& info, VkImageView view, bool unorderedAccess, const char* function) {
+    g_writer.store(this);
+    const std::lock_guard guard(imageLock_);
+    const auto known = images_.find(view);
+    if (known != images_.end()) return known->second.words;
+    const VkImageCreateInfo& image = resource->Texture().layout.info;
+    const bool multisampled = image.samples != VK_SAMPLE_COUNT_1_BIT;
+    std::optional<ImageFormatInfo> format = ImageFormatOf(info.format);
+    if (!format && (info.format == VK_FORMAT_D32_SFLOAT_S8_UINT || info.format == VK_FORMAT_D32_SFLOAT)) {
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) format = ImageFormatOf(VK_FORMAT_R32_SFLOAT);
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT) format = ImageFormatOf(VK_FORMAT_R8_UINT);
+    }
+    if (!format && info.format == VK_FORMAT_D24_UNORM_S8_UINT) {
+        constexpr std::uint32_t kDepth24Stencil8Unorm = 141;
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) format = ImageFormatInfo{kDepth24Stencil8Unorm, ImageComponent::Float};
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT) format = ImageFormatOf(VK_FORMAT_R8_UINT);
+    }
+    if (!format) {
+        AbxUnsupported(function, ("Vulkan format " + std::to_string(static_cast<int>(info.format)) + " has no image descriptor format code AnyBox has sourced").c_str());
+    }
+    const bool cube = info.viewType == VK_IMAGE_VIEW_TYPE_CUBE || info.viewType == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    const VkImageViewType bindingType = cube ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : info.viewType;
+    const std::optional<std::uint32_t> binding = multisampled ? std::optional<std::uint32_t>(0u) : ImageBinding(bindingType, format->component, unorderedAccess);
+    std::optional<std::uint32_t> type = ImageType(info.viewType);
+    if (multisampled && type) type = *type == kImageType2DArray ? kImageType2DMsaaArray : kImageType2DMsaa;
+    if (!binding || !type) {
+        AbxUnsupported(function, ("an image view of type " + std::to_string(static_cast<int>(info.viewType)) + " with that component type has no bindless binding").c_str());
+    }
+    const VkImageSubresourceRange& range = info.subresourceRange;
+    const std::uint32_t levels = range.levelCount == VK_REMAINING_MIP_LEVELS ? image.mipLevels - range.baseMipLevel : range.levelCount;
+    const std::uint32_t layers = range.layerCount == VK_REMAINING_ARRAY_LAYERS ? image.arrayLayers - range.baseArrayLayer : range.layerCount;
+    ImageDescriptorFields fields;
+    fields.base = nextImageBase_++;
+    fields.format = format->code;
+    fields.width = image.extent.width;
+    fields.height = image.extent.height;
+    fields.depth = info.viewType == VK_IMAGE_VIEW_TYPE_3D ? image.extent.depth
+                   : (info.viewType == VK_IMAGE_VIEW_TYPE_2D || info.viewType == VK_IMAGE_VIEW_TYPE_1D) ? 1u
+                                                                                                         : range.baseArrayLayer + layers;
+    const VkComponentSwizzle swizzles[] = {info.components.r, info.components.g, info.components.b, info.components.a};
+    for (std::uint32_t component = 0; component < 4; ++component) {
+        const std::optional<std::uint32_t> select = ComponentSelect(swizzles[component], 4 + component);
+        if (!select) AbxUnsupported(function, "a component swizzle the image descriptor cannot express");
+        fields.select[component] = *select;
+    }
+    fields.baseLevel = range.baseMipLevel;
+    fields.lastLevel = range.baseMipLevel + levels - 1;
+    fields.type = *type;
+    fields.baseArray = range.baseArrayLayer;
+    fields.maxMip = image.mipLevels - 1;
+    if (multisampled) {
+        std::uint32_t log2 = 0;
+        while ((1u << (log2 + 1)) <= static_cast<std::uint32_t>(image.samples)) ++log2;
+        fields.baseLevel = 0;
+        fields.lastLevel = log2;
+        fields.maxMip = static_cast<std::uint32_t>(image.samples);
+    }
+    const std::optional<ImageDescriptorWords> words = EncodeImageDescriptor(fields);
+    if (!words) AbxUnsupported(function, "an image whose size, mips or layers do not fit the image descriptor");
+    if (multisampled) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "multisampled textures get image descriptor words but no bindless slot: the title layout has no multisampled image binding");
+        }
+        images_.emplace(view, BoundImage{*words, resource});
+        return *words;
+    }
+    std::uint32_t& next = nextImageSlot_.try_emplace(*binding, 1u).first->second;
+    std::vector<std::uint32_t>& freed = freeImageSlots_[*binding];
+    const bool reused = !freed.empty();
+    std::uint32_t slot = reused ? freed.back() : next;
+    if (reused) freed.pop_back();
+    std::string error;
+    VkImageView bound = view;
+    if (cube) {
+        VkImageViewCreateInfo layers = info;
+        layers.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        bound = resource->View(layers, error);
+        Check(bound != VK_NULL_HANDLE, function, error);
+    }
+    Check(context_.bindless->WriteImage(*binding, slot, bound, error), function, error);
+    std::uint32_t source[8];
+    std::copy(words->begin(), words->end(), source);
+    if (!context_.bindless->Table().Insert(ImageKey(source), slot)) {
+        AbxUnsupported(function, "the bindless descriptor table refused a new image key");
+    }
+    Check(context_.bindless->Upload(error), function, error);
+    if (!reused) ++next;
+    images_.emplace(view, BoundImage{*words, resource, *binding, slot, true});
+    return *words;
+}
+
+void DescriptorWriter::ForgetResource(const Resource* resource) {
+    DescriptorWriter* writer = g_writer.load();
+    if (writer == nullptr || resource == nullptr) return;
+    const std::lock_guard guard(writer->imageLock_);
+    bool erased = false;
+    for (auto it = writer->images_.begin(); it != writer->images_.end();) {
+        if (it->second.resource != resource) {
+            ++it;
+            continue;
+        }
+        if (it->second.hasSlot && writer->context_.bindless != nullptr) {
+            std::uint32_t words[8];
+            std::copy(it->second.words.begin(), it->second.words.end(), words);
+            writer->context_.bindless->Table().Erase(ImageKey(words));
+            writer->freeImageSlots_[it->second.binding].push_back(it->second.slot);
+            erased = true;
+            const std::uint64_t recycled = ++writer->recycledImageSlots_;
+            if (recycled == 1) {
+                AbxLog("d3d12_x", "bindless image slots of destroyed textures are reused (first: binding %u slot %u)", it->second.binding, it->second.slot);
+            }
+        }
+        it = writer->images_.erase(it);
+    }
+    if (erased) {
+        std::string error;
+        if (!writer->context_.bindless->Upload(error)) AbxLog("d3d12_x", "uploading the bindless lookup table after freeing image slots failed: %s", error.c_str());
+    }
 }
 
 void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
     const char* function = "ID3D12Device::CreateShaderResourceView";
     const Target target = Resolve(destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, function);
     Resource* ours = Ours(resource, function);
+    D3D12_SHADER_RESOURCE_VIEW_DESC shifted{};
+    if (ours != nullptr && desc != nullptr && ours->SkippedMips() != 0) {
+        shifted = *desc;
+        const UINT skip = ours->SkippedMips();
+        const auto shift = [skip](UINT& mostDetailed, FLOAT& clamp) {
+            mostDetailed = mostDetailed > skip ? mostDetailed - skip : 0;
+            clamp = clamp > static_cast<FLOAT>(skip) ? clamp - static_cast<FLOAT>(skip) : 0.0f;
+        };
+        switch (shifted.ViewDimension) {
+        case D3D12_SRV_DIMENSION_TEXTURE2D: shift(shifted.Texture2D.MostDetailedMip, shifted.Texture2D.ResourceMinLODClamp); break;
+        case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: shift(shifted.Texture2DArray.MostDetailedMip, shifted.Texture2DArray.ResourceMinLODClamp); break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBE: shift(shifted.TextureCube.MostDetailedMip, shifted.TextureCube.ResourceMinLODClamp); break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: shift(shifted.TextureCubeArray.MostDetailedMip, shifted.TextureCubeArray.ResourceMinLODClamp); break;
+        default: break;
+        }
+        desc = &shifted;
+    }
     std::string error;
     if (ours == nullptr) {
         if (desc == nullptr) {
             AbxUnsupported(function, "a null shader resource view without a description");
         }
         if (desc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
-            AbxUnsupported(function, "ray tracing acceleration structures");
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
+                AbxLog("d3d12_x", "ray tracing acceleration structure views (first at GPU address 0x%llx) are written as empty descriptors: AnyBox does not build acceleration structures, so the title's rays hit nothing (ray-traced shadows and reflections are missing)",
+                       static_cast<unsigned long long>(desc->RaytracingAccelerationStructure.Location));
+            }
         }
         WriteWords(target, nullptr, 0);
         target.heap->Record(target.index) = DescriptorRecord{};
@@ -141,7 +331,7 @@ void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const 
         if (desc == nullptr) {
             AbxUnsupported(function, "a buffer shader resource view without a description");
         }
-        const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Buffer().size, *desc, error);
+        const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Width(), *desc, error);
         Check(words.has_value(), function, error);
         WriteWords(target, words->data(), kBufferDescriptorBytes);
         DescriptorRecord record;
@@ -151,6 +341,39 @@ void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const 
         return;
     }
     WriteImageView(ours, ShaderResourceView(ours->Texture().desc, desc, error), false, target, function, error);
+}
+
+void DescriptorWriter::CreateShaderResourceViewAt(std::uint64_t address, std::uint64_t bytes, const D3D12_SHADER_RESOURCE_VIEW_DESC& desc,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    const char* function = "ID3D12Device::CreateShaderResourceView (buffer at an address)";
+    const Target target = Resolve(destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, function);
+    std::string error;
+    const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(address, bytes, desc, error);
+    Check(words.has_value(), function, error);
+    WriteWords(target, words->data(), kBufferDescriptorBytes);
+    DescriptorRecord record;
+    record.kind = HeapEntry::Buffer;
+    target.heap->Record(target.index) = record;
+}
+
+void DescriptorWriter::CreateUnorderedAccessViewAt(std::uint64_t address, std::uint64_t bytes, const D3D12_UNORDERED_ACCESS_VIEW_DESC& desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    const char* function = "ID3D12Device::CreateUnorderedAccessView (buffer at an address)";
+    const Target target = Resolve(destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, function);
+    if (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER && desc.Buffer.NumElements == 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) AbxLog("d3d12_x", "unordered access views of zero elements at an address are written as null descriptors");
+        WriteWords(target, nullptr, 0);
+        target.heap->Record(target.index) = DescriptorRecord{};
+        return;
+    }
+    std::string error;
+    const std::optional<BufferDescriptorWords> words = UnorderedAccessBufferDescriptor(address, bytes, desc, false, error);
+    Check(words.has_value(), function, error);
+    WriteWords(target, words->data(), kBufferDescriptorBytes);
+    DescriptorRecord record;
+    record.kind = HeapEntry::Buffer;
+    record.unorderedAccess = true;
+    target.heap->Record(target.index) = record;
 }
 
 void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
@@ -172,7 +395,7 @@ void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D1
         if (desc == nullptr) {
             AbxUnsupported(function, "a buffer unordered access view without a description");
         }
-        const std::optional<BufferDescriptorWords> words = UnorderedAccessBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Buffer().size, *desc, counter != nullptr, error);
+        const std::optional<BufferDescriptorWords> words = UnorderedAccessBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Width(), *desc, counter != nullptr, error);
         Check(words.has_value(), function, error);
         WriteWords(target, words->data(), kBufferDescriptorBytes);
         DescriptorRecord record;
@@ -185,7 +408,20 @@ void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D1
     if (counter != nullptr) {
         AbxUnsupported(function, "a counter on a texture unordered access view");
     }
-    WriteImageView(ours, UnorderedAccessView(ours->Texture().desc, desc, error), true, target, function, error);
+    const TextureImage& layout = ours->Texture().layout;
+    if (layout.depthUnorderedAccess && (layout.info.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x",
+                   "%s: the device offers no storage images of Vulkan depth format %d, so unordered access views of such depth textures are written as null views "
+                   "(shader writes through them are dropped, reads return zero; later views are not logged)",
+                   function, static_cast<int>(layout.info.format));
+        }
+        WriteWords(target, nullptr, 0);
+        target.heap->Record(target.index) = DescriptorRecord{};
+        return;
+    }
+    WriteImageView(ours, UnorderedAccessView(ours->Texture().layout, ours->Texture().desc, desc, error), true, target, function, error);
 }
 
 void DescriptorWriter::CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
@@ -272,13 +508,41 @@ void DescriptorWriter::CreateSampler(const D3D12_SAMPLER_DESC* desc, D3D12_CPU_D
     if (desc == nullptr) {
         AbxUnsupported(function, "a sampler without a description");
     }
-    RequireImageWords(target, HeapEntry::Sampler, function);
+    const bool encode = context_.bindless != nullptr;
+    if (!encode) RequireImageWords(target, HeapEntry::Sampler, function);
     std::string error;
     DescriptorRecord record;
     record.kind = HeapEntry::Sampler;
     record.sampler = SamplerFor(*desc, error);
     Check(record.sampler != VK_NULL_HANDLE, function, error);
-    WriteWords(target, nullptr, 0);
+    if (!encode) {
+        WriteWords(target, nullptr, 0);
+        target.heap->Record(target.index) = record;
+        return;
+    }
+    SamplerDescriptorWords words{};
+    {
+        const std::lock_guard guard(imageLock_);
+        const auto known = boundSamplers_.find(record.sampler);
+        if (known != boundSamplers_.end()) {
+            words = known->second;
+        } else {
+            const std::uint32_t slot = nextSamplerSlot_;
+            const std::optional<SamplerDescriptorWords> encoded = EncodeSamplerDescriptor(*desc, slot);
+            if (!encoded) AbxUnsupported(function, "a sampler whose address modes or count do not fit the sampler descriptor");
+            Check(context_.bindless->WriteSampler(slot, record.sampler, error), function, error);
+            std::uint32_t source[4];
+            std::copy(encoded->begin(), encoded->end(), source);
+            if (!context_.bindless->Table().Insert(SamplerKey(source), slot)) {
+                AbxUnsupported(function, "the bindless descriptor table refused a new sampler key");
+            }
+            Check(context_.bindless->Upload(error), function, error);
+            ++nextSamplerSlot_;
+            words = *encoded;
+            boundSamplers_.emplace(record.sampler, words);
+        }
+    }
+    WriteWords(target, words.data(), sizeof(words));
     target.heap->Record(target.index) = record;
 }
 
@@ -327,13 +591,36 @@ void DescriptorWriter::CopyDescriptors(UINT destinationRanges, const D3D12_CPU_D
             const UINT target = to.index + destinationDone + step;
             const UINT origin = from.index + sourceDone + step;
             const DescriptorRecord record = from.heap->Record(origin);
-            RequireImageWords({to.heap, target}, record.kind, function);
+            if (context_.bindless == nullptr) RequireImageWords({to.heap, target}, record.kind, function);
             std::memmove(to.heap->Slot(target), from.heap->Slot(origin), to.heap->Increment());
             to.heap->Record(target) = record;
         }
         destinationDone += run;
         sourceDone += run;
     }
+}
+
+std::string DescriptorWriter::DescribeImageWords(const std::uint32_t* words) {
+    DescriptorWriter* writer = g_writer.load();
+    if (writer == nullptr) return "no writer";
+    const std::lock_guard guard(writer->imageLock_);
+    for (const auto& [view, bound] : writer->images_) {
+        if (std::memcmp(bound.words.data(), words, sizeof(std::uint32_t) * 8) != 0) continue;
+        if (bound.resource == nullptr) return "a known view";
+        const D3D12_RESOURCE_DESC& desc = bound.resource->Texture().desc;
+        char text[160];
+        std::snprintf(text, sizeof(text), "texture %p %llux%u f%d at title 0x%llx", static_cast<void*>(bound.resource->Texture().image), static_cast<unsigned long long>(desc.Width),
+                      desc.Height, static_cast<int>(desc.Format), static_cast<unsigned long long>(bound.resource->TitleAddress()));
+        return text;
+    }
+    char text[200];
+    const std::uint64_t address = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xFF) << 32)) << 8;
+    const std::uint32_t width = (((words[1] >> 30) & 3) | ((words[2] & 0xFFF) << 2)) + 1;
+    const std::uint32_t height = ((words[2] >> 14) & 0x3FFF) + 1;
+    std::snprintf(text, sizeof(text), "title T#: address 0x%llx format %u %ux%u type %u swizzle %u mips %u..%u words %08x %08x %08x %08x",
+                  static_cast<unsigned long long>(address), (words[1] >> 20) & 0x1FF, width, height, words[3] >> 28, (words[3] >> 20) & 0x1F, (words[3] >> 12) & 0xF,
+                  (words[3] >> 16) & 0xF, words[0], words[1], words[2], words[3]);
+    return text;
 }
 
 }

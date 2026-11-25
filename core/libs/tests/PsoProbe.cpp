@@ -324,13 +324,17 @@ int GraphicsSelfTest() {
     state = TranslateGraphicsState(desc, error);
     if (state->stencilTest) return Fail("stencil without a stencil format");
 
+    desc = DefaultGraphics();
+    desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+    state = TranslateGraphicsState(desc, error);
+    if (!state || !state->conservative) return Fail("conservative rasterization kept");
+
     const std::pair<void (*)(D3D12_GRAPHICS_PIPELINE_STATE_DESC&), const char*> refusals[] = {
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.HS.BytecodeLength = 4; }, "tessellation"},
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.StreamOutput.NumEntries = 1; }, "stream output"},
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(1); }, "pipeline state flags 1"},
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.NodeMask = 2; }, "node mask 2"},
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH; }, "primitive topology type 4"},
-        {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON; }, "conservative"},
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.RasterizerState.ForcedSampleCount = 4; }, "forced sample count"},
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.RasterizerState.FillMode = static_cast<D3D12_FILL_MODE>(7); }, "fill mode 7"},
         {[](D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) { d.SampleDesc.Count = 3; }, "sample count 3"},
@@ -979,7 +983,10 @@ int TexturesSelfTest() {
     }
     const std::optional<TextureImage> chain = TranslateTextureDesc(cases[0].desc, error);
     const VkImageUsageFlags rgbaUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-    if (chain->info.mipLevels != 9 || chain->info.usage != rgbaUsage || chain->info.flags != 0 || chain->info.imageType != VK_IMAGE_TYPE_2D) return Fail("rgba8 image");
+    if (chain->info.mipLevels != 9 || chain->info.usage != rgbaUsage || chain->info.flags != (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) || chain->info.imageType != VK_IMAGE_TYPE_2D) {
+        return Fail("rgba8 image: mips " + std::to_string(chain->info.mipLevels) + ", usage " + std::to_string(chain->info.usage) + ", flags " + std::to_string(chain->info.flags) +
+                    ", type " + std::to_string(static_cast<int>(chain->info.imageType)));
+    }
     const std::optional<TextureImage> typeless = TranslateTextureDesc(cases[1].desc, error);
     if ((typeless->info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) == 0 || (typeless->info.flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) == 0) return Fail("typeless is mutable");
     const std::optional<TextureImage> denied = TranslateTextureDesc(cases[4].desc, error);
@@ -990,6 +997,15 @@ int TexturesSelfTest() {
     if (volume->info.imageType != VK_IMAGE_TYPE_3D || volume->info.extent.depth != 16 || volume->info.arrayLayers != 1 || volume->info.mipLevels != 6 ||
         (volume->info.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) == 0) return Fail("volume");
     if (TranslateTextureDesc(cases[8].desc, error)->info.samples != VK_SAMPLE_COUNT_4_BIT) return Fail("msaa samples");
+    D3D12_RESOURCE_DESC writableDepth = cases[0].desc;
+    writableDepth.Format = DXGI_FORMAT_D32_FLOAT;
+    writableDepth.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const std::optional<TextureImage> written = TranslateTextureDesc(writableDepth, error);
+    if (!written || !written->depthUnorderedAccess || !written->depthRenderTarget ||
+        (written->info.usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) != 0 ||
+        (written->info.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0) return Fail("writable depth");
+    error.clear();
+    if (UnorderedAccessView(writableDepth, nullptr, error) || error.find("depth texture") == std::string::npos) return Fail("writable depth view gave '" + error + "'");
 
     const std::pair<void (*)(D3D12_RESOURCE_DESC&), const char*> refusals[] = {
         {[](D3D12_RESOURCE_DESC& d) { d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; }, "resource dimension 1 is not a texture"},
@@ -1002,7 +1018,6 @@ int TexturesSelfTest() {
         {[](D3D12_RESOURCE_DESC& d) { d.Width = 0x100000000ull; }, "zero or oversized extent"},
         {[](D3D12_RESOURCE_DESC& d) { d.Format = DXGI_FORMAT_D32_FLOAT; }, "depth format 40 without ALLOW_DEPTH_STENCIL"},
         {[](D3D12_RESOURCE_DESC& d) { d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL; }, "a depth-stencil texture has the color format 28"},
-        {[](D3D12_RESOURCE_DESC& d) { d.Format = DXGI_FORMAT_D32_FLOAT; d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS); }, "cannot also allow"},
         {[](D3D12_RESOURCE_DESC& d) { d.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE; }, "DENY_SHADER_RESOURCE without ALLOW_DEPTH_STENCIL"},
         {[](D3D12_RESOURCE_DESC& d) { d.Format = DXGI_FORMAT_BC3_UNORM; }, "a block-compressed texture is 1D or allows"},
         {[](D3D12_RESOURCE_DESC& d) { d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x100); }, "resource flags 256 are not supported"},
@@ -1213,6 +1228,20 @@ int ViewsSelfTest() {
     const ImageView slices = view(11);
     if (slices.info.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY || slices.info.subresourceRange.baseArrayLayer != 4 || slices.info.subresourceRange.layerCount != 8) return Fail("volume slices");
     if (view(12).info.components.a != VK_COMPONENT_SWIZZLE_ONE || view(12).info.format != VK_FORMAT_B8G8R8A8_UNORM) return Fail("bgrx alpha");
+    {
+        ViewCase recast = cases[12];
+        recast.useDefault = false;
+        recast.srv = {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}};
+        recast.srv.Texture2D = {0, 1, 0, 0.0f};
+        const std::optional<ImageView> recastView = MakeView(recast, error);
+        if (!recastView || recastView->info.format != VK_FORMAT_B8G8R8A8_SRGB) return Fail("typed texture recast to its sRGB sibling: " + error);
+    }
+    {
+        ViewCase sameSize = cases[0];
+        sameSize.srv.Format = DXGI_FORMAT_R32_FLOAT;
+        const std::optional<ImageView> reinterpreted = MakeView(sameSize, error);
+        if (!reinterpreted || reinterpreted->info.format != VK_FORMAT_R32_SFLOAT) return Fail("same-size reinterpretation: " + error);
+    }
     if (view(13).info.viewType != VK_IMAGE_VIEW_TYPE_1D_ARRAY || view(13).info.subresourceRange.layerCount != 3) return Fail("1D array");
     if (view(15).info.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY || view(16).info.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return Fail("msaa arrays");
 
@@ -1223,11 +1252,9 @@ int ViewsSelfTest() {
     };
     const Refusal refusals[] = {
         {0, [](ViewCase& v) { v.srv.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS; }, "is typeless"},
-        {0, [](ViewCase& v) { v.srv.Format = DXGI_FORMAT_R32_FLOAT; }, "view format 41 is not in the format family of the texture's 27"},
         {0, [](ViewCase& v) { v.srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; }, "is not in the format family"},
-        {12, [](ViewCase& v) { v.useDefault = false; v.srv = {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, {}}; v.srv.Texture2D = {0, 1, 0, 0.0f}; }, "differs from a texture that is not typeless"},
         {0, [](ViewCase& v) { v.srv.Texture2DArray.MostDetailedMip = 7; }, "mip range 7+2"},
-        {0, [](ViewCase& v) { v.srv.Texture2DArray.ArraySize = 4; }, "array range 1+4"},
+        {0, [](ViewCase& v) { v.srv.Texture2DArray.FirstArraySlice = 64; }, "array range 64+"},
         {0, [](ViewCase& v) { v.srv.Texture2DArray.ResourceMinLODClamp = 1.0f; }, "minimum LOD clamp"},
         {0, [](ViewCase& v) { v.srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; }, "does not match the texture's dimension"},
         {0, [](ViewCase& v) { v.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; }, "dimension 1 is not a texture view"},
@@ -1239,7 +1266,6 @@ int ViewsSelfTest() {
         {6, [](ViewCase& v) { v.dsv.Flags = static_cast<D3D12_DSV_FLAGS>(4); }, "flags 4 are unknown"},
         {7, [](ViewCase& v) { v.srv.TextureCubeArray.NumCubes = 3; }, "do not fit"},
         {10, [](ViewCase& v) { v.useDefault = false; v.uav = {DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE3D, {}}; v.uav.Texture3D = {0, 2, 4}; }, "part of a 3D texture's depth"},
-        {11, [](ViewCase& v) { v.rtv.Texture3D = {0, 10, 8}; }, "array range 10+8"},
         {12, [](ViewCase& v) { v.kind = 'u'; }, "without ALLOW_UNORDERED_ACCESS"},
         {12, [](ViewCase& v) { v.kind = 'r'; }, "without ALLOW_RENDER_TARGET"},
         {12, [](ViewCase& v) { v.kind = 'd'; }, "without ALLOW_DEPTH_STENCIL"},
@@ -1931,7 +1957,6 @@ int IndirectSelfTest() {
     const std::pair<D3D12_COMMAND_SIGNATURE_DESC, const char*> refusals[] = {
         {{16, 2, withConstant, 0}, "argument type 5 (constants, views or buffer bindings changed per command)"},
         {{16, 2, drawFirst, 0}, "is not the last argument"},
-        {{16, 1, &mesh, 0}, "type 10 as the last argument"},
         {{12, 1, &draw, 0}, "byte stride 12 is smaller than the 16-byte arguments"},
         {{18, 1, &draw, 0}, "byte stride 18"},
         {{16, 0, &draw, 0}, "has no arguments"},
@@ -2347,7 +2372,9 @@ int BuffersSelfTest() {
 
     const auto view = [](const BufferDescriptorWords& w) { return DecodeBufferDescriptor(w); };
     const std::optional<BufferDescriptorWords> cbv = ConstantBufferDescriptor({0x10000, 256}, error);
-    if (!cbv || view(*cbv).base != 0x10000 || view(*cbv).records != 256 || view(*cbv).bounds != BufferBounds::Raw || view(*cbv).stride != 0) return Fail("constant buffer: " + error);
+    if (!cbv || view(*cbv).base != 0x10000 || view(*cbv).records != 16 || view(*cbv).bounds != BufferBounds::StructuredWithOffset || view(*cbv).stride != 16) {
+        return Fail("constant buffer: " + error);
+    }
     if (ConstantBufferDescriptor({0x10000, 100}, error) || ConstantBufferDescriptor({0, 256}, error)) return Fail("constant buffer refusals");
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -2587,7 +2614,13 @@ int FenceGpu(bool validate) {
     expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence), error)) && fence != nullptr, "create fence: " + error);
     expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&other), error)) && other != nullptr, "create second fence");
     void* nothing = nullptr;
-    expect(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), &nothing, error) == E_INVALIDARG && nothing == nullptr, "shared fence refused");
+    expect(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER, __uuidof(ID3D12Fence), &nothing, error) == E_INVALIDARG && nothing == nullptr,
+           "cross-adapter fence refused");
+    ID3D12Fence1* shared = nullptr;
+    expect(SUCCEEDED(Fence::Create(*device, nullptr, 0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence1), reinterpret_cast<void**>(&shared), error)) && shared != nullptr &&
+               shared->GetCreationFlags() == D3D12_FENCE_FLAG_SHARED,
+           "shared fence keeps its flags: " + error);
+    if (shared != nullptr) shared->Release();
     D3D12_COMMAND_QUEUE_DESC directDesc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     D3D12_COMMAND_QUEUE_DESC computeDesc{D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, 0};
     ID3D12CommandQueue* direct = nullptr;

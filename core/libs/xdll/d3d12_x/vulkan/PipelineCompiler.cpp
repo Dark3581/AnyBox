@@ -1,10 +1,13 @@
 #include "PipelineCompiler.hpp"
 
+#include "AddressTranslation.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <cstdio>
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -178,12 +181,29 @@ void ComputePipeline::Reset() {
     pipeline_ = VK_NULL_HANDLE;
 }
 
+std::optional<std::vector<std::uint32_t>> ReadTitleModule(const std::filesystem::path& path, bool& usesCodeBase, std::string& error) {
+    const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(path, error);
+    if (!words) return std::nullopt;
+    std::optional<AddressTranslation> translated = TranslateTitleAddresses(*words, error);
+    if (!translated) {
+        error = path.string() + ": " + error;
+        return std::nullopt;
+    }
+    usesCodeBase = usesCodeBase || translated->usesCodeBase;
+    if (translated->unrecognizedHeapUses != 0) {
+        std::fprintf(stderr, "DIAG %s: %zu uses of the heap base the address pass does not rewrite (%zu rewritten)\n", path.filename().string().c_str(),
+                     translated->unrecognizedHeapUses, translated->rewritten);
+    }
+    return std::move(translated->words);
+}
+
 CompileOutcome CompileCompute(const VulkanDevice& device, VkPipelineCache cache, const ComputeJob& job, ComputePipeline* keep) {
     CompileOutcome outcome;
     outcome.name = job.name;
     std::error_code sizeError;
     outcome.bytes = std::filesystem::file_size(job.module, sizeError);
-    const std::optional<std::vector<std::uint32_t>> words = ReadSpirv(job.module, outcome.error);
+    bool usesCodeBase = false;
+    const std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(job.module, usesCodeBase, outcome.error);
     if (!words) {
         return outcome;
     }

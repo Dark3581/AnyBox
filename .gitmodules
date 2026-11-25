@@ -1,3 +1,6 @@
 [submodule "3rdparty/Vulkan-Headers"]
 	path = 3rdparty/Vulkan-Headers
 	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "3rdparty/zlib"]
+	path = 3rdparty/zlib
+	url = https://github.com/madler/zlib.git

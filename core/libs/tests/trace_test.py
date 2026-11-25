@@ -28,13 +28,13 @@ def main():
     shutil.rmtree(args.work, ignore_errors=True)
     args.work.mkdir(parents=True)
 
-    assert "XMemAlloc(" not in run(args.probe, args.libs, "xmem", None), "tracing is off by default"
-    assert "XMemAlloc(" not in run(args.probe, args.libs, "xmem", ""), "an empty list traces nothing"
-    assert "XMemAlloc(" not in run(args.probe, args.libs, "xmem", "d3d12_x"), "only the listed libraries are traced"
+    assert "XMemAllocDefault(" not in run(args.probe, args.libs, "xmem", None), "tracing is off by default"
+    assert "XMemAllocDefault(" not in run(args.probe, args.libs, "xmem", ""), "an empty list traces nothing"
+    assert "XMemAllocDefault(" not in run(args.probe, args.libs, "xmem", "d3d12_x"), "only the listed libraries are traced"
 
     traced = run(args.probe, args.libs, "xmem", "xmem")
-    assert "[xmem] XMemAlloc(100, 0x5e50000) -> " in traced, traced
-    assert "[xmem] XMemFree(" in traced and "[xmem] XMemVirtualQuery(" in traced, traced
+    assert "[xmem] XMemAllocDefault(100, 0x5e50000) -> " in traced, traced
+    assert "[xmem] XMemFreeDefault(" in traced and "[xmem] XMemVirtualQuery(" in traced, traced
     assert "[xmem] XMemGetWorkingSetStatistics(0x20000001, " in traced and ") -> 0" in traced, traced
 
     mixed = run(args.probe, args.libs, "rootsig", " gameinput , D3D12_X ")
