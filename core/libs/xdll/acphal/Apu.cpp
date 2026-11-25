@@ -45,6 +45,7 @@ namespace {
 constexpr std::size_t kShapeRequestCount = 0x10;
 constexpr std::size_t kShapeContextArray = 0x38;
 constexpr std::size_t kShapeContextBytes = 64;
+void* g_shapeContextsAllocated = nullptr;
 
 }
 
@@ -62,6 +63,7 @@ ABX_API HRESULT AcpHalAllocateShapeContexts(std::uint8_t* request) {
     void* contexts = count == 0 ? nullptr : VirtualAlloc(nullptr, static_cast<SIZE_T>(count) * kShapeContextBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (count != 0 && contexts == nullptr) return E_OUTOFMEMORY;
     std::memcpy(request + kShapeContextArray, &contexts, sizeof(contexts));
+    g_shapeContextsAllocated = contexts;
     AbxLog("acphal", "AcpHalAllocateShapeContexts: %u contexts of 64 bytes at %p; nothing processes them, so title audio decoded by the audio processor stays silent", count, contexts);
     return S_OK;
 }
@@ -144,5 +146,38 @@ AcpHal g_hal{kHalTable.data()};
 ABX_API HRESULT AcpHalCreate(void** hal) {
     if (hal == nullptr) return E_POINTER;
     *hal = &g_hal;
+    return S_OK;
+}
+
+namespace {
+
+constexpr std::uint32_t kApuAddressBase = 0x10000;
+
+}
+
+ABX_API bool ApuIsVirtualAddressValid(const void* address, std::uint32_t bytes) {
+    ApuHeap& heap = Heap();
+    const std::lock_guard guard(heap.lock);
+    const auto* at = static_cast<const std::uint8_t*>(address);
+    const std::uint64_t size = heap.firstBytes + heap.secondBytes;
+    return heap.base != nullptr && at >= heap.base && static_cast<std::uint64_t>(at - heap.base) <= size && bytes <= size - static_cast<std::uint64_t>(at - heap.base);
+}
+
+ABX_API std::uint32_t ApuMapVirtualAddress(const void* address) {
+    if (!ApuIsVirtualAddressValid(address, 1)) {
+        AbxUnsupported(__func__, "an address outside the audio heap");
+    }
+    return kApuAddressBase + static_cast<std::uint32_t>(static_cast<const std::uint8_t*>(address) - Heap().base);
+}
+
+ABX_API void* ApuMapApuAddress(std::uint32_t apuAddress) {
+    ApuHeap& heap = Heap();
+    if (heap.base == nullptr || apuAddress < kApuAddressBase || apuAddress - kApuAddressBase >= heap.firstBytes + heap.secondBytes) return nullptr;
+    return heap.base + (apuAddress - kApuAddressBase);
+}
+
+ABX_API HRESULT AcpHalReleaseShapeContexts() {
+    if (g_shapeContextsAllocated != nullptr) VirtualFree(g_shapeContextsAllocated, 0, MEM_RELEASE);
+    g_shapeContextsAllocated = nullptr;
     return S_OK;
 }

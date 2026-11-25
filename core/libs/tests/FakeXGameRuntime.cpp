@@ -28,7 +28,7 @@ __declspec(dllexport) HRESULT XAsyncRun(void*, void*) { return E_FAIL; }
 __declspec(dllexport) HRESULT XAsyncGetStatus(void*, bool) { return E_FAIL; }
 __declspec(dllexport) HRESULT XAsyncGetResultSize(void*, std::size_t*) { return E_FAIL; }
 __declspec(dllexport) HRESULT XAsyncGetResult(void*, const void*, std::size_t, void*, std::size_t*) { return E_FAIL; }
-__declspec(dllexport) HRESULT XUserAddAsync() { return E_FAIL; }
+__declspec(dllexport) HRESULT XUserGetState() { return E_FAIL; }
 __declspec(dllexport) std::uint32_t XSystemGetDeviceType() { return 0xffffffffu; }
 __declspec(dllexport) bool XPackageIsPackagedProcess() { return true; }
 __declspec(dllexport) HRESULT XGameRuntimeInitializeWithOptions(const void*) { return E_FAIL; }

@@ -115,7 +115,14 @@ Console shaders carry native GPU code and no DXIL, so `d3d12_x` cannot hand them
   - buffers and scalar loads: the shader adds the heap base to the console address it read, so a title's buffers and descriptor tables have to sit in one buffer-device-address range, below 4 GB for descriptor tables ([`vulkan/TitleBufferWindow.cpp`](../../core/libs/xdll/d3d12_x/vulkan/TitleBufferWindow.cpp)).
 - `anybox-pipeline-probe` drives each piece on the GPU (`selftest`, `validation`, `bindless`, `window`, `compile`); the `pso_probe` test program drives pipeline state descriptions through the store and the library.
 
-Not built yet, because they follow from a title's own calls: `D3D12XboxCreateDevice` and the device's methods (so nothing calls the pipeline state paths yet), command queues and lists, resources and descriptor heaps, mesh pipelines, presentation, and which allocations go to the buffer window. Each open point is in [debt/d3d12_x.md](debt/d3d12_x.md).
+Since the first title bring-up, the device's methods, command queues and lists, resources, descriptor heaps and presentation are built, and a title reaches its game world (see [Bring-up status](GAME_TESTING.md#bring-up-status)). Points added during that bring-up:
+
+- **Mesh pipelines**: a pipeline stream whose subobject 24 (amplification on the desktop) holds a shader the store lists as a mesh shader, with no subobject 25, is built as a mesh pipeline. A mesh stage reads its root words from s16 and the pixel stage from s8, so the mesh module's register reads are moved down by 8 when the pipeline is created ([`vulkan/UserDataRebase.cpp`](../../core/libs/xdll/d3d12_x/vulkan/UserDataRebase.cpp)). Mesh dispatches and indirect mesh dispatches are recorded as `vkCmdDrawMeshTasks*EXT`.
+- **Indirect argument check** ([`commands/IndirectClamp.cpp`](../../core/libs/xdll/d3d12_x/commands/IndirectClamp.cpp)): indirect dispatch and mesh dispatch records are copied and checked on the GPU first; a record over the device's group limits runs empty instead of hanging the GPU.
+- **Pipeline builds**: compute pipelines build in the background; graphics pipelines build in the background only when the pipeline cache already holds them, and otherwise when a draw first uses them, so loading does not wait behind pipelines the title may never draw with.
+- **Title textures**: textures in title memory are uploaded again when their memory changes; uploads are submitted without waiting for the GPU, and their staging memory is freed when the batch's fence signals.
+
+Each open point is in [debt/d3d12_x.md](debt/d3d12_x.md).
 
 ## Run report
 

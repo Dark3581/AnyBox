@@ -78,6 +78,8 @@ struct DeviceFunctions {
     PFN_vkCmdEndRendering cmdEndRendering = nullptr;
     PFN_vkCmdClearAttachments cmdClearAttachments = nullptr;
     PFN_vkCmdCopyBuffer cmdCopyBuffer = nullptr;
+    PFN_vkCmdFillBuffer cmdFillBuffer = nullptr;
+    PFN_vkCmdUpdateBuffer cmdUpdateBuffer = nullptr;
     PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage = nullptr;
     PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
     PFN_vkCmdCopyImage cmdCopyImage = nullptr;
@@ -98,6 +100,9 @@ struct DeviceFunctions {
     PFN_vkCmdDrawIndirectCount cmdDrawIndirectCount = nullptr;
     PFN_vkCmdDrawIndexedIndirectCount cmdDrawIndexedIndirectCount = nullptr;
     PFN_vkCmdDispatchIndirect cmdDispatchIndirect = nullptr;
+    PFN_vkCmdDrawMeshTasksEXT cmdDrawMeshTasks = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectEXT cmdDrawMeshTasksIndirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT cmdDrawMeshTasksIndirectCount = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
     PFN_vkCreateSemaphore createSemaphore = nullptr;
     PFN_vkDestroySemaphore destroySemaphore = nullptr;
@@ -108,6 +113,7 @@ struct DeviceFunctions {
     PFN_vkCreateFence createFence = nullptr;
     PFN_vkDestroyFence destroyFence = nullptr;
     PFN_vkWaitForFences waitForFences = nullptr;
+    PFN_vkGetFenceStatus getFenceStatus = nullptr;
     PFN_vkGetBufferDeviceAddress getBufferDeviceAddress = nullptr;
     PFN_vkQueueWaitIdle queueWaitIdle = nullptr;
 };
@@ -135,10 +141,26 @@ public:
     VkQueue Queue() const { return queue_; }
     bool BufferDeviceAddress() const { return bufferDeviceAddress_; }
     bool RectangleFill() const { return rectangleFill_; }
+    bool ConservativeRasterization() const { return conservative_; }
+    const std::uint32_t* MeshMaxGroups() const { return meshMaxGroups_; }
+    std::uint32_t MeshMaxTotal() const { return meshMaxTotal_; }
+    std::string FaultReport() const;
+    std::string CheckpointReport() const;
+    void Checkpoint(VkCommandBuffer commands, const char* marker) const;
+    bool Checkpoints() const { return checkpoints_; }
+    void SetFaultAddressDescriber(std::function<std::string(std::uint64_t)> describer) { faultDescriber_ = std::move(describer); }
     VkDeviceSize HostImportAlignment() const { return hostImportAlignment_; }
     PFN_vkGetMemoryHostPointerPropertiesEXT HostPointerProperties() const { return hostPointerProperties_; }
     std::optional<std::uint32_t> MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
+    std::optional<std::uint32_t> SystemMemoryType(std::uint32_t typeBits) const;
+    VkFormatFeatureFlags OptimalFeatures(VkFormat format) const;
     bool Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
+    struct PendingSubmit {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+    };
+    std::optional<PendingSubmit> SubmitWithoutWaiting(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
+    VkResult Finish(PendingSubmit& pending, bool wait) const;
     std::mutex& QueueLock() const { return queueLock_; }
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
     bool PreferenceMissed() const { return preferenceMissed_; }
@@ -178,13 +200,23 @@ private:
     VkPhysicalDeviceMemoryProperties memory_{};
     bool bufferDeviceAddress_ = false;
     VkDeviceSize hostImportAlignment_ = 0;
+    std::uint32_t meshMaxGroups_[3] = {};
+    std::uint32_t meshMaxTotal_ = 0;
     PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties_ = nullptr;
+    PFN_vkGetPhysicalDeviceFormatProperties formatProperties_ = nullptr;
     bool subgroupSizeControl_ = false;
     bool pipelineCacheControl_ = false;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     std::vector<std::string> enabled_;
     bool rectangleFill_ = false;
+    bool deviceFault_ = false;
+    bool conservative_ = false;
+    PFN_vkGetDeviceFaultInfoEXT faultInfo_ = nullptr;
+    bool checkpoints_ = false;
+    PFN_vkCmdSetCheckpointNV setCheckpoint_ = nullptr;
+    PFN_vkGetQueueCheckpointDataNV checkpointData_ = nullptr;
+    std::function<std::string(std::uint64_t)> faultDescriber_;
     std::vector<std::string> extensions_;
 };
 

@@ -223,6 +223,7 @@ std::optional<AddressTranslation> TranslateTitleAddresses(std::span<const std::u
     const std::uint32_t translate = emit.Id();
     AddressTranslation translated;
     translated.usesCodeBase = usesCodeBase;
+    std::set<std::size_t> rewrittenAt;
     std::vector<std::uint32_t>& out = module.Words();
     for (const Instruction* addition : additions) {
         const std::uint32_t type = module.Word(*addition, 1);
@@ -236,7 +237,21 @@ std::optional<AddressTranslation> TranslateTitleAddresses(std::span<const std::u
         out[addition->at + 3] = translate;
         out[addition->at + 4] = leftBase ? right : left;
         ++translated.rewritten;
+        rewrittenAt.insert(addition->at);
     }
+    std::size_t heapMemberChains = 0;
+    for (const Instruction& instruction : module.Instructions()) {
+        if (rewrittenAt.count(instruction.at) != 0) continue;
+        if (instruction.opcode == OpBitwiseOr && instruction.count > 2 && heapBases.count(words[instruction.at + 2]) != 0) continue;
+        if (instruction.opcode == OpAccessChain && instruction.count == 5 && words[instruction.at + 3] == pushVariable) {
+            const auto index = constants.find(words[instruction.at + 4]);
+            if (index != constants.end() && (index->second == kHeapBaseLowMember || index->second == kHeapBaseHighMember)) ++heapMemberChains;
+        }
+        for (std::uint32_t index = 1; index < instruction.count; ++index) {
+            if (heapBases.count(words[instruction.at + index]) != 0) ++translated.unrecognizedHeapUses;
+        }
+    }
+    if (heapBases.empty()) translated.unrecognizedHeapUses += heapMemberChains;
     if (translated.rewritten == 0) {
         translated.words.assign(words.begin(), words.end());
         return translated;

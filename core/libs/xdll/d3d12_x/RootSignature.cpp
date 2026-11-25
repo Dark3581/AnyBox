@@ -1,5 +1,7 @@
 #include "xdll/d3d12_x/d3d12_x.hpp"
 
+#include "RootSignatureLayout.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -68,6 +70,25 @@ ABX_API HRESULT D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED_ROOT_
         AbxUnsupported(__func__, "root signature version is neither 1.0 nor 1.1");
     }
     result = serialize(&desktop, blob, errorBlob);
+    const std::uint32_t heapIndexing = static_cast<std::uint32_t>(DesktopFlags(flags)) & abx::d3d12x::kHeapIndexingFlags;
+    if (result == E_INVALIDARG && heapIndexing != 0) {
+        const D3D12_ROOT_SIGNATURE_FLAGS stripped = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<std::uint32_t>(DesktopFlags(flags)) & ~abx::d3d12x::kHeapIndexingFlags);
+        if (desktop.Version == D3D_ROOT_SIGNATURE_VERSION_1_0) desktop.Desc_1_0.Flags = stripped;
+        else desktop.Desc_1_1.Flags = stripped;
+        if (errorBlob != nullptr && *errorBlob != nullptr) {
+            (*errorBlob)->Release();
+            *errorBlob = nullptr;
+        }
+        result = serialize(&desktop, blob, errorBlob);
+        if (SUCCEEDED(result) && blob != nullptr && *blob != nullptr) {
+            abx::d3d12x::RememberHeapIndexing((*blob)->GetBufferPointer(), (*blob)->GetBufferSize(), heapIndexing);
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                AbxLog("d3d12_x", "the host d3d12.dll refuses the heap-directly-indexed root signature flags 0x%x, so they are serialized without them and kept beside the blob", heapIndexing);
+            }
+        }
+    }
     AbxTrace("D3D12SerializeVersionedRootSignature(%p) version 0x%x, flags 0x%x -> 0x%x, result 0x%08lx", static_cast<const void*>(rootSignature),
              static_cast<unsigned>(desktop.Version), static_cast<unsigned>(flags), static_cast<unsigned>(DesktopFlags(flags)), static_cast<unsigned long>(result));
     return result;

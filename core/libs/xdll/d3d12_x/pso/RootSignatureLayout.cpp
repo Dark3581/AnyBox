@@ -1,5 +1,9 @@
 #include "RootSignatureLayout.hpp"
 
+#include <unordered_map>
+
+#include <mutex>
+
 namespace abx::d3d12x {
 
 namespace {
@@ -207,6 +211,40 @@ std::optional<RootSignatureLayout> BuildRootSignatureLayout(const D3D12_VERSIONE
         layout.staticSamplers.push_back({samplers[index], *translated});
     }
     return layout;
+}
+
+namespace {
+
+std::uint64_t BlobKey(const void* blob, std::size_t bytes) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto* data = static_cast<const std::uint8_t*>(blob);
+    for (std::size_t index = 0; index < bytes; ++index) hash = (hash ^ data[index]) * 0x100000001b3ull;
+    return hash ^ bytes;
+}
+
+std::mutex& HeapIndexingLock() {
+    static std::mutex lock;
+    return lock;
+}
+
+std::unordered_map<std::uint64_t, std::uint32_t>& HeapIndexingTable() {
+    static auto* table = new std::unordered_map<std::uint64_t, std::uint32_t>();
+    return *table;
+}
+
+}
+
+void RememberHeapIndexing(const void* blob, std::size_t bytes, std::uint32_t flags) {
+    if (blob == nullptr || bytes == 0) return;
+    const std::lock_guard guard(HeapIndexingLock());
+    HeapIndexingTable()[BlobKey(blob, bytes)] = flags & kHeapIndexingFlags;
+}
+
+std::uint32_t HeapIndexingOf(const void* blob, std::size_t bytes) {
+    if (blob == nullptr || bytes == 0) return 0;
+    const std::lock_guard guard(HeapIndexingLock());
+    const auto found = HeapIndexingTable().find(BlobKey(blob, bytes));
+    return found != HeapIndexingTable().end() ? found->second : 0;
 }
 
 std::optional<RootSignatureLayout> DeserializeRootSignature(const void* blob, std::size_t bytes, std::string& error) {

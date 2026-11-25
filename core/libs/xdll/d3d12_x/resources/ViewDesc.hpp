@@ -19,6 +19,7 @@ struct ImageView {
 std::optional<VkComponentMapping> ComponentMapping(UINT mapping, bool alphaOne);
 std::optional<ImageView> ShaderResourceView(const D3D12_RESOURCE_DESC& resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* view, std::string& error);
 std::optional<ImageView> UnorderedAccessView(const D3D12_RESOURCE_DESC& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* view, std::string& error);
+std::optional<ImageView> UnorderedAccessView(const TextureImage& image, const D3D12_RESOURCE_DESC& resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* view, std::string& error);
 std::optional<ImageView> RenderTargetView(const D3D12_RESOURCE_DESC& resource, const D3D12_RENDER_TARGET_VIEW_DESC* view, std::string& error);
 std::optional<ImageView> DepthStencilView(const D3D12_RESOURCE_DESC& resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* view, std::string& error);
 

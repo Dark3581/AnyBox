@@ -1,4 +1,7 @@
 #include "ConsoleObjects.hpp"
+#include "FrameDump.hpp"
+#include "LiveStats.hpp"
+#include "TitleTextures.hpp"
 
 #include "AbxApi.hpp"
 #include "CommandAllocator.hpp"
@@ -17,6 +20,8 @@
 #include <array>
 #include <cstring>
 #include <optional>
+#include <chrono>
+#include <cstdarg>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,10 +29,17 @@
 #include <vector>
 #include <string>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define ABX_CALLER _ReturnAddress()
+#else
+#define ABX_CALLER __builtin_return_address(0)
+#endif
+
 namespace abx::d3d12x::console {
 namespace {
 
-const TitleAddressSpace* g_addresses = nullptr;
+TitleAddressSpace* g_addresses = nullptr;
 
 
 std::atomic<UINT64> g_timestampFrequency{0};
@@ -38,31 +50,97 @@ struct Label {
     std::uint64_t value;
 };
 
+std::atomic<long long> g_traceUntil{0};
+std::atomic<int> g_traceLines{0};
+
+bool Tracing() {
+    const long long until = g_traceUntil.load();
+    if (until == 0) return false;
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now < until && g_traceLines.load() < 600;
+}
+
+void StartTracing() {
+    long long expected = 0;
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (g_traceUntil.compare_exchange_strong(expected, now + 30000)) AbxLog("d3d12_x", "WTRACE: tracing memory waits, labels and submissions for 30 s");
+}
+
+void TraceLine(const char* format, ...) {
+    if (!Tracing()) return;
+    ++g_traceLines;
+    char text[256];
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    AbxLog("d3d12_x", "WTRACE %s", text);
+}
+
+std::mutex g_writesLock;
+std::map<std::uint64_t, std::pair<std::uint64_t, const char*>> g_lastWrites;
+
+void NoteWrite(std::uint64_t address, std::uint64_t value, const char* how) {
+    const std::lock_guard guard(g_writesLock);
+    if (g_lastWrites.size() > 65536) g_lastWrites.clear();
+    g_lastWrites[address] = {value, how};
+}
+
 std::mutex g_labelLock;
 std::map<const CommandList*, std::vector<Label>> g_labels;
 
-void STDMETHODCALLTYPE ListWriteLabel(Facade* self, std::uint64_t* address, std::uint32_t stage, std::uint64_t value, std::uint32_t mode) {
-    if (address == nullptr || stage != 7 || mode != 1) {
-        AbxUnsupported("D3D12 command list slot 74", "arguments other than the measured (address, 7, value, 1)");
+struct MemoryWait {
+    const volatile std::uint64_t* address;
+    std::uint32_t comparison;
+    std::uint64_t value;
+    std::uint64_t mask = ~std::uint64_t{0};
+    bool narrow = false;
+};
+
+std::map<const CommandList*, std::vector<MemoryWait>> g_waits;
+
+bool ListWritesBefore(const CommandList* list, std::uint64_t address, std::uint64_t bytes) {
+    const auto found = g_labels.find(list);
+    if (found == g_labels.end()) return false;
+    for (const Label& label : found->second) {
+        const std::uint64_t at = reinterpret_cast<std::uintptr_t>(label.address);
+        if (at < address + bytes && address < at + sizeof(std::uint64_t)) return true;
     }
+    return false;
+}
+
+void ReportOrderedWait() {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "a memory wait on an address the same command list writes earlier is ordered by the list itself and is not checked on the CPU before submission (as xcl does)");
+    }
+}
+
+void STDMETHODCALLTYPE ListWait64(Facade* self, std::uint64_t* address, std::uint32_t comparison, std::uint64_t value, std::uint64_t flags) {
+    static_cast<void>(flags);
+    if (address == nullptr || comparison < D3D12_COMPARISON_FUNC_NEVER || comparison > D3D12_COMPARISON_FUNC_ALWAYS) {
+        AbxUnsupported("D3D12 command list slot 74 (Wait64BitValueX)", ("a null address or comparison " + std::to_string(comparison)).c_str());
+    }
+    if (comparison == D3D12_COMPARISON_FUNC_ALWAYS) return;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "command list slot 74 is Wait64BitValueX(address, comparison, value, flags): the list and what follows on its queue are held until the value is in memory or promised by a submitted label (first: comparison %u, value %llu)",
+               comparison, static_cast<unsigned long long>(value));
+    }
+    TraceLine("wait64 recorded list %p 0x%llx cmp %u value %llu", static_cast<const void*>(InnerOf<CommandList>(self)),
+              static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(address)), comparison, static_cast<unsigned long long>(value));
     const std::lock_guard guard(g_labelLock);
-    g_labels[InnerOf<CommandList>(self)].push_back({address, value});
+    if (ListWritesBefore(InnerOf<CommandList>(self), reinterpret_cast<std::uintptr_t>(address), 8)) {
+        ReportOrderedWait();
+        return;
+    }
+    g_waits[InnerOf<CommandList>(self)].push_back({address, comparison, value});
 }
 
 void ClearLabels(const CommandList* list) {
     const std::lock_guard guard(g_labelLock);
     g_labels.erase(list);
-}
-
-void WriteLabels(const CommandList* list) {
-    std::vector<Label> labels;
-    {
-        const std::lock_guard guard(g_labelLock);
-        const auto found = g_labels.find(list);
-        if (found == g_labels.end()) return;
-        labels = found->second;
-    }
-    for (const Label& label : labels) *label.address = label.value;
+    g_waits.erase(list);
 }
 
 HRESULT STDMETHODCALLTYPE ListClose(Facade* self) {
@@ -80,27 +158,165 @@ void STDMETHODCALLTYPE ListRecordedCommand(Facade*, std::uint32_t first, std::ui
     }
 }
 
+struct GpuPageEntry {
+    std::uint32_t operation;
+    std::uint32_t value;
+    std::uint32_t count;
+};
+static_assert(sizeof(GpuPageEntry) == 12);
+
 struct GpuPageRecord {
     std::uint64_t address;
-    std::uint32_t pages;
-    std::uint32_t unknown;
+    std::uint32_t entries;
+    std::uint32_t unused;
+    const GpuPageEntry* list;
 };
+static_assert(sizeof(GpuPageRecord) == 24);
 
-HRESULT STDMETHODCALLTYPE QueueUpdateGpuPages(Facade*, UINT count, const GpuPageRecord* records, const void* frames, UINT fifth, UINT sixth) {
+constexpr std::uint64_t kGpuPageBytes = 0x10000;
+
+std::mutex g_poolLock;
+std::map<const void*, std::pair<std::uint64_t, std::uint64_t>> g_pools;
+constexpr std::uint32_t kMapPoolPage = 1;
+constexpr std::uint32_t kMapPlaceholder = 2;
+
+using PhysicalPageView = void* (*)(std::uintptr_t);
+
+PhysicalPageView XmemExport(const char* name) {
+    const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+    return xmem != nullptr ? reinterpret_cast<PhysicalPageView>(reinterpret_cast<void*>(GetProcAddress(xmem, name))) : nullptr;
+}
+
+PhysicalPageView PageView() {
+    static const PhysicalPageView view = XmemExport("AbxXMemPhysicalPageView");
+    return view;
+}
+
+using MirrorPage = BOOL (*)(std::uintptr_t, std::uintptr_t);
+
+MirrorPage Mirror() {
+    static const MirrorPage mirror = [] {
+        const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+        return xmem != nullptr ? reinterpret_cast<MirrorPage>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemMirrorPhysicalPage"))) : nullptr;
+    }();
+    return mirror;
+}
+
+std::uintptr_t ZeroFrame() {
+    static const std::uintptr_t frame = [] {
+        using Allocate = BOOL (*)(std::uint64_t, std::uintptr_t*, std::uintptr_t*);
+        const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+        const auto allocate = xmem != nullptr ? reinterpret_cast<Allocate>(reinterpret_cast<void*>(GetProcAddress(xmem, "XMemAllocatePhysicalPages"))) : nullptr;
+        std::uintptr_t count = 1;
+        std::uintptr_t page = 0;
+        if (allocate == nullptr || !allocate(0, &count, &page)) return std::uintptr_t{0};
+        AbxLog("d3d12_x", "command queue slot 31 operation 2 maps one shared zero page (frame %llu) at the placeholder addresses, for the CPU and the GPU", static_cast<unsigned long long>(page));
+        return page;
+    }();
+    return frame;
+}
+
+PhysicalPageView ViewAt() {
+    static const PhysicalPageView view = XmemExport("AbxXMemPhysicalViewAt");
+    return view;
+}
+
+[[noreturn]] void RefuseGpuPages(const std::string& text) {
+    AbxUnsupported("D3D12 command queue slot 31 (GPU page mapping)", text.c_str());
+}
+
+HRESULT STDMETHODCALLTYPE QueueUpdateGpuPages(Facade*, UINT count, const GpuPageRecord* records, const void* pool, UINT poolPages, UINT sixth) {
     constexpr UINT kMaxRecords = 4096;
-    if (count > kMaxRecords || (count != 0 && records == nullptr)) AbxUnsupported("D3D12 command queue slot 31", "more than 4096 records or a null record array");
-    static std::atomic<bool> reported{false};
-    if (count != 0 && !reported.exchange(true)) {
-        AbxLog("d3d12_x", "command queue slot 31 updates GPU page mappings (%u records, first 0x%llx x %u pages, 0x%x; %p, 0x%x, 0x%x); AnyBox's page table already follows the CPU mappings",
-               count, static_cast<unsigned long long>(records[0].address), records[0].pages, records[0].unknown, frames, fifth, sixth);
+    constexpr std::uint32_t kMaxEntries = 65536;
+    if (count > kMaxRecords || (count != 0 && records == nullptr)) RefuseGpuPages("more than 4096 records or a null record array");
+    if (count == 0) return S_OK;
+    if (g_addresses == nullptr) RefuseGpuPages("GPU page mapping before the device's address space exists");
+    const PhysicalPageView view = PageView();
+    const PhysicalPageView viewAt = ViewAt();
+    if (view == nullptr || viewAt == nullptr) RefuseGpuPages("ab_xmem.dll has no AbxXMemPhysicalPageView / AbxXMemPhysicalViewAt export");
+    std::pair<std::uint64_t, std::uint64_t> poolRange{0, 0};
+    {
+        const std::lock_guard guard(g_poolLock);
+        const auto found = g_pools.find(pool);
+        if (found != g_pools.end()) poolRange = found->second;
+        for (const auto& [handle, range] : g_pools) {
+            if (poolRange.second == 0 && range.first == reinterpret_cast<std::uint64_t>(pool)) poolRange = range;
+        }
     }
-    for (UINT index = 0; index < count && g_addresses != nullptr; ++index) {
-        const std::uint64_t bytes = static_cast<std::uint64_t>(records[index].pages) * 0x10000;
-        if (bytes != 0 && !g_addresses->Contains(records[index].address, bytes)) {
-            static std::atomic<bool> missing{false};
-            if (!missing.exchange(true)) {
-                AbxLog("d3d12_x", "command queue slot 31: 0x%llx (%u pages) is not CPU-mapped GPU-visible memory, so shaders read zero there (later cases are not logged)",
-                       static_cast<unsigned long long>(records[index].address), records[index].pages);
+    if (poolRange.second != 0 && static_cast<std::uint64_t>(poolPages) * kGpuPageBytes != poolRange.second) {
+        char text[200];
+        std::snprintf(text, sizeof(text), "the fifth argument (%u) is not the page count of the pool at 0x%llx (%llu pages)", poolPages, static_cast<unsigned long long>(poolRange.first),
+                      static_cast<unsigned long long>(poolRange.second / kGpuPageBytes));
+        RefuseGpuPages(text);
+    }
+    if (sixth != 0) RefuseGpuPages("a sixth argument other than 0 (" + std::to_string(sixth) + ")");
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "command queue slot 31 maps the title's physical pages at GPU-only addresses: records {address, entries, 12-byte entries {operation, value, pages}}; operation 1 maps the page mapped at page `value` of the page pool the third argument names (its start, registered through device slot 74; the fifth argument is its page count, %u), operation 2 maps a shared zero page - layout read from the title's caller, every page checked against AnyBox's physical page windows",
+               poolPages);
+    }
+    for (UINT index = 0; index < count; ++index) {
+        const GpuPageRecord& record = records[index];
+        if (record.entries > kMaxEntries || (record.entries != 0 && record.list == nullptr)) RefuseGpuPages("a record with more than 65536 entries or no entry list");
+        std::uint64_t at = record.address;
+        for (std::uint32_t entry = 0; entry < record.entries; ++entry) {
+            const GpuPageEntry& page = record.list[entry];
+            if (page.count > kMaxEntries) RefuseGpuPages("an entry of more than 65536 pages");
+            for (std::uint32_t step = 0; step < page.count; ++step, at += kGpuPageBytes) {
+                void* source = nullptr;
+                std::uintptr_t frame = 0;
+                if (page.operation == kMapPoolPage) {
+                    const std::uint64_t poolOffset = static_cast<std::uint64_t>(page.value + step) * kGpuPageBytes;
+                    if (poolRange.second == 0 || poolOffset >= poolRange.second) {
+                        char text[200];
+                        std::snprintf(text, sizeof(text), "pool page %u of %s at GPU address 0x%llx", page.value + step, poolRange.second == 0 ? "a pool that device slot 74 did not register" : "past the end of its pool",
+                                      static_cast<unsigned long long>(at));
+                        RefuseGpuPages(text);
+                    }
+                    frame = static_cast<std::uintptr_t>(poolRange.first + poolOffset);
+                    source = viewAt(frame);
+                } else if (page.operation == kMapPlaceholder) {
+                    frame = ZeroFrame();
+                    if (frame == 0) RefuseGpuPages("no physical page could be allocated for the placeholder mapping");
+                    using MapFrame = BOOL (*)(std::uintptr_t, std::uintptr_t);
+                    static const MapFrame mapFrame = [] {
+                        const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+                        return xmem != nullptr ? reinterpret_cast<MapFrame>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemMapFrameAt"))) : nullptr;
+                    }();
+                    if (mapFrame != nullptr) mapFrame(static_cast<std::uintptr_t>(at), frame);
+                    source = view(frame);
+                } else {
+                    char text[200];
+                    std::snprintf(text, sizeof(text), "entry operation %u (value 0x%x, %u pages) at GPU address 0x%llx; only operations 1 and 2 are read from the title's caller", page.operation,
+                                  page.value, page.count, static_cast<unsigned long long>(at));
+                    RefuseGpuPages(text);
+                }
+                if (source == nullptr) {
+                    char text[240];
+                    std::snprintf(text, sizeof(text), "operation %u value 0x%x names 0x%llx for GPU address 0x%llx, which has no physical page mapped in AnyBox's windows (pool page) or is not a frame AnyBox issued (placeholder)",
+                                  page.operation, page.value + step, static_cast<unsigned long long>(frame), static_cast<unsigned long long>(at));
+                    RefuseGpuPages(text);
+                }
+                if (page.operation == kMapPoolPage) {
+                    const MirrorPage mirror = Mirror();
+                    const bool mirrored = mirror != nullptr && mirror(static_cast<std::uintptr_t>(at), frame) != FALSE;
+                    static std::atomic<int> failures{0};
+                    if (!mirrored && failures.fetch_add(1) < 6) {
+                        MEMORY_BASIC_INFORMATION region{};
+                        VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region));
+                        AbxLog("d3d12_x", "DIAG slot 31 pool page %u could not be mapped for the CPU at 0x%llx (pool page at 0x%llx): state 0x%lx protection 0x%lx type 0x%lx allocation base %p",
+                               page.value + step, static_cast<unsigned long long>(at), static_cast<unsigned long long>(frame), region.State, region.Protect, region.Type, region.AllocationBase);
+                    }
+                    static std::atomic<bool> reported{false};
+                    if (!reported.exchange(true)) {
+                        AbxLog("d3d12_x", "command queue slot 31 pool pages are also mapped for the CPU at their GPU address, as on the console (first 0x%llx: %s)", static_cast<unsigned long long>(at),
+                               mirrored ? "mapped" : "not inside an xmem physical window, GPU only");
+                    }
+                }
+                std::string error;
+                if (!g_addresses->AliasPhysical(at, kGpuPageBytes, reinterpret_cast<std::uint64_t>(source), error)) {
+                    RefuseGpuPages("aliasing a physical page at GPU address failed: " + error);
+                }
             }
         }
     }
@@ -123,21 +339,62 @@ void STDMETHODCALLTYPE QueueExecuteCommandLists(Facade* self, UINT count, void* 
     }
     AbxTrace("ExecuteCommandLists(%u lists, frame token %llu)", count, static_cast<unsigned long long>(frameToken));
     CommandQueue* queue = InnerOf<CommandQueue>(self);
-    queue->ExecuteCommandLists(count, inner);
-    bool labelled = false;
-    {
-        const std::lock_guard guard(g_labelLock);
-        for (UINT index = 0; index < count && !labelled; ++index) labelled = g_labels.count(static_cast<CommandList*>(inner[index])) != 0;
-    }
-    if (labelled) {
-        queue->Flush();
-        const VulkanDevice* device = g_vulkan.load();
-        std::string error;
-        if (device == nullptr || !device->Submit([](VkCommandBuffer) {}, error)) {
-            AbxUnsupported("D3D12 command queue slot 35", ("waiting for the GPU before writing labels failed: " + error).c_str());
+    if (Tracing()) {
+        std::string ids;
+        for (UINT index = 0; index < count; ++index) {
+            char one[24];
+            std::snprintf(one, sizeof(one), " %p", static_cast<void*>(inner[index]));
+            ids += one;
         }
-        for (UINT index = 0; index < count; ++index) WriteLabels(static_cast<CommandList*>(inner[index]));
+        TraceLine("execute queue %p thread %lu lists%s", static_cast<void*>(queue), GetCurrentThreadId(), ids.c_str());
     }
+    if (TitleTextures* textures = TitleTextures::Active()) textures->Flush();
+    std::vector<ID3D12CommandList*> segment;
+    std::vector<CommandQueue::MemoryWait> segmentWaits;
+    std::vector<CommandQueue::MemoryLabel> segmentLabels;
+    const auto submit = [&] {
+        if (segment.empty()) return;
+        queue->ExecuteOrdered(static_cast<UINT>(segment.size()), segment.data(), std::move(segmentWaits), std::move(segmentLabels));
+        segment.clear();
+        segmentWaits.clear();
+        segmentLabels.clear();
+    };
+    for (UINT index = 0; index < count; ++index) {
+        const CommandList* list = static_cast<CommandList*>(inner[index]);
+        std::vector<CommandQueue::MemoryWait> waits;
+        std::vector<CommandQueue::MemoryLabel> labels;
+        {
+            const std::lock_guard guard(g_labelLock);
+            if (const auto found = g_waits.find(list); found != g_waits.end()) {
+                for (const MemoryWait& wait : found->second) {
+                    const std::uint64_t at = reinterpret_cast<std::uintptr_t>(wait.address);
+                    bool ordered = false;
+                    for (const CommandQueue::MemoryLabel& label : segmentLabels) ordered = ordered || reinterpret_cast<std::uintptr_t>(label.address) == at;
+                    if (ordered) {
+                        ReportOrderedWait();
+                        continue;
+                    }
+                    const std::uint8_t* mapped = g_addresses != nullptr ? g_addresses->HostAt(at) : nullptr;
+                    CommandQueue::MemoryWait converted;
+                    converted.address = mapped != nullptr ? mapped : reinterpret_cast<const std::uint8_t*>(at);
+                    converted.titleAddress = at;
+                    converted.narrow = wait.narrow;
+                    converted.comparison = wait.comparison;
+                    converted.value = wait.value;
+                    converted.mask = wait.mask;
+                    waits.push_back(converted);
+                }
+            }
+            if (const auto found = g_labels.find(list); found != g_labels.end()) {
+                for (const Label& label : found->second) labels.push_back({label.address, label.value});
+            }
+        }
+        if (!waits.empty()) submit();
+        segment.push_back(inner[index]);
+        segmentWaits.insert(segmentWaits.end(), waits.begin(), waits.end());
+        segmentLabels.insert(segmentLabels.end(), labels.begin(), labels.end());
+    }
+    submit();
 }
 
 HRESULT STDMETHODCALLTYPE QueueSignal(Facade* self, void* fence, UINT64 value) {
@@ -157,20 +414,64 @@ HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std:
     std::memcpy(&resources, planes + kPlaneResources, sizeof(resources));
     Resource* image = resources != nullptr ? static_cast<Resource*>(FacadeInner(resources[0])) : nullptr;
     if (image == nullptr || image->IsBuffer()) AbxUnsupported("D3D12 command queue slot 32", "a present plane without a texture AnyBox handed out");
-    InnerOf<CommandQueue>(self)->Flush();
+    if (!InnerOf<CommandQueue>(self)->Drain(std::chrono::milliseconds(300))) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) AbxLog("d3d12_x", "a present was shown while its queue still held work waiting for a fence or a memory value for over 300 ms");
+    }
+    if (TracingFrame()) {
+        const D3D12_RESOURCE_DESC& traced = image->Texture().desc;
+        AbxLog("d3d12_x", "TRACE present %p %llux%u f%d (%u planes)", static_cast<void*>(image->Texture().image), static_cast<unsigned long long>(traced.Width), traced.Height,
+               static_cast<int>(traced.Format), planeCount);
+        if (const VulkanDevice* device = g_vulkan.load()) DumpTracedFrame(*device, image, Stats().presents.load());
+        DescriptorHeap::ReportForeignDescriptors();
+        if (TitleTextures* textures = TitleTextures::Active()) textures->Report();
+    }
+    ++Stats().presents;
+    StartLiveStats();
+    if (TitleTextures* textures = TitleTextures::Active()) textures->Refresh();
     const std::lock_guard guard(g_presentLock);
     std::string error;
+    static std::chrono::steady_clock::time_point failingSince{};
+    static std::uint64_t dropped = 0;
+    constexpr auto kGiveUp = std::chrono::seconds(120);
+    const auto failed = [&](const char* what) {
+        const auto now = std::chrono::steady_clock::now();
+        if (failingSince == std::chrono::steady_clock::time_point{}) {
+            failingSince = now;
+            AbxLog("d3d12_x", "%s: %s; frames are not shown until the window's surface can be presented to again (display off, locked or changed), retried every frame for 120 s", what,
+                   error.c_str());
+        }
+        ++dropped;
+        g_presenter.reset();
+        if (const VulkanDevice* probe = g_vulkan.load()) {
+            std::string lost;
+            if (!probe->Submit([](VkCommandBuffer) {}, lost)) AbxUnsupported("D3D12 command queue slot 32", (std::string(what) + " and the GPU no longer accepts work: " + lost).c_str());
+        }
+        if (now - failingSince > kGiveUp) AbxUnsupported("D3D12 command queue slot 32", (std::string(what) + " for 120 s: " + error).c_str());
+    };
     if (!g_presenter) {
         const VulkanDevice* device = g_vulkan.load();
         const HWND window = FindProcessWindow();
         if (device == nullptr || window == nullptr) AbxUnsupported("D3D12 command queue slot 32", "presenting before the title's window or the Vulkan device exists");
         g_presenter = Presenter::Create(*device, window, error);
-        if (!g_presenter) AbxUnsupported("D3D12 command queue slot 32", ("the swapchain could not be created: " + error).c_str());
-        AbxLog("d3d12_x", "presenting to the title's window (%u plane(s); only the first is shown)", planeCount);
+        if (!g_presenter) {
+            if (failingSince == std::chrono::steady_clock::time_point{}) AbxUnsupported("D3D12 command queue slot 32", ("the swapchain could not be created: " + error).c_str());
+            failed("the swapchain could not be created again");
+            Sleep(16);
+            return S_OK;
+        }
+        if (failingSince == std::chrono::steady_clock::time_point{}) AbxLog("d3d12_x", "presenting to the title's window (%u plane(s); only the first is shown)", planeCount);
     }
     const D3D12_RESOURCE_DESC& desc = image->Texture().desc;
     if (!g_presenter->Present(image->Texture().image, {static_cast<std::uint32_t>(desc.Width), desc.Height}, VK_IMAGE_LAYOUT_GENERAL, error)) {
-        AbxUnsupported("D3D12 command queue slot 32", ("presenting failed: " + error).c_str());
+        failed("presenting failed");
+        Sleep(16);
+        return S_OK;
+    }
+    if (failingSince != std::chrono::steady_clock::time_point{}) {
+        AbxLog("d3d12_x", "presenting works again after %llu frames that were not shown", static_cast<unsigned long long>(dropped));
+        failingSince = {};
+        dropped = 0;
     }
     return S_OK;
 }
@@ -226,13 +527,24 @@ void STDMETHODCALLTYPE ListWriteValue(Facade*, std::uint32_t* address, std::uint
         AbxLog("d3d12_x", "command list slot 71 writes a 32-bit marker to title memory: AnyBox writes it when it is recorded, before the GPU would reach it");
     }
     *address = value;
+    NoteWrite(reinterpret_cast<std::uintptr_t>(address), value, "a 32-bit marker (slot 71)");
 }
 
 
 
-void STDMETHODCALLTYPE ListWriteTimestamp(Facade*, std::uint64_t* address, std::uint64_t second, std::uint64_t third, std::uint32_t mode) {
-    if (address == nullptr || second != 0 || third != 0 || mode != 1) {
-        AbxUnsupported("D3D12 command list slot 72", "arguments other than the measured (address, 0, 0, 1)");
+void STDMETHODCALLTYPE ListWriteTimestamp(Facade* self, std::uint64_t* address, std::uint64_t value, std::uint64_t flush, std::uint32_t mode) {
+    static_cast<void>(flush);
+    if (address == nullptr) AbxUnsupported("D3D12 command list slot 72 (Write64BitValueBottomOfPipeX)", "a null address");
+    if ((mode & 3u) == 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "command list slot 72 is Write64BitValueBottomOfPipeX(address, value, flush, flags): values are written after the list's GPU work completes, timestamps (flags & 3) when recorded");
+        }
+        TraceLine("label recorded list %p 0x%llx value %llu flags 0x%x", static_cast<const void*>(InnerOf<CommandList>(self)),
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(address)), static_cast<unsigned long long>(value), mode);
+        const std::lock_guard guard(g_labelLock);
+        g_labels[InnerOf<CommandList>(self)].push_back({address, value});
+        return;
     }
     const UINT64 frequency = g_timestampFrequency.load();
     LARGE_INTEGER now{};
@@ -248,6 +560,7 @@ void STDMETHODCALLTYPE ListWriteTimestamp(Facade*, std::uint64_t* address, std::
     }
     const long double seconds = static_cast<long double>(now.QuadPart) / static_cast<long double>(ticks.QuadPart);
     *address = static_cast<std::uint64_t>(seconds * static_cast<long double>(frequency));
+    NoteWrite(reinterpret_cast<std::uintptr_t>(address), *address, "a timestamp (slot 72)");
 }
 
 std::optional<D3D12_RESOURCE_STATES> StateOfLayout(D3D12_BARRIER_LAYOUT layout) {
@@ -328,7 +641,7 @@ void STDMETHODCALLTYPE ListBarrier(Facade* self, UINT groupCount, const D3D12_BA
                 continue;
             }
             const D3D12_RESOURCE_DESC& desc = resource->Texture().desc;
-            const UINT mips = resource->Texture().layout.info.mipLevels;
+            const UINT mips = resource->Texture().layout.info.mipLevels + resource->SkippedMips();
             const UINT layers = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
             const UINT planes = (std::max)(range.NumPlanes, 1u);
             for (UINT plane = range.FirstPlane; plane < range.FirstPlane + planes; ++plane) {
@@ -342,6 +655,27 @@ void STDMETHODCALLTYPE ListBarrier(Facade* self, UINT groupCount, const D3D12_BA
         }
     }
     if (!barriers.empty()) InnerOf<CommandList>(self)->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+}
+
+ID3D12Resource* ResourceArgument(void* resource, const char* function);
+
+void STDMETHODCALLTYPE ListResourceBarrierConsole(Facade* self, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+    const char* function = "D3D12 command list slot 26 (ResourceBarrier)";
+    if (count == 0) return;
+    if (barriers == nullptr) AbxUnsupported(function, "barriers without a barrier array");
+    std::vector<D3D12_RESOURCE_BARRIER> inner(barriers, barriers + count);
+    for (D3D12_RESOURCE_BARRIER& barrier : inner) {
+        switch (barrier.Type) {
+        case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: barrier.Transition.pResource = ResourceArgument(barrier.Transition.pResource, function); break;
+        case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
+            barrier.Aliasing.pResourceBefore = ResourceArgument(barrier.Aliasing.pResourceBefore, function);
+            barrier.Aliasing.pResourceAfter = ResourceArgument(barrier.Aliasing.pResourceAfter, function);
+            break;
+        case D3D12_RESOURCE_BARRIER_TYPE_UAV: barrier.UAV.pResource = ResourceArgument(barrier.UAV.pResource, function); break;
+        default: AbxUnsupported(function, ("barrier type " + std::to_string(static_cast<int>(barrier.Type))).c_str());
+        }
+    }
+    InnerOf<CommandList>(self)->ResourceBarrier(count, inner.data());
 }
 
 void STDMETHODCALLTYPE ListSetPipelineState(Facade* self, void* pipeline) {
@@ -362,6 +696,34 @@ ID3D12Resource* ResourceArgument(void* resource, const char* function) {
     return inner;
 }
 
+void STDMETHODCALLTYPE ListCopyMemoryToMemory(Facade* self, std::uint64_t destination, std::uint64_t source, std::uint64_t bytes, std::uint32_t flags) {
+    static_cast<void>(flags);
+    InnerOf<CommandList>(self)->CopyMemoryToMemory(destination, source, bytes, "D3D12 command list slot 62 (CopyMemoryToMemoryX)");
+}
+
+template <typename Value>
+void FillPattern(Facade* self, std::uint64_t destination, std::uint64_t bytes, Value value, const char* function) {
+    std::uint8_t pattern[16];
+    for (std::size_t index = 0; index < sizeof(pattern); index += sizeof(Value)) std::memcpy(pattern + index, &value, sizeof(Value));
+    InnerOf<CommandList>(self)->FillTitleMemory(destination, bytes, pattern, sizeof(Value), function);
+}
+
+void STDMETHODCALLTYPE ListFill32(Facade* self, std::uint64_t destination, std::uint64_t bytes, std::uint32_t value) {
+    FillPattern(self, destination, bytes, value, "D3D12 command list slot 63 (FillMemoryWith32BitValueX)");
+}
+
+void STDMETHODCALLTYPE ListFill64(Facade* self, std::uint64_t destination, std::uint64_t bytes, std::uint64_t value) {
+    FillPattern(self, destination, bytes, value, "D3D12 command list slot 64 (FillMemoryWith64BitValueX)");
+}
+
+void STDMETHODCALLTYPE ListFill128(Facade* self, std::uint64_t destination, std::uint64_t bytes, const std::uint8_t* value) {
+    const char* function = "D3D12 command list slot 65 (FillMemoryWith128BitValueX)";
+    if (value == nullptr) AbxUnsupported(function, "a null value");
+    std::uint8_t pattern[16];
+    std::memcpy(pattern, value, sizeof(pattern));
+    InnerOf<CommandList>(self)->FillTitleMemory(destination, bytes, pattern, 16, function);
+}
+
 void STDMETHODCALLTYPE ListCopyBufferRegion(Facade* self, void* destination, UINT64 destinationOffset, void* source, UINT64 sourceOffset, UINT64 bytes) {
     const char* function = "D3D12 command list slot 15";
     InnerOf<CommandList>(self)->CopyBufferRegion(ResourceArgument(destination, function), destinationOffset, ResourceArgument(source, function), sourceOffset, bytes);
@@ -375,7 +737,31 @@ void STDMETHODCALLTYPE ListCopyTextureRegion(Facade* self, const D3D12_TEXTURE_C
     D3D12_TEXTURE_COPY_LOCATION from = *source;
     to.pResource = ResourceArgument(to.pResource, function);
     from.pResource = ResourceArgument(from.pResource, function);
+    const auto remap = [](D3D12_TEXTURE_COPY_LOCATION& location) {
+        auto* resource = dynamic_cast<Resource*>(location.pResource);
+        if (resource == nullptr || location.Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX || resource->SkippedMips() == 0) return true;
+        const UINT skip = resource->SkippedMips();
+        const UINT kept = resource->Texture().desc.MipLevels;
+        const UINT original = kept + skip;
+        const UINT mip = location.SubresourceIndex % original;
+        const UINT slice = location.SubresourceIndex / original;
+        if (mip < skip) return false;
+        location.SubresourceIndex = (mip - skip) + slice * kept;
+        return true;
+    };
+    if (!remap(to) || !remap(from)) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) AbxLog("d3d12_x", "copies into the top mips of title textures stored without them (texture memory reduction) are dropped");
+        return;
+    }
     InnerOf<CommandList>(self)->CopyTextureRegion(&to, x, y, z, &from, box);
+}
+
+void STDMETHODCALLTYPE ListCopyTextureRegionX(Facade* self, const D3D12_TEXTURE_COPY_LOCATION* destination, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* source,
+                                              const D3D12_BOX* box, UINT flags) {
+    static std::atomic<bool> reported{false};
+    if (flags != 0 && !reported.exchange(true)) AbxLog("d3d12_x", "command list slot 85 (CopyTextureRegionX) copy flags 0x%x are recorded and not applied", flags);
+    ListCopyTextureRegion(self, destination, x, y, z, source, box);
 }
 
 void STDMETHODCALLTYPE ListCopyResource(Facade* self, void* destination, void* source) {
@@ -402,6 +788,166 @@ void STDMETHODCALLTYPE ListSetGraphicsRootSignature(Facade* self, void* signatur
 
 void STDMETHODCALLTYPE ListSetPrimitiveTopology(Facade* self, D3D12_PRIMITIVE_TOPOLOGY topology) {
     InnerOf<CommandList>(self)->IASetPrimitiveTopology(topology);
+}
+
+void STDMETHODCALLTYPE ListExecuteIndirect(Facade* self, void* signature, UINT maxCount, void* arguments, UINT64 argumentOffset, void* count, UINT64 countOffset) {
+    const char* function = "D3D12 command list slot 61 (ExecuteIndirect)";
+    auto* inner = dynamic_cast<ID3D12CommandSignature*>(FacadeInner(signature));
+    if (inner == nullptr) AbxUnsupported(function, "a command signature that AnyBox did not hand out");
+    InnerOf<CommandList>(self)->ExecuteIndirect(inner, maxCount, ResourceArgument(arguments, function), argumentOffset, count != nullptr ? ResourceArgument(count, function) : nullptr, countOffset);
+}
+
+void STDMETHODCALLTYPE ListCopyResourceX(Facade* self, void* destination, void* source, UINT flags) {
+    const char* function = "D3D12 command list slot 86 (CopyResourceX)";
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) AbxLog("d3d12_x", "command list slot 86 is CopyResourceX(destination, source, flags): in place it is a console compression operation (nothing to do); flags 0x%x recorded", flags);
+    if (destination == source) return;
+    InnerOf<CommandList>(self)->CopyResource(ResourceArgument(destination, function), ResourceArgument(source, function));
+}
+
+template <typename Value>
+void WriteTitleValue(std::uint64_t address, Value value) {
+    const std::uint8_t* mapped = g_addresses != nullptr ? g_addresses->HostAt(address) : nullptr;
+    auto* target = mapped != nullptr ? reinterpret_cast<volatile Value*>(const_cast<std::uint8_t*>(mapped)) : reinterpret_cast<volatile Value*>(address);
+    *target = value;
+    NoteWrite(address, value, "a record-time write (slots 90-92)");
+}
+
+void ReportSlotOnce(std::atomic<bool>& reported, const char* text) {
+    if (!reported.exchange(true)) AbxLog("d3d12_x", "%s", text);
+}
+
+void STDMETHODCALLTYPE ListDrawIndexedX(Facade* self, std::uint64_t address, DXGI_FORMAT format, UINT count, UINT flags) {
+    static_cast<void>(flags);
+    static std::atomic<bool> reported{false};
+    ReportSlotOnce(reported, "command list slot 83 is DrawIndexedX(index address, index format, index count, flags): one instance of that many indices, the bound index buffer kept");
+    InnerOf<CommandList>(self)->DrawIndexedAt(address, format, count, "D3D12 command list slot 83 (DrawIndexedX)");
+}
+
+void STDMETHODCALLTYPE ListSetPredicationBufferX(Facade*, const std::uint64_t* desc) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "command list slot 87 is SetPredicationBufferX({address, operation}*): predication is not applied, so predicated work always runs (first: %s)",
+               desc == nullptr ? "cleared" : "set");
+    }
+}
+
+void STDMETHODCALLTYPE ListKickoffX(Facade*) {
+    static std::atomic<bool> reported{false};
+    ReportSlotOnce(reported, "command list slot 95 is KickoffX(): the work recorded so far runs when the list is executed, not earlier");
+}
+
+ID3D12QueryHeap* QueryHeapArgument(void* heap, const char* function) {
+    if (heap == nullptr) AbxUnsupported(function, "a null query heap");
+    auto* inner = dynamic_cast<ID3D12QueryHeap*>(static_cast<IUnknown*>(FacadeInner(heap)));
+    if (inner == nullptr) AbxUnsupported(function, "a query heap argument that AnyBox did not hand out");
+    return inner;
+}
+
+void STDMETHODCALLTYPE ListBeginQuery(Facade* self, void* heap, D3D12_QUERY_TYPE type, UINT index) {
+    InnerOf<CommandList>(self)->BeginQuery(QueryHeapArgument(heap, "D3D12 command list slot 28 (BeginQuery)"), type, index);
+}
+
+void STDMETHODCALLTYPE ListEndQuery(Facade* self, void* heap, D3D12_QUERY_TYPE type, UINT index) {
+    InnerOf<CommandList>(self)->EndQuery(QueryHeapArgument(heap, "D3D12 command list slot 29 (EndQuery)"), type, index);
+}
+
+void STDMETHODCALLTYPE ListResolveQueryData(Facade* self, void* heap, D3D12_QUERY_TYPE type, UINT start, UINT count, void* destination, UINT64 offset) {
+    const char* function = "D3D12 command list slot 30 (ResolveQueryData)";
+    InnerOf<CommandList>(self)->ResolveQueryData(QueryHeapArgument(heap, function), type, start, count, ResourceArgument(destination, function), offset);
+}
+
+void STDMETHODCALLTYPE ListSetPredication(Facade* self, void* buffer, UINT64 offset, D3D12_PREDICATION_OP operation) {
+    InnerOf<CommandList>(self)->SetPredication(ResourceArgument(buffer, "D3D12 command list slot 31 (SetPredication)"), offset, operation);
+}
+
+void* STDMETHODCALLTYPE ListAllocateTransient(Facade* self, UINT bytes, UINT alignment) {
+    return InnerOf<CommandList>(self)->AllocateTransient(bytes, alignment, "D3D12 command list slot 148 (transient memory)");
+}
+
+void STDMETHODCALLTYPE ListDispatchX(Facade* self, UINT x, UINT y, UINT z, UINT flags) {
+    static std::atomic<bool> reported{false};
+    ReportSlotOnce(reported, "command list slot 80 is DispatchX(x, y, z, flags): a Dispatch, the flags recorded");
+    static_cast<void>(flags);
+    InnerOf<CommandList>(self)->Dispatch(x, y, z);
+}
+
+void STDMETHODCALLTYPE ListWrite32Top(Facade*, std::uint32_t* address, std::uint32_t value, std::uint32_t flags) {
+    static_cast<void>(flags);
+    if (address == nullptr) AbxUnsupported("D3D12 command list slot 90 (Write32BitValueTopOfPipeX)", "a null address");
+    static std::atomic<bool> reported{false};
+    ReportSlotOnce(reported, "command list slots 90/91/92 (32/64-bit top-of-pipe and bottom-of-shader writes) are written when recorded");
+    WriteTitleValue<std::uint32_t>(reinterpret_cast<std::uintptr_t>(address), value);
+}
+
+void STDMETHODCALLTYPE ListWrite64Top(Facade*, std::uint64_t* address, std::uint64_t value, std::uint32_t flags) {
+    if (address == nullptr) AbxUnsupported("D3D12 command list slot 91 (Write64BitValueTopOfPipeX)", "a null address");
+    if ((flags & 0xCu) != 0) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        value = static_cast<std::uint64_t>(now.QuadPart);
+    }
+    WriteTitleValue<std::uint64_t>(reinterpret_cast<std::uintptr_t>(address), value);
+}
+
+void STDMETHODCALLTYPE ListWrite32BottomOfShader(Facade*, std::uint32_t* address, std::uint32_t value, std::uint32_t stage) {
+    static_cast<void>(stage);
+    if (address == nullptr) AbxUnsupported("D3D12 command list slot 92 (Write32BitValueBottomOfShaderX)", "a null address");
+    WriteTitleValue<std::uint32_t>(reinterpret_cast<std::uintptr_t>(address), value);
+}
+
+void STDMETHODCALLTYPE ListWait32(Facade* self, std::uint32_t* address, std::uint32_t comparison, std::uint32_t value, std::uint32_t mask, std::uint32_t flags) {
+    static_cast<void>(flags);
+    if (address == nullptr || comparison < D3D12_COMPARISON_FUNC_NEVER || comparison > D3D12_COMPARISON_FUNC_ALWAYS) {
+        AbxUnsupported("D3D12 command list slot 73 (Wait32BitValueX)", ("a null address or comparison " + std::to_string(comparison)).c_str());
+    }
+    if (comparison == D3D12_COMPARISON_FUNC_ALWAYS) return;
+    static std::atomic<bool> reported{false};
+    ReportSlotOnce(reported, "command list slot 73 is Wait32BitValueX(address, comparison, value, mask, flags): held like a 64-bit wait until the masked value is there or promised");
+    const std::lock_guard guard(g_labelLock);
+    if (ListWritesBefore(InnerOf<CommandList>(self), reinterpret_cast<std::uintptr_t>(address), 4)) {
+        ReportOrderedWait();
+        return;
+    }
+    g_waits[InnerOf<CommandList>(self)].push_back({reinterpret_cast<const volatile std::uint64_t*>(address), comparison, value, mask, true});
+}
+
+void STDMETHODCALLTYPE ListDepthBiasX(Facade*, FLOAT bias, FLOAT clamp, FLOAT slope) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "command list slot 96 is RSSetDepthBiasX(%f, %f, %f): recorded, not applied (pipelines keep their own depth bias)", bias, clamp, slope);
+    }
+}
+
+void STDMETHODCALLTYPE ListToggle101(Facade*, UINT kind, UINT enable) {
+    static std::atomic<std::uint32_t> seen{0};
+    const std::uint32_t bit = 1u << ((kind & 15u) * 2 + (enable != 0 ? 1u : 0u));
+    if ((seen.fetch_or(bit) & bit) == 0) {
+        AbxLog("d3d12_x", "command list slot 101 (%u, %u): a begin/end toggle the title brackets clears with (game+0x50a6651/0x50a666a); recorded, not applied", kind, enable);
+    }
+}
+
+void STDMETHODCALLTYPE ListDispatchMesh(Facade* self, UINT x, UINT y, UINT z) {
+    const char* function = "D3D12 command list slot 129 (taken as DispatchMesh)";
+    const PipelineStateObject* pipeline = InnerOf<CommandList>(self)->Pipeline();
+    bool anyStage = false;
+    for (const char* stage : {"vs", "hs", "ds", "gs", "ps", "cs", "as", "ms"}) anyStage = anyStage || (pipeline != nullptr && pipeline->HasStage(stage));
+    const bool unbuiltMesh = pipeline != nullptr && pipeline->BindPoint() == VK_PIPELINE_BIND_POINT_GRAPHICS && pipeline->Pipeline() == VK_NULL_HANDLE && !anyStage;
+    if (pipeline == nullptr || (!pipeline->HasStage("ms") && !unbuiltMesh)) {
+        HMODULE caller = nullptr;
+        void* const returnAddress = ABX_CALLER;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(returnAddress), &caller);
+        std::string stages;
+        for (const char* stage : {"vs", "hs", "ds", "gs", "ps", "cs", "as", "ms"}) {
+            if (pipeline != nullptr && pipeline->HasStage(stage)) stages += std::string(" ") + stage;
+        }
+        char text[320];
+        std::snprintf(text, sizeof(text), "arguments (%u, %u, %u) with %s bound (bind point %d, stages:%s), called from module+0x%llx: slot 129 is read as DispatchMesh only when a mesh pipeline is bound",
+                      x, y, z, pipeline == nullptr ? "no pipeline" : "a pipeline without a mesh stage", pipeline != nullptr ? static_cast<int>(pipeline->BindPoint()) : -1,
+                      stages.empty() ? " none" : stages.c_str(), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(returnAddress) - reinterpret_cast<std::uintptr_t>(caller)));
+        AbxUnsupported(function, text);
+    }
+    InnerOf<CommandList>(self)->DispatchMesh(x, y, z);
 }
 
 void STDMETHODCALLTYPE ListSetShadingRate(Facade*, D3D12_SHADING_RATE rate, const D3D12_SHADING_RATE_COMBINER* combiners) {
@@ -552,6 +1098,7 @@ const FacadeType& TypeOf(Kind kind) {
         Map(type, 23, &ListForward<&CommandList::OMSetBlendFactor, const FLOAT*>);
         Map(type, 24, &ListForward<&CommandList::OMSetStencilRef, UINT>);
         Map(type, 25, &ListSetPipelineState);
+        Map(type, 26, &ListResourceBarrierConsole);
         Map(type, 32, &ListSetDescriptorHeaps);
         Map(type, 33, &ListSetComputeRootSignature);
         Map(type, 34, &ListSetGraphicsRootSignature);
@@ -573,14 +1120,37 @@ const FacadeType& TypeOf(Kind kind) {
         Map(type, 50, &ListForward<&CommandList::OMSetRenderTargets, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*>);
         Map(type, 51, &ListForward<&CommandList::ClearDepthStencilView, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*>);
         Map(type, 52, &ListClearRenderTargetView);
+        Map(type, 62, &ListCopyMemoryToMemory);
         Map(type, 70, &ListSetDepthBounds);
         Map(type, 71, &ListWriteValue);
         Map(type, 72, &ListWriteTimestamp);
-        Map(type, 74, &ListWriteLabel);
+        Map(type, 74, &ListWait64);
         Map(type, 139, &ListReset);
         Map(type, 142, &ListSetCoverageMask);
+        Map(type, 148, &ListAllocateTransient);
         Map(type, 146, &ListBarrier);
         Map(type, 126, &ListSetShadingRate);
+        Map(type, 129, &ListDispatchMesh);
+        Map(type, 85, &ListCopyTextureRegionX);
+        Map(type, 101, &ListToggle101);
+        Map(type, 61, &ListExecuteIndirect);
+        Map(type, 86, &ListCopyResourceX);
+        Map(type, 80, &ListDispatchX);
+        Map(type, 28, &ListBeginQuery);
+        Map(type, 29, &ListEndQuery);
+        Map(type, 30, &ListResolveQueryData);
+        Map(type, 31, &ListSetPredication);
+        Map(type, 83, &ListDrawIndexedX);
+        Map(type, 87, &ListSetPredicationBufferX);
+        Map(type, 95, &ListKickoffX);
+        Map(type, 63, &ListFill32);
+        Map(type, 64, &ListFill64);
+        Map(type, 65, &ListFill128);
+        Map(type, 90, &ListWrite32Top);
+        Map(type, 91, &ListWrite64Top);
+        Map(type, 92, &ListWrite32BottomOfShader);
+        Map(type, 73, &ListWait32);
+        Map(type, 96, &ListDepthBiasX);
         Map(type, 75, &ListRecordedCommand<75>);
         Map(type, 131, &ListRecordedCommand<131>);
         Map(type, 132, &ListRecordedCommand<132>);
@@ -629,7 +1199,16 @@ const FacadeType& TypeOf(Kind kind) {
 
 }
 
-void SetAddressSpace(const TitleAddressSpace* addresses) {
+const TitleAddressSpace* AddressSpace() {
+    return g_addresses;
+}
+
+void RegisterPagePool(const void* handle, std::uint64_t start, std::uint64_t bytes) {
+    const std::lock_guard guard(g_poolLock);
+    g_pools[handle] = {start, bytes};
+}
+
+void SetAddressSpace(TitleAddressSpace* addresses) {
     g_addresses = addresses;
 }
 
@@ -658,4 +1237,9 @@ HRESULT Deliver(Kind kind, IUnknown* inner, REFIID riid, void** object) {
     return S_OK;
 }
 
+}
+
+ABX_API const void* AbxD3D12TitleHostView(std::uint64_t address) {
+    const abx::d3d12x::TitleAddressSpace* addresses = abx::d3d12x::console::AddressSpace();
+    return addresses != nullptr ? addresses->HostAt(address) : nullptr;
 }

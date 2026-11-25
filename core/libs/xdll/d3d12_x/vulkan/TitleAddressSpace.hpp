@@ -28,13 +28,20 @@ public:
     bool Import(std::uint64_t start, std::uint64_t bytes, std::string& error);
     bool MapDevice(std::uint64_t start, std::uint64_t bytes, VkDeviceAddress device, VkBuffer buffer, std::string& error);
     void Release(std::uint64_t start, std::uint64_t bytes);
+    void AddBacking(std::uint64_t view, std::uint64_t bytes);
+    void RemoveBacking(std::uint64_t view, std::uint64_t bytes);
+    bool AliasPhysical(std::uint64_t start, std::uint64_t bytes, std::uint64_t source, std::string& error);
+    const std::uint8_t* HostAt(std::uint64_t address) const;
     bool Contains(std::uint64_t address, std::uint64_t bytes) const;
     struct Location {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
     };
     std::optional<Location> Locate(std::uint64_t address, std::uint64_t bytes) const;
+    std::optional<Location> LocateRun(std::uint64_t address, std::uint64_t& available) const;
     std::uint64_t ImportedBytes() const;
+    std::string DescribeDeviceAddress(std::uint64_t device) const;
+    std::string DescribeTitleAddress(std::uint64_t address) const;
     std::optional<std::uint64_t> AliasBelow4GiB(std::uint64_t start, std::uint64_t bytes, std::string& error);
     void ReleaseAlias(std::uint64_t alias);
 
@@ -53,10 +60,14 @@ private:
         VkDeviceSize bufferOffset = 0;
     };
 
+    std::map<std::uint64_t, std::uint64_t> hostPages_;
     explicit TitleAddressSpace(const VulkanDevice& device) : device_(device) {}
     bool Initialize(std::string& error);
     bool CreateTable(std::uint64_t bytes, Allocation& table, std::string& error);
     bool ImportLocked(std::uint64_t start, std::uint64_t bytes, std::string& error);
+    bool ImportHost(std::uint64_t start, std::uint64_t bytes, Allocation& imported, std::string& error);
+    std::map<std::uint64_t, Range>::iterator FirstOverlap(std::uint64_t start);
+    const Allocation* BackingChunk(std::uint64_t source, std::uint64_t& chunkStart, std::uint64_t& chunkBytes, std::string& error);
     void Destroy(Allocation& allocation);
     std::uint64_t* RegionTable(std::uint64_t region, std::string& error);
     void Point(std::uint64_t start, std::uint64_t bytes, VkDeviceAddress device, std::uint64_t deviceStart);
@@ -80,6 +91,8 @@ private:
     std::uint64_t aliasBase_ = 0;
     std::uint64_t aliasBytes_ = 0;
     std::map<std::uint64_t, Alias> aliases_;
+    std::map<std::uint64_t, std::uint64_t> backings_;
+    std::map<std::uint64_t, Allocation> chunks_;
 };
 
 }

@@ -3,9 +3,11 @@
 #include "AbxRuntime.hpp"
 #include "LoaderRedirect.hpp"
 #include "Settings.hpp"
+#include "TitleAsserts.hpp"
 #include "TitleConfig.hpp"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <array>
 #include <atomic>
@@ -268,11 +270,8 @@ std::size_t CaptureFrames(std::uint64_t* frames) {
     return count;
 }
 
-std::size_t UnwindFrames(const CONTEXT& start, std::uint64_t* frames) {
+std::size_t UnwindFramesWithin(const CONTEXT& start, std::uint64_t* frames, ULONG_PTR low, ULONG_PTR high) {
     CONTEXT context = start;
-    const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
-    const ULONG_PTR low = reinterpret_cast<ULONG_PTR>(tib->StackLimit);
-    const ULONG_PTR high = reinterpret_cast<ULONG_PTR>(tib->StackBase);
     std::size_t count = 0;
     while (count < MaxFrames && context.Rip != 0) {
         frames[count++] = context.Rip;
@@ -290,6 +289,102 @@ std::size_t UnwindFrames(const CONTEXT& start, std::uint64_t* frames) {
         if (context.Rsp < low || context.Rsp > high) break;
     }
     return count;
+}
+
+std::size_t UnwindFrames(const CONTEXT& start, std::uint64_t* frames) {
+    const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    return UnwindFramesWithin(start, frames, reinterpret_cast<ULONG_PTR>(tib->StackLimit), reinterpret_cast<ULONG_PTR>(tib->StackBase));
+}
+
+void Emit(const std::string& line);
+
+constexpr std::size_t MaxStackHits = 12;
+constexpr std::size_t MaxScannedStackBytes = 256 * 1024;
+
+struct ThreadFrames {
+    DWORD id = 0;
+    std::size_t count = 0;
+    std::uint64_t frames[MaxFrames]{};
+    std::size_t hits = 0;
+    std::uint64_t stackHits[MaxStackHits]{};
+};
+
+constexpr std::size_t MaxDumpedThreads = 256;
+constexpr std::size_t DumpedFramesPerThread = MaxFrames;
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> AnyBoxModuleRanges() {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return ranges;
+    MODULEENTRY32W module{};
+    module.dwSize = sizeof(module);
+    for (BOOL more = Module32FirstW(snapshot, &module); more; more = Module32NextW(snapshot, &module)) {
+        if (_wcsnicmp(module.szModule, L"ab_", 3) == 0) {
+            const auto base = reinterpret_cast<std::uint64_t>(module.modBaseAddr);
+            ranges.emplace_back(base, base + module.modBaseSize);
+        }
+    }
+    CloseHandle(snapshot);
+    return ranges;
+}
+
+void EmitOtherThreads(const char* when = "at the crash") {
+    std::vector<DWORD> ids;
+    ids.reserve(MaxDumpedThreads);
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    const DWORD process = GetCurrentProcessId();
+    const DWORD self = GetCurrentThreadId();
+    for (BOOL more = Thread32First(snapshot, &entry); more && ids.size() < MaxDumpedThreads; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID == process && entry.th32ThreadID != self) ids.push_back(entry.th32ThreadID);
+    }
+    CloseHandle(snapshot);
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> anybox = AnyBoxModuleRanges();
+    std::vector<ThreadFrames> dumped(ids.size());
+    std::size_t filled = 0;
+    for (const DWORD id : ids) {
+        const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id);
+        if (thread == nullptr) continue;
+        if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(thread, &context)) {
+                MEMORY_BASIC_INFORMATION stack{};
+                if (VirtualQuery(reinterpret_cast<const void*>(context.Rsp), &stack, sizeof(stack)) == sizeof(stack)) {
+                    const auto low = reinterpret_cast<ULONG_PTR>(stack.AllocationBase);
+                    const auto high = reinterpret_cast<ULONG_PTR>(stack.BaseAddress) + stack.RegionSize;
+                    ThreadFrames& target = dumped[filled++];
+                    target.id = id;
+                    target.count = UnwindFramesWithin(context, target.frames, low, high);
+                    const ULONG_PTR scanEnd = (std::min)(high, static_cast<ULONG_PTR>(context.Rsp + MaxScannedStackBytes));
+                    for (ULONG_PTR at = context.Rsp & ~static_cast<ULONG_PTR>(7); at + sizeof(std::uint64_t) <= scanEnd && target.hits < MaxStackHits; at += sizeof(std::uint64_t)) {
+                        const std::uint64_t word = *reinterpret_cast<const std::uint64_t*>(at);
+                        for (const auto& [begin, end] : anybox) {
+                            if (word >= begin && word < end) {
+                                target.stackHits[target.hits++] = word;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ResumeThread(thread);
+        }
+        CloseHandle(thread);
+    }
+    Emit(std::format("[anybox] other threads {} ({} of {}):\n", when, filled, ids.size()));
+    for (std::size_t index = 0; index < filled; ++index) {
+        const ThreadFrames& thread = dumped[index];
+        Emit(std::format("[anybox]  thread {}:\n", thread.id));
+        for (std::size_t frame = 0; frame < (std::min)(thread.count, DumpedFramesPerThread); ++frame) {
+            Emit(std::format("[anybox]     #{:02} {}\n", frame, FrameText(thread.frames[frame])));
+        }
+        for (std::size_t hit = 0; hit < thread.hits; ++hit) {
+            Emit(std::format("[anybox]     stack word -> {}\n", FrameText(thread.stackHits[hit])));
+        }
+    }
 }
 
 
@@ -453,6 +548,7 @@ LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
         stop.frames = frames;
         stop.frameCount = UnwindFrames(*pointers->ContextRecord, frames);
         EmitFrames("crashed in", frames, stop.frameCount);
+        if (Environment("ANYBOX_CRASH_THREADS") == "1") EmitOtherThreads();
     }
     AbxWriteReport(&stop);
     const LPTOP_LEVEL_EXCEPTION_FILTER previous = g_previousFilter.load();
@@ -476,6 +572,91 @@ LONG WINAPI KeepFilter(EXCEPTION_POINTERS*) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+std::atomic<std::uint64_t> g_watchAddress{0};
+std::atomic<int> g_watchHits{0};
+
+LONG CALLBACK WatchWriteHandler(EXCEPTION_POINTERS* info) {
+    if (info == nullptr || info->ExceptionRecord == nullptr || info->ContextRecord == nullptr) return EXCEPTION_CONTINUE_SEARCH;
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || (info->ContextRecord->Dr6 & 1u) == 0) return EXCEPTION_CONTINUE_SEARCH;
+    info->ContextRecord->Dr6 = 0;
+    const std::uint64_t address = g_watchAddress.load();
+    if (g_watchHits.fetch_add(1) < 16) {
+        std::uint64_t frames[MaxFrames]{};
+        const std::size_t count = UnwindFrames(*info->ContextRecord, frames);
+        const std::uint64_t value = address != 0 ? *reinterpret_cast<const volatile std::uint64_t*>(address) : 0;
+        Emit(std::format("[anybox] watched address 0x{:x} written (now {}) by thread {}:\n", address, value, GetCurrentThreadId()));
+        for (std::size_t frame = 0; frame < (std::min)(count, std::size_t{8}); ++frame) Emit(std::format("[anybox]     #{:02} {}\n", frame, FrameText(frames[frame])));
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void ArmWatch() {
+    const std::uint64_t address = g_watchAddress.load();
+    if (address == 0) return;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    const DWORD process = GetCurrentProcessId();
+    const DWORD self = GetCurrentThreadId();
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+        const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, entry.th32ThreadID);
+        if (thread == nullptr) continue;
+        if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(thread, &context) && context.Dr0 != address) {
+                context.Dr0 = address;
+                context.Dr7 = (context.Dr7 & ~static_cast<DWORD64>(0xF0003)) | 1u | (1u << 16) | (3u << 18);
+                SetThreadContext(thread, &context);
+            }
+            ResumeThread(thread);
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+}
+
+DWORD WINAPI HoldTitleWatchdogPaused(LPVOID parameter) {
+    auto* const flag = static_cast<volatile std::uint8_t*>(parameter);
+    for (;;) {
+        *flag = 1;
+        Sleep(250);
+    }
+}
+
+void StartTitleWatchdogPause() {
+    const char* value = AbxSetting("runtime.title_watchdog_pause_rva");
+    if (value == nullptr || value[0] == 0) return;
+    const std::uint64_t rva = std::strtoull(value, nullptr, 16);
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    MEMORY_BASIC_INFORMATION region{};
+    const bool queried = rva != 0 && VirtualQuery(reinterpret_cast<const void*>(base + rva), &region, sizeof(region)) == sizeof(region);
+    if (!queried || region.AllocationBase != reinterpret_cast<void*>(base) || region.State != MEM_COMMIT || (region.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) == 0) {
+        Emit(std::format("[anybox] runtime.title_watchdog_pause_rva = 0x{:x} is not writable data of the title's image; the title's watchdog is left running\n", rva));
+        return;
+    }
+    Emit(std::format("[anybox] the title's hang watchdog is held paused through its own pause flag at title+0x{:x} (runtime.title_watchdog_pause_rva): frames that take longer than its "
+                     "limit no longer end the process\n", rva));
+    if (const HANDLE holder = CreateThread(nullptr, 0, HoldTitleWatchdogPaused, reinterpret_cast<void*>(base + rva), 0, nullptr)) CloseHandle(holder);
+}
+
+DWORD WINAPI WatchDumpRequests(LPVOID) {
+    wchar_t module[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameW(nullptr, module, MAX_PATH);
+    std::wstring path(module, length);
+    const std::size_t slash = path.find_last_of(L"\\/");
+    path = (slash == std::wstring::npos ? std::wstring(L".") : path.substr(0, slash)) + L"\\anybox_dump_threads";
+    for (;;) {
+        Sleep(2000);
+        ArmWatch();
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        DeleteFileW(path.c_str());
+        EmitOtherThreads("on request (anybox_dump_threads)");
+    }
+}
+
 void Start() {
     g_start = std::chrono::steady_clock::now();
     const std::string logPath = Environment("ANYBOX_LOG_FILE");
@@ -486,7 +667,10 @@ void Start() {
     g_keepFilter = AddVectoredExceptionHandler(0, KeepFilter);
     abx::InstallCpuFixups();
     abx::InstallProbes();
+    abx::InstallTitleAssertPolicy();
     abx::InstallLoaderRedirect();
+    if (const HANDLE watcher = CreateThread(nullptr, 0, WatchDumpRequests, nullptr, 0, nullptr)) CloseHandle(watcher);
+    StartTitleWatchdogPause();
     WaitForDebugger();
 }
 
@@ -640,6 +824,13 @@ ABX_RUNTIME_API const char* AbxTitleName() {
 
 ABX_RUNTIME_API const char* AbxTitleDeviceFamily() {
     return Title().targetDeviceFamily.empty() ? nullptr : Title().targetDeviceFamily.c_str();
+}
+
+ABX_API void AbxWatchWrites(std::uint64_t address) {
+    if (address == 0 || address % 8 != 0 || g_watchAddress.exchange(address) != 0) return;
+    AddVectoredExceptionHandler(1, WatchWriteHandler);
+    Emit(std::format("[anybox] hardware write watch armed on 0x{:x} in every thread (re-armed every 2 s for new threads)\n", address));
+    ArmWatch();
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {

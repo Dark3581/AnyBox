@@ -19,6 +19,7 @@ constexpr std::uint32_t kCodeBaseHighMember = 4;
 struct AddressTranslation {
     std::vector<std::uint32_t> words;
     std::size_t rewritten = 0;
+    std::size_t unrecognizedHeapUses = 0;
     bool usesCodeBase = false;
 };
 

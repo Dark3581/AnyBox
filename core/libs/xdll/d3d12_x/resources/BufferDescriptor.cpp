@@ -201,11 +201,13 @@ std::optional<BufferDescriptorWords> ConstantBufferDescriptor(const D3D12_CONSTA
         error = "a constant buffer view needs an address and a size that is a nonzero multiple of 16 bytes";
         return std::nullopt;
     }
+    constexpr std::uint32_t kConstantRowBytes = 16;
     BufferDescriptorFields fields;
     fields.base = desc.BufferLocation;
-    fields.records = desc.SizeInBytes;
-    fields.bounds = BufferBounds::Raw;
-    fields.format = TypedBufferFormatOf(DXGI_FORMAT_R32_FLOAT)->code;
+    fields.stride = kConstantRowBytes;
+    fields.records = desc.SizeInBytes / kConstantRowBytes;
+    fields.bounds = BufferBounds::StructuredWithOffset;
+    fields.format = TypedBufferFormatOf(DXGI_FORMAT_R32G32B32A32_FLOAT)->code;
     return EncodeBufferDescriptor(fields, error);
 }
 

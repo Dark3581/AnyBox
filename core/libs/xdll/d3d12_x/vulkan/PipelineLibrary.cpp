@@ -1,5 +1,6 @@
 #include "PipelineLibrary.hpp"
 #include "PipelineCompiler.hpp"
+#include "UserDataRebase.hpp"
 
 #include <chrono>
 #include <exception>
@@ -18,9 +19,23 @@ const char* PipelineOriginName(PipelineOrigin origin) {
         return "refused";
     case PipelineOrigin::Failed:
         return "failed";
+    case PipelineOrigin::Deferred:
+        return "deferred until first use";
     }
     return "unknown";
 }
+
+namespace {
+
+thread_local bool t_cacheOnly = false;
+
+}
+
+CacheOnlyBuilds::CacheOnlyBuilds(bool enabled) : previous_(t_cacheOnly) { t_cacheOnly = enabled; }
+
+CacheOnlyBuilds::~CacheOnlyBuilds() { t_cacheOnly = previous_; }
+
+bool CacheOnlyBuilds::Active() { return t_cacheOnly; }
 
 PipelineLibrary::PipelineLibrary(const VulkanDevice& device, VkPipelineCache cache, std::uintmax_t compileLimitBytes)
     : device_(device), cache_(cache), compileLimitBytes_(compileLimitBytes) {}
@@ -54,13 +69,13 @@ PipelineEntry PipelineLibrary::Graphics(const GraphicsRequest& request) {
 PipelineEntry PipelineLibrary::Obtain(const std::string& key, const std::function<PipelineEntry()>& create) {
     std::unique_lock<std::mutex> guard(lock_);
     const auto [found, inserted] = slots_.try_emplace(key);
-    if (!inserted) {
-        Slot& slot = *found->second;
-        finished_.wait(guard, [&slot] { return slot.done; });
-        return slot.entry;
-    }
-    found->second = std::make_unique<Slot>();
+    if (inserted) found->second = std::make_unique<Slot>();
     Slot& slot = *found->second;
+    if (!inserted) {
+        finished_.wait(guard, [&slot] { return slot.done; });
+        if (slot.entry.origin != PipelineOrigin::Deferred || t_cacheOnly) return slot.entry;
+        slot.done = false;
+    }
     guard.unlock();
     PipelineEntry entry;
     try {
@@ -85,6 +100,8 @@ PipelineEntry PipelineLibrary::Obtain(const std::string& key, const std::functio
     case PipelineOrigin::Failed:
         ++stats_.failed;
         break;
+    case PipelineOrigin::Deferred:
+        break;
     }
     finished_.notify_all();
     return entry;
@@ -93,6 +110,14 @@ PipelineEntry PipelineLibrary::Obtain(const std::string& key, const std::functio
 PipelineLibraryStats PipelineLibrary::Stats() const {
     std::lock_guard<std::mutex> guard(lock_);
     return stats_;
+}
+
+namespace {
+
+constexpr std::uint32_t kMeshFirstRootSgpr = 16;
+constexpr std::uint32_t kPixelFirstRootSgpr = 8;
+constexpr std::uint32_t kUserSgprs = 32;
+
 }
 
 PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) const {
@@ -110,8 +135,13 @@ PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) co
         }
     };
     for (const GraphicsShaderSource& shader : request.shaders) {
-        const std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(shader.module, entry.usesCodeBase, entry.error);
+        std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(shader.module, entry.usesCodeBase, entry.error);
         if (!words) {
+            release();
+            return finish();
+        }
+        if (shader.stage == VK_SHADER_STAGE_MESH_BIT_EXT && !RebaseUserData(*words, kMeshFirstRootSgpr, kPixelFirstRootSgpr, kUserSgprs, entry.error)) {
+            entry.error = "the mesh shader's root words cannot be moved to where the pixel shader reads them: " + entry.error;
             release();
             return finish();
         }
@@ -143,6 +173,11 @@ PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) co
         if (result == VK_SUCCESS) {
             entry.origin = PipelineOrigin::Ready;
         }
+    }
+    if (result == VK_PIPELINE_COMPILE_REQUIRED && t_cacheOnly && device_.PipelineCacheControl()) {
+        release();
+        entry.origin = PipelineOrigin::Deferred;
+        return finish();
     }
     if (result == VK_PIPELINE_COMPILE_REQUIRED) {
         if (overLimit) {

@@ -2,7 +2,11 @@
 
 #include "Inflate.hpp"
 
+#include <algorithm>
 #include <array>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -165,11 +169,16 @@ static_assert(sizeof(ConsoleRequest) == 0x38);
 
 constexpr std::uint64_t kRequestCompressed = 0x1;
 constexpr std::uint64_t kRequestMemorySource = 0x400000;
+constexpr std::uint64_t kRequestDestinationPages = 0x200000;
+constexpr std::uint64_t kRequestBcPackMask = 0x1E;
+constexpr std::uint32_t kRequestBcPackShift = 1;
+constexpr std::uint64_t kDestinationPageBytes = 64 * 1024;
 
 struct StatusArray;
 
 struct QueueEntry {
     ConsoleRequest request{};
+    std::vector<std::uintptr_t> destinationPages;
     StatusArray* status = nullptr;
     std::uint32_t statusIndex = 0;
 };
@@ -177,6 +186,11 @@ struct QueueEntry {
 struct StorageQueue : StorageObject {
     std::mutex lock;
     std::vector<QueueEntry> pending;
+    std::mutex workLock;
+    std::condition_variable workReady;
+    std::deque<std::vector<QueueEntry>> batches;
+    std::thread worker;
+    bool stopping = false;
     HRESULT failure = S_OK;
     std::uint64_t sourceType = 0;
     std::uint16_t capacity = 0;
@@ -203,7 +217,50 @@ HRESULT STDMETHODCALLTYPE QueueEnqueueRequest(StorageQueue* self, const ConsoleR
 HRESULT STDMETHODCALLTYPE QueueEnqueueStatus(StorageQueue* self, StorageObject* array, std::uint32_t index);
 HRESULT STDMETHODCALLTYPE QueueSubmit(StorageQueue* self);
 
-HRESULT ExecuteRequest(const ConsoleRequest& request, std::string& error) {
+void AnnounceWritten(const void* destination, std::uint64_t bytes) {
+    using Announce = void (*)(std::uint64_t, std::uint64_t);
+    static const Announce announce = [] {
+        const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+        return xmem != nullptr ? reinterpret_cast<Announce>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemAnnounceWritten"))) : nullptr;
+    }();
+    if (announce != nullptr) announce(reinterpret_cast<std::uint64_t>(destination), bytes);
+}
+
+bool ScatterToPages(const std::vector<std::uintptr_t>& pages, std::uint64_t pageOffset, const std::uint8_t* data, std::uint64_t bytes, std::string& error) {
+    using View = void* (*)(std::uintptr_t);
+    static const View view = [] {
+        const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+        return xmem != nullptr ? reinterpret_cast<View>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemPhysicalPageView"))) : nullptr;
+    }();
+    if (view == nullptr) {
+        error = "ab_xmem.dll has no AbxXMemPhysicalPageView export for writing physical pages";
+        return false;
+    }
+    std::uint64_t done = 0;
+    while (done < bytes) {
+        const std::uint64_t at = pageOffset + done;
+        const std::size_t index = static_cast<std::size_t>(at / kDestinationPageBytes);
+        if (index >= pages.size()) {
+            error = "the destination page array ends before the request's data";
+            return false;
+        }
+        auto* page = static_cast<std::uint8_t*>(view(pages[index]));
+        if (page == nullptr) {
+            error = "destination page frame " + std::to_string(pages[index]) + " (index " + std::to_string(index) + " of " + std::to_string(pages.size()) + ", offset 0x" +
+                    std::to_string(pageOffset) + ", " + std::to_string(bytes) + " bytes) is not one AnyBox allocated; the array holds";
+            for (std::size_t shown = 0; shown < (std::min)(pages.size(), std::size_t{8}); ++shown) error += " " + std::to_string(pages[shown]);
+            return false;
+        }
+        const std::uint64_t within = at % kDestinationPageBytes;
+        const std::uint64_t piece = (std::min)(kDestinationPageBytes - within, bytes - done);
+        std::memcpy(page + within, data + done, static_cast<std::size_t>(piece));
+        AnnounceWritten(page + within, piece);
+        done += piece;
+    }
+    return true;
+}
+
+HRESULT ExecuteRequest(const ConsoleRequest& request, const std::vector<std::uintptr_t>& destinationPages, std::string& error) {
     std::vector<std::uint8_t> source(request.sourceSize);
     if ((request.options & kRequestMemorySource) != 0) {
         std::memcpy(source.data(), reinterpret_cast<const void*>(request.source), source.size());
@@ -223,23 +280,64 @@ HRESULT ExecuteRequest(const ConsoleRequest& request, std::string& error) {
             return HRESULT_FROM_WIN32(code != 0 ? code : ERROR_HANDLE_EOF);
         }
     }
+    const std::uint8_t bc = static_cast<std::uint8_t>((request.options & kRequestBcPackMask) >> kRequestBcPackShift);
+    const bool zlib = (request.options & kRequestCompressed) != 0;
+    if (bc != 0 && zlib) {
+        std::vector<std::uint8_t> packed(request.unknown34);
+        std::size_t inflated = 0;
+        if (!abx::xcrdapi::InflateZlib(source.data(), source.size(), packed.data(), packed.size(), inflated, error)) {
+            error = "the zlib stage before BCPack: " + error;
+            return E_FAIL;
+        }
+        packed.resize(inflated);
+        source = std::move(packed);
+    }
+    const auto produce = [&](std::uint8_t* out, std::size_t& written) -> HRESULT {
+        if (bc != 0) {
+            AbxUnsupported("xcrdapi", ("a DirectStorage request with BCPack-compressed data (format " + std::to_string(bc) + "): AnyBox has no BCPack decoder").c_str());
+        }
+        if (zlib) return abx::xcrdapi::InflateZlib(source.data(), source.size(), out, request.destinationSize, written, error) ? S_OK : E_FAIL;
+        if (source.size() > request.destinationSize) {
+            error = "an uncompressed request larger than its destination";
+            return E_INVALIDARG;
+        }
+        std::memcpy(out, source.data(), source.size());
+        written = source.size();
+        return S_OK;
+    };
+    std::size_t written = 0;
+    if ((request.options & kRequestDestinationPages) != 0) {
+        std::vector<std::uint8_t> output(request.destinationSize);
+        const HRESULT made = produce(output.data(), written);
+        if (FAILED(made)) return made;
+        if (ScatterToPages(destinationPages, request.unknown10 & 0xFFFFu, output.data(), written, error)) return S_OK;
+        MEMORY_BASIC_INFORMATION region{};
+        if (request.destination == 0 || VirtualQuery(reinterpret_cast<const void*>(request.destination), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT) {
+            return E_INVALIDARG;
+        }
+        const auto* current = reinterpret_cast<const std::uintptr_t*>(request.destination);
+        const std::vector<std::uintptr_t> reread(current, current + destinationPages.size());
+        if (reread == destinationPages) return E_INVALIDARG;
+        std::string retry;
+        if (!ScatterToPages(reread, request.unknown10 & 0xFFFFu, output.data(), written, retry)) {
+            error += "; read again at submission it holds";
+            for (std::size_t shown = 0; shown < (std::min)(reread.size(), std::size_t{8}); ++shown) error += " " + std::to_string(reread[shown]);
+            return E_INVALIDARG;
+        }
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("xcrdapi", "a physical-page request's page array changed between enqueue and submission (the title fills it after enqueueing); it is read again when the request runs");
+        }
+        return S_OK;
+    }
     auto* destination = reinterpret_cast<std::uint8_t*>(request.destination);
     if (destination == nullptr) {
         error = "a request with no destination";
         return E_INVALIDARG;
     }
-    if ((request.options & kRequestCompressed) == 0) {
-        if (source.size() > request.destinationSize) {
-            error = "an uncompressed request larger than its destination";
-            return E_INVALIDARG;
-        }
-        std::memcpy(destination, source.data(), source.size());
-        return S_OK;
-    }
-    std::size_t written = 0;
-    if (!abx::xcrdapi::InflateZlib(source.data(), source.size(), destination, request.destinationSize, written, error)) {
-        return E_FAIL;
-    }
+    const HRESULT made = produce(destination, written);
+    if (FAILED(made)) return made;
+    AnnounceWritten(destination, written);
     return S_OK;
 }
 
@@ -258,14 +356,24 @@ void DestroyStatusArray(StorageObject* object) {
 }
 
 void DestroyQueue(StorageObject* object) {
-    delete static_cast<StorageQueue*>(object);
+    auto* queue = static_cast<StorageQueue*>(object);
+    {
+        const std::lock_guard guard(queue->workLock);
+        queue->stopping = true;
+    }
+    queue->workReady.notify_all();
+    if (queue->worker.joinable()) queue->worker.join();
+    delete queue;
 }
 
 HRESULT STDMETHODCALLTYPE QueueEnqueueRequest(StorageQueue* self, const ConsoleRequest* request) {
     if (request == nullptr) {
         AbxUnsupported("DirectStorage EnqueueRequest", "a null request");
     }
-    if ((request->options & ~(kRequestCompressed | kRequestMemorySource)) != 0 || request->unknown10 != 0 || request->unknown34 != 0) {
+    const bool destinationPages = (request->options & kRequestDestinationPages) != 0;
+    const bool zlibThenBcPack = (request->options & kRequestCompressed) != 0 && (request->options & kRequestBcPackMask) != 0;
+    if ((request->options & ~(kRequestCompressed | kRequestMemorySource | kRequestDestinationPages | kRequestBcPackMask)) != 0 || (!destinationPages && request->unknown10 != 0) ||
+        (destinationPages && request->unknown10 > 0xFFFFu) || (!zlibThenBcPack && request->unknown34 != 0) || (zlibThenBcPack && request->unknown34 == 0)) {
         char text[160];
         std::snprintf(text, sizeof(text), "request options 0x%llx or words at +0x10/+0x34 (0x%llx, 0x%x) that are not measured", static_cast<unsigned long long>(request->options),
                       static_cast<unsigned long long>(request->unknown10), request->unknown34);
@@ -287,7 +395,21 @@ HRESULT STDMETHODCALLTYPE QueueEnqueueRequest(StorageQueue* self, const ConsoleR
     const std::lock_guard guard(self->lock);
     QueueEntry entry;
     entry.request = *request;
-    self->pending.push_back(entry);
+    if (destinationPages) {
+        const std::uint64_t span = (request->unknown10 & 0xFFFFu) + request->destinationSize;
+        const std::size_t count = static_cast<std::size_t>((span + kDestinationPageBytes - 1) / kDestinationPageBytes);
+        if (request->destination == 0 && count != 0) {
+            AbxUnsupported("DirectStorage EnqueueRequest", "a physical-page destination with no page array");
+        }
+        const auto* pages = reinterpret_cast<const std::uintptr_t*>(request->destination);
+        entry.destinationPages.assign(pages, pages + count);
+        static std::atomic<bool> pagesReported{false};
+        if (!pagesReported.exchange(true)) {
+            AbxLog("xcrdapi", "requests into physical pages are written through AnyBox's views of those pages (first: %zu pages, offset 0x%llx, %u bytes, options 0x%llx)", count,
+                   static_cast<unsigned long long>(request->unknown10), request->destinationSize, static_cast<unsigned long long>(request->options));
+        }
+    }
+    self->pending.push_back(std::move(entry));
     return S_OK;
 }
 
@@ -308,12 +430,7 @@ HRESULT STDMETHODCALLTYPE QueueEnqueueStatus(StorageQueue* self, StorageObject* 
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE QueueSubmit(StorageQueue* self) {
-    std::vector<QueueEntry> entries;
-    {
-        const std::lock_guard guard(self->lock);
-        entries.swap(self->pending);
-    }
+void RunBatch(StorageQueue* self, const std::vector<QueueEntry>& entries) {
     HRESULT since = S_OK;
     for (const QueueEntry& entry : entries) {
         if (entry.status != nullptr) {
@@ -323,14 +440,49 @@ HRESULT STDMETHODCALLTYPE QueueSubmit(StorageQueue* self) {
             continue;
         }
         std::string error;
-        const HRESULT result = ExecuteRequest(entry.request, error);
+        const HRESULT result = ExecuteRequest(entry.request, entry.destinationPages, error);
         if (FAILED(result)) {
             AbxLog("xcrdapi", "DirectStorage request failed with 0x%08lx: %s", static_cast<unsigned long>(result), error.c_str());
             if (SUCCEEDED(since)) since = result;
             if (SUCCEEDED(self->failure)) self->failure = result;
         }
     }
-    AbxTrace("DirectStorage queue \"%s\": submitted %zu entries", self->label.c_str(), entries.size());
+    AbxTrace("DirectStorage queue \"%s\": ran %zu entries", self->label.c_str(), entries.size());
+}
+
+void RunQueue(StorageQueue* self) {
+    for (;;) {
+        std::vector<QueueEntry> entries;
+        {
+            std::unique_lock guard(self->workLock);
+            self->workReady.wait(guard, [self] { return self->stopping || !self->batches.empty(); });
+            if (self->batches.empty()) return;
+            entries = std::move(self->batches.front());
+            self->batches.pop_front();
+        }
+        RunBatch(self, entries);
+    }
+}
+
+HRESULT STDMETHODCALLTYPE QueueSubmit(StorageQueue* self) {
+    std::vector<QueueEntry> entries;
+    {
+        const std::lock_guard guard(self->lock);
+        entries.swap(self->pending);
+    }
+    if (entries.empty()) return S_OK;
+    {
+        const std::lock_guard guard(self->workLock);
+        if (!self->worker.joinable()) {
+            self->worker = std::thread(RunQueue, self);
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
+                AbxLog("xcrdapi", "DirectStorage queues run their submitted requests on a worker thread each, in submission order; Submit returns at once and status arrays report completion");
+            }
+        }
+        self->batches.push_back(std::move(entries));
+    }
+    self->workReady.notify_one();
     return S_OK;
 }
 

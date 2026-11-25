@@ -42,9 +42,12 @@ std::optional<VkPrimitiveTopology> VulkanTopology(D3D_PRIMITIVE_TOPOLOGY topolog
 constexpr D3D_PRIMITIVE_TOPOLOGY kConsoleRectangleList = static_cast<D3D_PRIMITIVE_TOPOLOGY>(17);
 std::optional<VkViewport> VulkanViewport(const D3D12_VIEWPORT& viewport);
 
+bool CopyNeedsBuffer(const TextureRef& destination, UINT destinationSubresource, const TextureRef& source, UINT sourceSubresource);
+
 class CommandRecorder {
 public:
     CommandRecorder(const VulkanDevice& device, VkCommandBuffer commands) : device_(device), commands_(commands) {}
+    void Checkpoint(const char* marker) const { device_.Checkpoint(commands_, marker); }
 
     bool InitializeTexture(const TextureRef& texture, D3D12_RESOURCE_STATES initial, std::string& error);
     bool Transition(const TextureRef& texture, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after, std::string& error);
@@ -53,12 +56,16 @@ public:
     bool ClearRenderTarget(const AttachmentRef& target, const float color[4], const std::vector<D3D12_RECT>& rects, std::string& error);
     bool ClearDepthStencil(const AttachmentRef& target, D3D12_CLEAR_FLAGS flags, float depth, std::uint8_t stencil, const std::vector<D3D12_RECT>& rects, std::string& error);
     bool CopyBufferRegion(const BufferRef& destination, UINT64 destinationOffset, const BufferRef& source, UINT64 sourceOffset, UINT64 bytes, std::string& error);
+    bool FillBuffer(const BufferRef& destination, UINT64 bytes, std::uint32_t value, std::string& error);
+    bool UpdateBuffer(const BufferRef& destination, const std::uint8_t* data, UINT64 bytes, std::string& error);
     bool CopyBufferToTexture(const TextureRef& destination, D3D12_RESOURCE_STATES state, UINT subresource, UINT x, UINT y, UINT z, const BufferRef& source,
                              const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, const D3D12_BOX* box, std::string& error);
     bool CopyTextureToFootprint(const BufferRef& destination, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, UINT x, UINT y, UINT z, const TextureRef& source,
                                 D3D12_RESOURCE_STATES state, UINT subresource, const D3D12_BOX* box, std::string& error);
     bool CopyTextureToBuffer(const BufferRef& destination, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, const TextureRef& source, D3D12_RESOURCE_STATES state,
                              UINT subresource, const D3D12_BOX* box, std::string& error);
+    bool CopyTextureThroughBuffer(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, UINT x, UINT y, UINT z, const TextureRef& source,
+                                  D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, const D3D12_BOX* box, const BufferRef& scratch, std::string& error);
     bool CopyTexture(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, UINT x, UINT y, UINT z, const TextureRef& source,
                      D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, const D3D12_BOX* box, std::string& error);
     bool ResolveSubresource(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, const TextureRef& source,
@@ -80,6 +87,7 @@ public:
     void Draw(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance);
     void DrawIndexed(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance);
     void Dispatch(UINT x, UINT y, UINT z);
+    bool DrawMesh(UINT x, UINT y, UINT z, std::string& error);
     bool ExecuteIndirect(const IndirectSignature& signature, UINT maxCount, const BufferRef& arguments, UINT64 argumentOffset, const BufferRef* count, UINT64 countOffset,
                          std::string& error);
 

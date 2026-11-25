@@ -39,7 +39,7 @@ void* Allocate(std::size_t size) {
     void* address = nullptr;
     Block block = Block::Heap;
     if (size >= PageThreshold) {
-        address = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        address = abx::xmem::AllocateBelowGpuLimit(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         block = Block::Pages;
     } else {
         address = _aligned_malloc(size, HeapAlignment);
@@ -198,11 +198,21 @@ ABX_API void* XMemVirtualAlloc(void* address, std::size_t size, std::uint32_t al
         return window;
     }
     void* result = (allocationType & kPlaceholderTypes) != 0 ? abx::xmem::AllocateWithPlaceholders(address, size, allocationType & kDesktopAllocationTypes, protection)
-                                                             : VirtualAlloc(address, size, allocationType & kDesktopAllocationTypes, protection);
+                                                             : abx::xmem::AllocateBelowGpuLimit(address, size, allocationType & kDesktopAllocationTypes, protection);
     if (result != nullptr && (allocationType & MEM_COMMIT) != 0 && abx::xmem::IsGpuVisible(protect)) {
         abx::xmem::AnnounceAvailable(reinterpret_cast<std::uint64_t>(result), size);
     }
     AbxTrace("XMemVirtualAlloc(%p, 0x%zx, type 0x%x, attributes 0x%llx, protect 0x%x) = %p (console-only type bits 0x%x and protection bits 0x%x dropped)", address, size,
              allocationType, static_cast<unsigned long long>(attributes), protect, result, allocationType & kConsoleOnlyAllocationTypes, protect & ~0xFFu);
     return result;
+}
+
+ABX_API BOOL XMemIsToolsMemAvailable() {
+    AbxTrace("XMemIsToolsMemAvailable() -> TRUE (the host has no separate tools memory pool)");
+    return TRUE;
+}
+
+ABX_API BOOL XMemTransferMemory(std::uint32_t direction, std::size_t bytes) {
+    AbxLog("xmem", "XMemTransferMemory(direction %u, %zu bytes): accepted; the host has one memory pool, so nothing moves", direction, bytes);
+    return TRUE;
 }

@@ -1,6 +1,7 @@
 #include "xdll/xapu/xapu.hpp"
 
 #include <cstdint>
+#include <cstring>
 
 namespace {
 
@@ -34,4 +35,24 @@ ABX_API std::uint32_t XApuGetResultCount(void* connection) {
         AbxLog("xapu", "XApuGetResultCount(%p): 0, since no audio processor executes the enqueued commands", connection);
     }
     return 0;
+}
+
+ABX_API HRESULT XApuEnqueueCommand(void* connection, const void* command) {
+    if (connection == nullptr || command == nullptr) return E_INVALIDARG;
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        std::uint32_t type = 0;
+        std::memcpy(&type, command, sizeof(type));
+        AbxLog("xapu", "XApuEnqueueCommand(%p, type %u): accepted and dropped; no audio processor executes commands (later commands are not logged)", connection, type);
+    }
+    return S_OK;
+}
+
+ABX_API HRESULT XApuDisconnect(void* connection) {
+    auto* closing = static_cast<Connection*>(connection);
+    if (closing == nullptr) return E_INVALIDARG;
+    if (closing->shared != nullptr) VirtualFree(closing->shared, 0, MEM_RELEASE);
+    delete closing;
+    return S_OK;
 }

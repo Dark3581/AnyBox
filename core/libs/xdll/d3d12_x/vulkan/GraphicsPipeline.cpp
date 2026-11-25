@@ -44,6 +44,7 @@ std::string GraphicsStateKey(const GraphicsPipelineState& state, const VertexInp
     add(state.cullMode);
     add(state.frontFace);
     add(state.depthClamp);
+    add(state.conservative);
     add(state.depthBias);
     addFloat(state.depthBiasConstant);
     addFloat(state.depthBiasClamp);
@@ -144,6 +145,9 @@ VkResult CreateGraphicsPipeline(const VulkanDevice& device, VkPipelineCache cach
     rasterization.depthBiasClamp = state.depthBiasClamp;
     rasterization.depthBiasSlopeFactor = state.depthBiasSlope;
     rasterization.lineWidth = 1.0f;
+    VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
+    conservative.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
+    if (state.conservative && device.ConservativeRasterization()) rasterization.pNext = &conservative;
     const VkSampleMask sampleMask = state.sampleMask;
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = state.samples;

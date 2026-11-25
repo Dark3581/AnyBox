@@ -63,6 +63,21 @@ if(Python3_FOUND)
             --probe $<TARGET_FILE:shader_store_probe> --libs ${ANYBOX_LIBS_DIR} --tool ${CMAKE_SOURCE_DIR}/tools/shader_store.py --work ${CMAKE_CURRENT_BINARY_DIR}/shader_store)
 endif()
 
+add_executable(gfx10_tiling_test Gfx10TilingTest.cpp)
+target_link_libraries(gfx10_tiling_test PRIVATE gfx10_tiling)
+anybox_static_runtime(gfx10_tiling_test)
+add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
+
+add_executable(gameinput_test GameInputTest.cpp)
+target_link_libraries(gameinput_test PRIVATE gameinput_core)
+anybox_static_runtime(gameinput_test)
+add_test(NAME gameinput COMMAND gameinput_test)
+
+add_executable(xg_layout_test XgLayoutTest.cpp)
+target_link_libraries(xg_layout_test PRIVATE gfx10_tiling)
+anybox_static_runtime(xg_layout_test)
+add_test(NAME xg_layout COMMAND xg_layout_test)
+
 add_executable(pso_probe PsoProbe.cpp)
 target_link_libraries(pso_probe PRIVATE d3d12_x_pso)
 target_include_directories(pso_probe PRIVATE ${ANYBOX_LIBS_INCLUDE} ${CMAKE_SOURCE_DIR}/core/libs/probe)

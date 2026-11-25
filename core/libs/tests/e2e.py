@@ -124,8 +124,8 @@ def run_under_debugger(converted, argument, out, env):
 
 
 STOPPED_IN = {
-    "stub": "XUserAddAsync",
-    "stub_debugger": "XUserAddAsync",
+    "stub": "XUserGetState",
+    "stub_debugger": "XUserGetState",
     "api_impl": "QueryApiImpl",
     "api_unmapped": "QueryApiImpl",
     "taskqueue_monitor_reentry": "XTaskQueueUnregisterMonitor",
@@ -181,7 +181,7 @@ def check_storage_run(run, local, title_id, cache):
 
 def check_persistent_local_storage(run, converted, out, env, local):
     check_storage_run(run, local, "1234ABCD", "absent")
-    assert sorted(path.name for path in (local / "AnyBox" / "1234ABCD").iterdir()) == ["PersistentLocalStorage", "XGameSave"]
+    assert sorted(path.name for path in (local / "AnyBox" / "1234ABCD").iterdir()) == ["PersistentLocalStorage", "T", "XGameSave"]
     assert list((local / "AnyBox" / "1234ABCD" / "XGameSave").iterdir()) == []
     again = subprocess.run([str(converted), "pls"], cwd=out, env=env, capture_output=True, text=True, timeout=60)
     check_storage_run(again, local, "1234ABCD", "present")

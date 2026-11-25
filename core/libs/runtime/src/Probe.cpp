@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -21,17 +22,31 @@ constexpr std::size_t kDumpQwords = 16;
 struct Watch {
     std::string reg;
     std::int64_t offset = 0;
+    bool text = false;
 };
 
 struct Probe {
     std::uintptr_t address = 0;
     std::uint8_t original = 0;
     bool armed = false;
+    std::uint32_t hits = 0;
+    std::uint32_t limit = 1;
     std::vector<Watch> watches;
 };
 
+constexpr DWORD kTrapFlag = 0x100;
+
 std::mutex g_lock;
 std::vector<Probe> g_probes;
+thread_local Probe* t_rearm = nullptr;
+
+void WriteByte(std::uintptr_t at, std::uint8_t value) {
+    DWORD old = 0;
+    VirtualProtect(reinterpret_cast<void*>(at), 1, PAGE_EXECUTE_READWRITE, &old);
+    *reinterpret_cast<std::uint8_t*>(at) = value;
+    VirtualProtect(reinterpret_cast<void*>(at), 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), 1);
+}
 
 bool Readable(std::uintptr_t address, std::size_t bytes) {
     MEMORY_BASIC_INFORMATION region{};
@@ -49,21 +64,42 @@ std::uint64_t Register(const CONTEXT& c, const std::string& name) {
     for (const auto& entry : registers) {
         if (name == entry.name) return entry.value;
     }
+    if (name == "title") return reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
     return 0;
 }
 
 LONG CALLBACK OnBreakpoint(EXCEPTION_POINTERS* pointers) {
+    if (pointers->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && t_rearm != nullptr) {
+        const std::lock_guard guard(g_lock);
+        if (t_rearm->armed) WriteByte(t_rearm->address, kBreakpoint);
+        t_rearm = nullptr;
+        pointers->ContextRecord->EFlags &= ~kTrapFlag;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (pointers->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
     const auto at = reinterpret_cast<std::uintptr_t>(pointers->ExceptionRecord->ExceptionAddress);
     const std::lock_guard guard(g_lock);
     for (Probe& probe : g_probes) {
         if (!probe.armed || probe.address != at) continue;
         CONTEXT& c = *pointers->ContextRecord;
-        AbxLog("probe", "hit at %p: rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx rbp %llx rsp %llx r8 %llx r9 %llx r10 %llx r11 %llx r12 %llx r13 %llx r14 %llx r15 %llx",
-               reinterpret_cast<void*>(at), c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15);
+        ++probe.hits;
+        AbxLog("probe", "hit %u at %p: rax %llx rbx %llx rcx %llx rdx %llx rsi %llx rdi %llx rbp %llx rsp %llx r8 %llx r9 %llx r10 %llx r11 %llx r12 %llx r13 %llx r14 %llx r15 %llx",
+               probe.hits, reinterpret_cast<void*>(at), c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15);
         for (const Watch& watch : probe.watches) {
             const std::uintptr_t address = static_cast<std::uintptr_t>(Register(c, watch.reg) + watch.offset);
             std::string text;
+            if (watch.text) {
+                char characters[97]{};
+                if (Readable(address, 1)) {
+                    for (std::size_t index = 0; index + 1 < sizeof(characters) && Readable(address + index, 1); ++index) {
+                        const char value = reinterpret_cast<const char*>(address)[index];
+                        if (value == 0) break;
+                        characters[index] = value >= 32 && value < 127 ? value : '.';
+                    }
+                }
+                AbxLog("probe", "  \"%s\" at [%s%+lld]", characters, watch.reg.c_str(), static_cast<long long>(watch.offset));
+                continue;
+            }
             if (Readable(address, kDumpQwords * 8)) {
                 std::uint64_t values[kDumpQwords];
                 std::memcpy(values, reinterpret_cast<const void*>(address), sizeof(values));
@@ -77,12 +113,12 @@ LONG CALLBACK OnBreakpoint(EXCEPTION_POINTERS* pointers) {
             }
             AbxLog("probe", "  [%s%+lld] = %p:%s", watch.reg.c_str(), static_cast<long long>(watch.offset), reinterpret_cast<void*>(address), text.c_str());
         }
-        DWORD old = 0;
-        VirtualProtect(reinterpret_cast<void*>(at), 1, PAGE_EXECUTE_READWRITE, &old);
-        *reinterpret_cast<std::uint8_t*>(at) = probe.original;
-        VirtualProtect(reinterpret_cast<void*>(at), 1, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), 1);
-        probe.armed = false;
+        WriteByte(at, probe.original);
+        probe.armed = probe.hits < probe.limit;
+        if (probe.armed) {
+            t_rearm = &probe;
+            c.EFlags |= kTrapFlag;
+        }
         c.Rip = at;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -98,7 +134,8 @@ std::vector<Watch> ParseWatches(const std::string& text) {
         const std::string item = text.substr(start, end - start);
         const std::size_t sign = item.find_first_of("+-");
         Watch watch;
-        watch.reg = item.substr(0, sign);
+        watch.text = item.rfind("s:", 0) == 0;
+        watch.reg = item.substr(watch.text ? 2 : 0, sign == std::string::npos ? std::string::npos : sign - (watch.text ? 2 : 0));
         if (sign != std::string::npos) watch.offset = std::strtoll(item.c_str() + sign, nullptr, 16);
         if (!watch.reg.empty()) watches.push_back(watch);
         start = end + 1;
@@ -109,11 +146,13 @@ std::vector<Watch> ParseWatches(const std::string& text) {
 }
 
 void InstallProbes() {
-    char buffer[512];
-    const DWORD length = GetEnvironmentVariableA("ANYBOX_PROBE", buffer, sizeof(buffer));
-    if (length == 0 || length >= sizeof(buffer)) return;
+    const DWORD needed = GetEnvironmentVariableA("ANYBOX_PROBE", nullptr, 0);
+    if (needed <= 1) return;
+    std::string spec(needed, ' ');
+    const DWORD length = GetEnvironmentVariableA("ANYBOX_PROBE", spec.data(), needed);
+    if (length == 0 || length >= needed) return;
+    spec.resize(length);
     const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-    const std::string spec(buffer, length);
     std::size_t start = 0;
     const std::lock_guard guard(g_lock);
     while (start < spec.size()) {
@@ -122,7 +161,10 @@ void InstallProbes() {
         const std::string item = spec.substr(start, end - start);
         const std::size_t at = item.find('@');
         Probe probe;
-        probe.address = base + std::strtoull(item.substr(0, at).c_str(), nullptr, 16);
+        const std::string head = item.substr(0, at);
+        const std::size_t count = head.find('#');
+        probe.address = base + std::strtoull(head.substr(0, count).c_str(), nullptr, 16);
+        if (count != std::string::npos) probe.limit = static_cast<std::uint32_t>((std::max)(1ul, std::strtoul(head.c_str() + count + 1, nullptr, 10)));
         if (at != std::string::npos) probe.watches = ParseWatches(item.substr(at + 1));
         DWORD old = 0;
         if (VirtualProtect(reinterpret_cast<void*>(probe.address), 1, PAGE_EXECUTE_READWRITE, &old)) {

@@ -10,6 +10,8 @@ ABX_API XSystemDeviceType XSystemGetDeviceType() {
     }
     const std::string_view family(configured);
     if (family == "Scarlett") {
+        const char* model = AbxSetting("runtime.console_model");
+        if (model != nullptr && std::string_view(model) == "series_s") return XSystemDeviceType::XboxScarlettLockhart;
         return XSystemDeviceType::XboxScarlettAnaconda;
     }
     if (family == "XboxOne") {

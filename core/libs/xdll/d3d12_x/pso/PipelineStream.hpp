@@ -15,6 +15,7 @@ struct ParsedPipelineStream {
     D3D12_SHADER_BYTECODE mesh{};
     D3D12_SHADER_BYTECODE amplification{};
     std::string types;
+    bool depthBounds = false;
 };
 
 std::optional<ParsedPipelineStream> ParsePipelineStream(const void* stream, std::size_t bytes, std::string& error);

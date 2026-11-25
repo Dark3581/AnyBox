@@ -19,6 +19,8 @@ namespace {
 const char* const kImageWordsUnknown =
     "image and sampler descriptor words in a shader-visible heap need the console's image (T#) and sampler (S#) descriptor layouts, which are not sourced yet";
 
+std::atomic<DescriptorWriter*> g_writer{nullptr};
+
 Resource* Ours(ID3D12Resource* resource, const char* function) {
     if (resource == nullptr) {
         return nullptr;
@@ -168,6 +170,7 @@ void DescriptorWriter::WriteImageView(Resource* resource, const std::optional<Im
 }
 
 ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkImageViewCreateInfo& info, VkImageView view, bool unorderedAccess, const char* function) {
+    g_writer.store(this);
     const std::lock_guard guard(imageLock_);
     const auto known = images_.find(view);
     if (known != images_.end()) return known->second.words;
@@ -176,6 +179,11 @@ ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkIma
     std::optional<ImageFormatInfo> format = ImageFormatOf(info.format);
     if (!format && (info.format == VK_FORMAT_D32_SFLOAT_S8_UINT || info.format == VK_FORMAT_D32_SFLOAT)) {
         if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) format = ImageFormatOf(VK_FORMAT_R32_SFLOAT);
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT) format = ImageFormatOf(VK_FORMAT_R8_UINT);
+    }
+    if (!format && info.format == VK_FORMAT_D24_UNORM_S8_UINT) {
+        constexpr std::uint32_t kDepth24Stencil8Unorm = 141;
+        if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT) format = ImageFormatInfo{kDepth24Stencil8Unorm, ImageComponent::Float};
         if (info.subresourceRange.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT) format = ImageFormatOf(VK_FORMAT_R8_UINT);
     }
     if (!format) {
@@ -225,10 +233,14 @@ ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkIma
         if (!reported.exchange(true)) {
             AbxLog("d3d12_x", "multisampled textures get image descriptor words but no bindless slot: the title layout has no multisampled image binding");
         }
-        images_.emplace(view, BoundImage{*words});
+        images_.emplace(view, BoundImage{*words, resource});
         return *words;
     }
-    std::uint32_t& slot = nextImageSlot_.try_emplace(*binding, 1u).first->second;
+    std::uint32_t& next = nextImageSlot_.try_emplace(*binding, 1u).first->second;
+    std::vector<std::uint32_t>& freed = freeImageSlots_[*binding];
+    const bool reused = !freed.empty();
+    std::uint32_t slot = reused ? freed.back() : next;
+    if (reused) freed.pop_back();
     std::string error;
     VkImageView bound = view;
     if (cube) {
@@ -244,22 +256,72 @@ ImageDescriptorWords DescriptorWriter::BindImage(Resource* resource, const VkIma
         AbxUnsupported(function, "the bindless descriptor table refused a new image key");
     }
     Check(context_.bindless->Upload(error), function, error);
-    ++slot;
-    images_.emplace(view, BoundImage{*words});
+    if (!reused) ++next;
+    images_.emplace(view, BoundImage{*words, resource, *binding, slot, true});
     return *words;
+}
+
+void DescriptorWriter::ForgetResource(const Resource* resource) {
+    DescriptorWriter* writer = g_writer.load();
+    if (writer == nullptr || resource == nullptr) return;
+    const std::lock_guard guard(writer->imageLock_);
+    bool erased = false;
+    for (auto it = writer->images_.begin(); it != writer->images_.end();) {
+        if (it->second.resource != resource) {
+            ++it;
+            continue;
+        }
+        if (it->second.hasSlot && writer->context_.bindless != nullptr) {
+            std::uint32_t words[8];
+            std::copy(it->second.words.begin(), it->second.words.end(), words);
+            writer->context_.bindless->Table().Erase(ImageKey(words));
+            writer->freeImageSlots_[it->second.binding].push_back(it->second.slot);
+            erased = true;
+            const std::uint64_t recycled = ++writer->recycledImageSlots_;
+            if (recycled == 1) {
+                AbxLog("d3d12_x", "bindless image slots of destroyed textures are reused (first: binding %u slot %u)", it->second.binding, it->second.slot);
+            }
+        }
+        it = writer->images_.erase(it);
+    }
+    if (erased) {
+        std::string error;
+        if (!writer->context_.bindless->Upload(error)) AbxLog("d3d12_x", "uploading the bindless lookup table after freeing image slots failed: %s", error.c_str());
+    }
 }
 
 void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
     const char* function = "ID3D12Device::CreateShaderResourceView";
     const Target target = Resolve(destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, function);
     Resource* ours = Ours(resource, function);
+    D3D12_SHADER_RESOURCE_VIEW_DESC shifted{};
+    if (ours != nullptr && desc != nullptr && ours->SkippedMips() != 0) {
+        shifted = *desc;
+        const UINT skip = ours->SkippedMips();
+        const auto shift = [skip](UINT& mostDetailed, FLOAT& clamp) {
+            mostDetailed = mostDetailed > skip ? mostDetailed - skip : 0;
+            clamp = clamp > static_cast<FLOAT>(skip) ? clamp - static_cast<FLOAT>(skip) : 0.0f;
+        };
+        switch (shifted.ViewDimension) {
+        case D3D12_SRV_DIMENSION_TEXTURE2D: shift(shifted.Texture2D.MostDetailedMip, shifted.Texture2D.ResourceMinLODClamp); break;
+        case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: shift(shifted.Texture2DArray.MostDetailedMip, shifted.Texture2DArray.ResourceMinLODClamp); break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBE: shift(shifted.TextureCube.MostDetailedMip, shifted.TextureCube.ResourceMinLODClamp); break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: shift(shifted.TextureCubeArray.MostDetailedMip, shifted.TextureCubeArray.ResourceMinLODClamp); break;
+        default: break;
+        }
+        desc = &shifted;
+    }
     std::string error;
     if (ours == nullptr) {
         if (desc == nullptr) {
             AbxUnsupported(function, "a null shader resource view without a description");
         }
         if (desc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
-            AbxUnsupported(function, "ray tracing acceleration structures");
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
+                AbxLog("d3d12_x", "ray tracing acceleration structure views (first at GPU address 0x%llx) are written as empty descriptors: AnyBox does not build acceleration structures, so the title's rays hit nothing (ray-traced shadows and reflections are missing)",
+                       static_cast<unsigned long long>(desc->RaytracingAccelerationStructure.Location));
+            }
         }
         WriteWords(target, nullptr, 0);
         target.heap->Record(target.index) = DescriptorRecord{};
@@ -291,6 +353,26 @@ void DescriptorWriter::CreateShaderResourceViewAt(std::uint64_t address, std::ui
     WriteWords(target, words->data(), kBufferDescriptorBytes);
     DescriptorRecord record;
     record.kind = HeapEntry::Buffer;
+    target.heap->Record(target.index) = record;
+}
+
+void DescriptorWriter::CreateUnorderedAccessViewAt(std::uint64_t address, std::uint64_t bytes, const D3D12_UNORDERED_ACCESS_VIEW_DESC& desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    const char* function = "ID3D12Device::CreateUnorderedAccessView (buffer at an address)";
+    const Target target = Resolve(destination, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, function);
+    if (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER && desc.Buffer.NumElements == 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) AbxLog("d3d12_x", "unordered access views of zero elements at an address are written as null descriptors");
+        WriteWords(target, nullptr, 0);
+        target.heap->Record(target.index) = DescriptorRecord{};
+        return;
+    }
+    std::string error;
+    const std::optional<BufferDescriptorWords> words = UnorderedAccessBufferDescriptor(address, bytes, desc, false, error);
+    Check(words.has_value(), function, error);
+    WriteWords(target, words->data(), kBufferDescriptorBytes);
+    DescriptorRecord record;
+    record.kind = HeapEntry::Buffer;
+    record.unorderedAccess = true;
     target.heap->Record(target.index) = record;
 }
 
@@ -326,7 +408,20 @@ void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D1
     if (counter != nullptr) {
         AbxUnsupported(function, "a counter on a texture unordered access view");
     }
-    WriteImageView(ours, UnorderedAccessView(ours->Texture().desc, desc, error), true, target, function, error);
+    const TextureImage& layout = ours->Texture().layout;
+    if (layout.depthUnorderedAccess && (layout.info.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x",
+                   "%s: the device offers no storage images of Vulkan depth format %d, so unordered access views of such depth textures are written as null views "
+                   "(shader writes through them are dropped, reads return zero; later views are not logged)",
+                   function, static_cast<int>(layout.info.format));
+        }
+        WriteWords(target, nullptr, 0);
+        target.heap->Record(target.index) = DescriptorRecord{};
+        return;
+    }
+    WriteImageView(ours, UnorderedAccessView(ours->Texture().layout, ours->Texture().desc, desc, error), true, target, function, error);
 }
 
 void DescriptorWriter::CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
@@ -503,6 +598,29 @@ void DescriptorWriter::CopyDescriptors(UINT destinationRanges, const D3D12_CPU_D
         destinationDone += run;
         sourceDone += run;
     }
+}
+
+std::string DescriptorWriter::DescribeImageWords(const std::uint32_t* words) {
+    DescriptorWriter* writer = g_writer.load();
+    if (writer == nullptr) return "no writer";
+    const std::lock_guard guard(writer->imageLock_);
+    for (const auto& [view, bound] : writer->images_) {
+        if (std::memcmp(bound.words.data(), words, sizeof(std::uint32_t) * 8) != 0) continue;
+        if (bound.resource == nullptr) return "a known view";
+        const D3D12_RESOURCE_DESC& desc = bound.resource->Texture().desc;
+        char text[160];
+        std::snprintf(text, sizeof(text), "texture %p %llux%u f%d at title 0x%llx", static_cast<void*>(bound.resource->Texture().image), static_cast<unsigned long long>(desc.Width),
+                      desc.Height, static_cast<int>(desc.Format), static_cast<unsigned long long>(bound.resource->TitleAddress()));
+        return text;
+    }
+    char text[200];
+    const std::uint64_t address = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xFF) << 32)) << 8;
+    const std::uint32_t width = (((words[1] >> 30) & 3) | ((words[2] & 0xFFF) << 2)) + 1;
+    const std::uint32_t height = ((words[2] >> 14) & 0x3FFF) + 1;
+    std::snprintf(text, sizeof(text), "title T#: address 0x%llx format %u %ux%u type %u swizzle %u mips %u..%u words %08x %08x %08x %08x",
+                  static_cast<unsigned long long>(address), (words[1] >> 20) & 0x1FF, width, height, words[3] >> 28, (words[3] >> 20) & 0x1F, (words[3] >> 12) & 0xF,
+                  (words[3] >> 16) & 0xF, words[0], words[1], words[2], words[3]);
+    return text;
 }
 
 }

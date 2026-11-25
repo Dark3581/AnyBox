@@ -9,6 +9,7 @@
 #include "Resource.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -18,9 +19,16 @@
 
 namespace abx::d3d12x {
 
+struct PendingConstants {
+    UINT index = 0;
+    UINT offset = 0;
+    std::vector<std::uint32_t> values;
+};
+
 struct RootArguments {
     const RootSignature* signature = nullptr;
     std::array<std::uint32_t, kRootSignatureWordLimit> words{};
+    std::vector<PendingConstants> pending;
 };
 
 class CommandList final : public DeviceChildBase<ID3D12GraphicsCommandList> {
@@ -36,6 +44,10 @@ public:
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT, UINT, UINT, INT, UINT) override;
     void STDMETHODCALLTYPE Dispatch(UINT, UINT, UINT) override;
     void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* destination, UINT64 destinationOffset, ID3D12Resource* source, UINT64 sourceOffset, UINT64 bytes) override;
+    void CopyMemoryToMemory(std::uint64_t destination, std::uint64_t source, std::uint64_t bytes, const char* function);
+    void DrawIndexedAt(std::uint64_t address, DXGI_FORMAT format, UINT count, const char* function);
+    void* AllocateTransient(std::size_t bytes, std::size_t alignment, const char* function);
+    void FillTitleMemory(std::uint64_t destination, std::uint64_t bytes, const std::uint8_t (&pattern)[16], std::uint32_t unit, const char* function);
     void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* destination, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* source,
                                              const D3D12_BOX* box) override;
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* destination, ID3D12Resource* source) override;
@@ -90,6 +102,7 @@ public:
     const std::vector<AttachmentRef>& RenderTargets() const { return renderTargets_; }
     const std::optional<AttachmentRef>& DepthStencil() const { return depthStencil_; }
     const PipelineStateObject* Pipeline() const { return pipeline_; }
+    void DispatchMesh(UINT x, UINT y, UINT z);
     const RootArguments& GraphicsArguments() const { return graphics_; }
     const RootArguments& ComputeArguments() const { return compute_; }
 
@@ -107,16 +120,19 @@ private:
     const DescriptorRecord& Attachment(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_DESCRIPTOR_HEAP_TYPE type, const char* function) const;
     void ResetBindings();
     void OrderCopy(const char* function);
+    std::optional<TitleAddressSpace::Location> LocateTitleMemory(std::uint64_t address, std::uint64_t wanted, bool write, std::uint64_t& available, std::uint64_t bytes, const char* function);
     void BindPipeline(ID3D12PipelineState* state, const char* function);
     void SetSignature(RootArguments& arguments, ID3D12RootSignature* signature, const char* function);
     void ReportRootState(const RootArguments& arguments, const char* function) const;
     void EndPass();
     bool PrepareDraw(const char* function);
-    bool SkippedWork(const char* function) const;
-    void PushUserData(const RootArguments& arguments, std::uint32_t firstSgpr, const char* function);
+    bool SkippedWork(const char* function);
+    void PushUserData(RootArguments& arguments, std::uint32_t firstSgpr, const char* function);
     void BindTitleSet(VkPipelineBindPoint point);
     const RootParameterLayout& Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const;
     void SetConstants(RootArguments& arguments, UINT index, UINT count, const void* data, UINT offset, const char* function);
+    static bool WriteConstants(RootArguments& arguments, UINT index, UINT offset, const std::uint32_t* values, UINT count);
+    static void ApplyPending(RootArguments& arguments);
     void SetRootView(RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, D3D12_GPU_VIRTUAL_ADDRESS address, const char* function);
     void SetTable(RootArguments& arguments, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle, const char* function);
 
@@ -129,12 +145,46 @@ private:
     DescriptorHeap* shaderResourceHeap_ = nullptr;
     DescriptorHeap* samplerHeap_ = nullptr;
     std::vector<AttachmentRef> renderTargets_;
+    std::vector<Resource*> targetResources_;
+    std::array<D3D12_VERTEX_BUFFER_VIEW, 4> traceViews_{};
+    D3D12_INDEX_BUFFER_VIEW indexView_{};
+    CommandAllocator* allocator_ = nullptr;
     std::optional<AttachmentRef> depthStencil_;
-    PipelineStateObject* pipeline_ = nullptr;
+    bool targetsSet_ = false;
+    UINT emptyTargets_ = 0;
+    bool depthHandleGiven_ = false;
+    class HeldPipeline {
+    public:
+        HeldPipeline() = default;
+        ~HeldPipeline() { Reset(); }
+        HeldPipeline(const HeldPipeline&) = delete;
+        HeldPipeline& operator=(const HeldPipeline&) = delete;
+        HeldPipeline& operator=(PipelineStateObject* pipeline) {
+            if (pipeline != nullptr) pipeline->AddRef();
+            Reset();
+            pipeline_ = pipeline;
+            return *this;
+        }
+        HeldPipeline& operator=(std::nullptr_t) {
+            Reset();
+            return *this;
+        }
+        PipelineStateObject* operator->() const { return pipeline_; }
+        operator PipelineStateObject*() const { return pipeline_; }
+
+    private:
+        void Reset() {
+            if (pipeline_ != nullptr) pipeline_->Release();
+            pipeline_ = nullptr;
+        }
+        PipelineStateObject* pipeline_ = nullptr;
+    };
+    HeldPipeline pipeline_;
     RootArguments graphics_;
     RootArguments compute_;
     bool rendering_ = false;
     bool rectangles_ = false;
+    bool pipelineBound_ = false;
     bool graphicsSetBound_ = false;
     bool computeSetBound_ = false;
 };

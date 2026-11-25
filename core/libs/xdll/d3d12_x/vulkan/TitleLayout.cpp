@@ -14,13 +14,13 @@ std::vector<BindingSpec> Build() {
     using C = ImageComponent;
     using F = ImageFormat;
     std::vector<BindingSpec> bindings = {
-        Spec(0, K::SampledImage, D::Dim2D, false, C::Float, F::Unknown, 8192),
+        Spec(0, K::SampledImage, D::Dim2D, false, C::Float, F::Unknown, 65536),
         Spec(1, K::Sampler, D::None, false, C::None, F::None, 2048),
         Spec(2, K::StorageBuffer, D::None, false, C::None, F::None, 1),
-        Spec(3, K::SampledImage, D::Dim2D, true, C::Float, F::Unknown, 2048),
+        Spec(3, K::SampledImage, D::Dim2D, true, C::Float, F::Unknown, 16384),
         Spec(4, K::StorageImage, D::Dim2D, false, C::Uint, F::R32ui, 1024),
-        Spec(5, K::SampledImage, D::Dim1D, false, C::Float, F::Unknown, 256),
-        Spec(6, K::SampledImage, D::Dim3D, false, C::Float, F::Unknown, 512),
+        Spec(5, K::SampledImage, D::Dim1D, false, C::Float, F::Unknown, 8192),
+        Spec(6, K::SampledImage, D::Dim3D, false, C::Float, F::Unknown, 4096),
         Spec(7, K::StorageImage, D::Dim3D, false, C::Uint, F::R32ui, 256),
     };
     const ImageDim storageDims[] = {D::Dim2D, D::Dim2D, D::Dim3D};

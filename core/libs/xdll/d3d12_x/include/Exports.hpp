@@ -27,3 +27,4 @@ ABX_API HRESULT D3D12CreateRootSignatureDeserializer(const void* data, SIZE_T si
 ABX_API HRESULT D3D12CreateVersionedRootSignatureDeserializer(const void* data, SIZE_T size, REFIID iid, void** deserializer);
 
 ABX_API HRESULT D3D12ConfigureVirtualMemoryX(const void* description);
+ABX_API const void* AbxD3D12TitleHostView(std::uint64_t address);

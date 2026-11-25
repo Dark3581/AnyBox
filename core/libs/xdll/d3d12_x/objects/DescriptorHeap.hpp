@@ -28,6 +28,8 @@ public:
     static HRESULT Create(const ResourceContext& context, IUnknown* parent, const D3D12_DESCRIPTOR_HEAP_DESC& desc, const DescriptorSizes& sizes, REFIID riid, void** heap,
                           std::string& error);
     static DescriptorHeap* Find(SIZE_T cpu, UINT& index);
+    static void ReportForeignDescriptors();
+    static const std::uint8_t* AtGpuAddress(std::uint64_t gpu, UINT& increment);
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
     D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE GetDesc(D3D12_DESCRIPTOR_HEAP_DESC* desc) override {

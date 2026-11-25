@@ -1,7 +1,7 @@
 #include <windows.h>
 
 #if defined(FAKE_MODULE_STOP)
-extern "C" __declspec(dllimport) HRESULT D3D12XboxCreateDevice();
+extern "C" __declspec(dllimport) HRESULT D3D12GetDebugInterface();
 #endif
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
@@ -11,7 +11,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
 #if defined(FAKE_MODULE_FAIL)
     return FALSE;
 #elif defined(FAKE_MODULE_STOP)
-    D3D12XboxCreateDevice();
+    D3D12GetDebugInterface();
     return TRUE;
 #elif defined(FAKE_MODULE_CRASH)
     volatile int* null = nullptr;

@@ -1,12 +1,113 @@
 #include "Resource.hpp"
 
 #include "AbxApi.hpp"
+#include "DescriptorWriter.hpp"
+#include "LiveStats.hpp"
 #include "ResourceState.hpp"
+#include "GraphicsState.hpp"
 #include "TextureDesc.hpp"
 
+#include <algorithm>
+#include <iterator>
+#include <vector>
+#include <memory>
+#include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <optional>
+#include <map>
+#include <mutex>
 
 namespace abx::d3d12x {
+
+namespace {
+
+constexpr VkDeviceSize kPoolBlockBytes = 64ull << 20;
+constexpr VkDeviceSize kPooledLimit = 1ull << 20;
+
+struct PoolBlock {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::uint32_t type = 0;
+    std::map<VkDeviceSize, VkDeviceSize> free;
+};
+
+struct TexturePool {
+    std::mutex lock;
+    std::vector<std::unique_ptr<PoolBlock>> blocks;
+};
+
+TexturePool& Pool() {
+    static TexturePool* pool = new TexturePool();
+    return *pool;
+}
+
+bool Carve(PoolBlock& block, VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset) {
+    for (auto range = block.free.begin(); range != block.free.end(); ++range) {
+        const VkDeviceSize start = range->first;
+        const VkDeviceSize length = range->second;
+        const VkDeviceSize aligned = (start + alignment - 1) / alignment * alignment;
+        if (aligned + size > start + length) continue;
+        block.free.erase(range);
+        if (aligned > start) block.free[start] = aligned - start;
+        if (aligned + size < start + length) block.free[aligned + size] = start + length - (aligned + size);
+        offset = aligned;
+        return true;
+    }
+    return false;
+}
+
+bool PoolAllocate(const VulkanDevice& device, std::uint32_t type, VkDeviceSize size, VkDeviceSize alignment, void*& handle, VkDeviceSize& offset) {
+    TexturePool& pool = Pool();
+    const std::lock_guard guard(pool.lock);
+    for (const std::unique_ptr<PoolBlock>& block : pool.blocks) {
+        if (block->type == type && Carve(*block, size, (std::max)(alignment, VkDeviceSize{1}), offset)) {
+            handle = block.get();
+            return true;
+        }
+    }
+    auto block = std::make_unique<PoolBlock>();
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = kPoolBlockBytes;
+    allocate.memoryTypeIndex = type;
+    if (device.Vk().allocateMemory(device.Handle(), &allocate, nullptr, &block->memory) != VK_SUCCESS) return false;
+    block->type = type;
+    block->free[0] = kPoolBlockBytes;
+    Stats().poolBlockBytes += kPoolBlockBytes;
+    if (!Carve(*block, size, (std::max)(alignment, VkDeviceSize{1}), offset)) return false;
+    handle = block.get();
+    pool.blocks.push_back(std::move(block));
+    if (pool.blocks.size() == 1) {
+        AbxLog("d3d12_x", "textures up to %llu KiB share %llu MiB blocks of video memory instead of one allocation each (each allocation costs at least 64 KiB on this driver)",
+               static_cast<unsigned long long>(kPooledLimit >> 10), static_cast<unsigned long long>(kPoolBlockBytes >> 20));
+    }
+    return true;
+}
+
+void PoolFree(void* handle, VkDeviceSize offset, VkDeviceSize size) {
+    TexturePool& pool = Pool();
+    const std::lock_guard guard(pool.lock);
+    auto& free = static_cast<PoolBlock*>(handle)->free;
+    VkDeviceSize start = offset;
+    VkDeviceSize length = size;
+    auto next = free.lower_bound(start);
+    if (next != free.begin()) {
+        auto previous = std::prev(next);
+        if (previous->first + previous->second == start) {
+            start = previous->first;
+            length += previous->second;
+            free.erase(previous);
+        }
+    }
+    next = free.lower_bound(start + length);
+    if (next != free.end() && next->first == start + length) {
+        length += next->second;
+        free.erase(next);
+    }
+    free[start] = length;
+}
+
+}
+
 
 namespace {
 
@@ -45,6 +146,10 @@ HRESULT Resource::CreateCommitted(const ResourceContext& context, IUnknown* pare
     }
     Resource* created = new Resource(context, parent, heap, heapFlags, desc);
     const bool built = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? created->CreateBuffer(error) : created->CreateTexture(initial, error);
+    if (built && desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width >= 1024 && (static_cast<UINT>(desc.Flags) & 7u) == 0) {
+        AbxLog("d3d12_x", "DIAG big texture %p %llux%u mips %u format %d flags 0x%x heap %d", static_cast<void*>(created->texture_.image), static_cast<unsigned long long>(desc.Width),
+               desc.Height, desc.MipLevels, static_cast<int>(desc.Format), static_cast<unsigned>(desc.Flags), static_cast<int>(heap.Type));
+    }
     if (!built) {
         created->Release();
         return E_INVALIDARG;
@@ -96,9 +201,16 @@ HRESULT Resource::CreateAtTitleAddress(const ResourceContext& context, IUnknown*
         return E_INVALIDARG;
     }
     MEMORY_BASIC_INFORMATION region{};
-    if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT) {
-        error = "the title address is not committed memory";
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) || region.State == MEM_FREE) {
+        error = "the title address is not reserved or committed memory";
         return E_INVALIDARG;
+    }
+    if (region.State != MEM_COMMIT) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "buffers are placed at reserved title addresses too (first 0x%llx): their pages are the GPU-only ones the title maps through command queue slot 31, located when the buffer is used",
+                   static_cast<unsigned long long>(address));
+        }
     }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1};
     Resource* created = new Resource(context, parent, heap, D3D12_HEAP_FLAG_NONE, desc);
@@ -118,9 +230,27 @@ HRESULT Resource::CreateAtTitleAddress(const ResourceContext& context, IUnknown*
     return result;
 }
 
+std::optional<BufferRef> Resource::BufferSpan(UINT64 offset, UINT64 bytes) const {
+    if (offset > desc_.Width || bytes > desc_.Width - offset) return std::nullopt;
+    if (titleAddress_ == 0) return BufferRef{context_.window.Buffer(), offset_ + offset, bytes};
+    if (context_.addresses == nullptr) return std::nullopt;
+    std::uint64_t available = 0;
+    const std::optional<TitleAddressSpace::Location> located = context_.addresses->LocateRun(titleAddress_ + offset, available);
+    if (!located) return std::nullopt;
+    return BufferRef{located->buffer, located->offset, (std::min)(available, static_cast<std::uint64_t>(bytes))};
+}
+
 BufferRef Resource::Buffer() const {
     if (titleAddress_ != 0) {
-        AbxUnsupported("ID3D12Resource", "GPU access to a buffer at a title address: the title's own memory has no Vulkan backing yet");
+        if (context_.addresses != nullptr) {
+            if (const std::optional<TitleAddressSpace::Location> located = context_.addresses->Locate(titleAddress_, desc_.Width)) {
+                return {located->buffer, located->offset, desc_.Width};
+            }
+        }
+        char text[160];
+        std::snprintf(text, sizeof(text), "GPU access to a buffer at title address 0x%llx (%llu bytes) that is in no GPU-visible title memory",
+                      static_cast<unsigned long long>(titleAddress_), static_cast<unsigned long long>(desc_.Width));
+        AbxUnsupported("ID3D12Resource", text);
     }
     return {context_.window.Buffer(), offset_, desc_.Width};
 }
@@ -149,9 +279,19 @@ bool Resource::CreateTexture(D3D12_RESOURCE_STATES initial, std::string& error) 
         error = "a texture with the driver-chosen layout must be in a default heap";
         return false;
     }
-    const std::optional<TextureImage> image = TranslateTextureDesc(desc_, error);
+    std::optional<TextureImage> image = TranslateTextureDesc(desc_, error);
     if (!image) {
         return false;
+    }
+    if (desc_.Format == kConsoleD16UnormS8Uint) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "console format 118 (16-bit depth, 8-bit stencil) is stored as Vulkan D32_SFLOAT_S8_UINT: depth keeps at least 16-bit precision, "
+                              "but depth bias follows float rules and copies of these textures are refused");
+        }
+    }
+    if (image->depthUnorderedAccess && (context_.device.OptimalFeatures(image->info.format) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0) {
+        image->info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     }
     for (const std::string& feature : image->features) {
         if (!context_.device.HasFeature(feature)) {
@@ -173,12 +313,48 @@ bool Resource::CreateTexture(D3D12_RESOURCE_STATES initial, std::string& error) 
     VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocate.allocationSize = needs.size;
     allocate.memoryTypeIndex = type.value_or(0);
-    if (!type || vk.allocateMemory(context_.device.Handle(), &allocate, nullptr, &memory_) != VK_SUCCESS) {
+    const bool pooled = type && needs.size <= kPooledLimit && image->info.tiling == VK_IMAGE_TILING_OPTIMAL &&
+                        PoolAllocate(context_.device, *type, needs.size, needs.alignment, poolBlock_, poolOffset_);
+    if (pooled) poolSize_ = needs.size;
+    VkResult allocated = pooled ? VK_SUCCESS : type ? vk.allocateMemory(context_.device.Handle(), &allocate, nullptr, &memory_) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (allocated != VK_SUCCESS) {
         memory_ = VK_NULL_HANDLE;
-        error = "no device memory for the texture";
-        return false;
+        const VkResult deviceResult = allocated;
+        const std::optional<std::uint32_t> host = context_.device.SystemMemoryType(needs.memoryTypeBits);
+        if (host) {
+            allocate.memoryTypeIndex = *host;
+            allocated = vk.allocateMemory(context_.device.Handle(), &allocate, nullptr, &memory_);
+        }
+        if (allocated != VK_SUCCESS) {
+            memory_ = VK_NULL_HANDLE;
+            error = "no device memory for the texture (device-local allocation " + std::to_string(static_cast<int>(deviceResult)) + ", system-memory allocation " +
+                    (host ? std::to_string(static_cast<int>(allocated)) : std::string("impossible: the image allows no system-memory type")) + ")";
+            return false;
+        }
+        static std::atomic<std::uint64_t> spilled{0};
+        const std::uint64_t count = ++spilled;
+        if (count == 1 || (count & (count - 1)) == 0) {
+            AbxLog("d3d12_x", "device-local memory is exhausted (VkResult %d): textures are placed in system memory the GPU reads over PCIe instead (%llu so far, this one %llu KiB)",
+                   static_cast<int>(deviceResult), static_cast<unsigned long long>(count), static_cast<unsigned long long>(needs.size >> 10));
+        }
     }
-    if (vk.bindImageMemory(context_.device.Handle(), texture_.image, memory_, 0) != VK_SUCCESS) {
+    textureBytes_ = needs.size;
+    Stats().textureBytes += textureBytes_;
+    ++Stats().textureCount;
+    constexpr UINT kWrittenFlags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    textureBucket_ = TextureBucket((static_cast<UINT>(desc_.Flags) & kWrittenFlags) != 0, textureBytes_);
+    Stats().textureBucketBytes[textureBucket_] += textureBytes_;
+    ++Stats().textureBucketCount[textureBucket_];
+    if (needs.size >= (16ull << 20)) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 120) {
+            AbxLog("d3d12_x", "DIAG large texture %llu MiB: %llux%ux%u, %u mips, format %d, %u samples, flags 0x%x", static_cast<unsigned long long>(needs.size >> 20),
+                   static_cast<unsigned long long>(desc_.Width), desc_.Height, desc_.DepthOrArraySize, desc_.MipLevels, static_cast<int>(desc_.Format), desc_.SampleDesc.Count,
+                   static_cast<unsigned>(desc_.Flags));
+        }
+    }
+    const VkDeviceMemory boundMemory = pooled ? static_cast<PoolBlock*>(poolBlock_)->memory : memory_;
+    if (vk.bindImageMemory(context_.device.Handle(), texture_.image, boundMemory, pooled ? poolOffset_ : 0) != VK_SUCCESS) {
         error = "vkBindImageMemory failed";
         return false;
     }
@@ -211,11 +387,73 @@ bool Resource::CreateTexture(D3D12_RESOURCE_STATES initial, std::string& error) 
     return true;
 }
 
+namespace {
+
+std::mutex g_gpuWrittenLock;
+std::multimap<std::uint64_t, Resource*> g_gpuWritten;
+
+}
+
+void Resource::RegisterGpuWritten(std::uint64_t address) {
+    const std::lock_guard guard(g_gpuWrittenLock);
+    gpuWrittenAddress_ = address;
+    g_gpuWritten.emplace(address, this);
+}
+
+Resource* Resource::GpuWrittenSame(std::uint64_t address, const D3D12_RESOURCE_DESC& desc) {
+    const std::lock_guard guard(g_gpuWrittenLock);
+    const auto [first, last] = g_gpuWritten.equal_range(address);
+    for (auto it = first; it != last; ++it) {
+        const D3D12_RESOURCE_DESC& own = it->second->texture_.desc;
+        if (own.Dimension == desc.Dimension && own.Width == desc.Width && own.Height == desc.Height && own.DepthOrArraySize == desc.DepthOrArraySize &&
+            own.MipLevels == desc.MipLevels && own.Format == desc.Format && own.SampleDesc.Count == desc.SampleDesc.Count &&
+            (static_cast<UINT>(own.Flags) & 0xFFFFu) == (static_cast<UINT>(desc.Flags) & 0xFFFFu)) {
+            return it->second;
+        }
+    }
+    return nullptr;
+}
+
+Resource* Resource::GpuWrittenAt(std::uint64_t address, const D3D12_RESOURCE_DESC& desc) {
+    const std::lock_guard guard(g_gpuWrittenLock);
+    Resource* found = nullptr;
+    const auto [first, last] = g_gpuWritten.equal_range(address);
+    for (auto it = first; it != last; ++it) {
+        const D3D12_RESOURCE_DESC& own = it->second->texture_.desc;
+        if (own.Dimension == desc.Dimension && own.Width == desc.Width && own.Height == desc.Height && own.DepthOrArraySize == desc.DepthOrArraySize) found = it->second;
+    }
+    return found;
+}
+
 Resource::~Resource() {
+    DescriptorWriter::ForgetResource(this);
+    if (gpuWrittenAddress_ != 0) {
+        const std::lock_guard guard(g_gpuWrittenLock);
+        const auto [first, last] = g_gpuWritten.equal_range(gpuWrittenAddress_);
+        for (auto it = first; it != last; ++it) {
+            if (it->second == this) {
+                g_gpuWritten.erase(it);
+                break;
+            }
+        }
+    }
     const DeviceFunctions& vk = context_.device.Vk();
     for (const auto& [info, view] : views_) vk.destroyImageView(context_.device.Handle(), view, nullptr);
     if (texture_.image != VK_NULL_HANDLE) vk.destroyImage(context_.device.Handle(), texture_.image, nullptr);
     if (memory_ != VK_NULL_HANDLE) vk.freeMemory(context_.device.Handle(), memory_, nullptr);
+    if (poolBlock_ != nullptr) PoolFree(poolBlock_, poolOffset_, poolSize_);
+    if (gpuWrittenAddress_ != 0 && textureBytes_ >= (4ull << 20)) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 400) {
+            AbxLog("d3d12_x", "DIAG written release 0x%llx %llu KiB", static_cast<unsigned long long>(gpuWrittenAddress_), static_cast<unsigned long long>(textureBytes_ >> 10));
+        }
+    }
+    if (textureBytes_ != 0) {
+        Stats().textureBytes -= textureBytes_;
+        --Stats().textureCount;
+        Stats().textureBucketBytes[textureBucket_] -= textureBytes_;
+        --Stats().textureBucketCount[textureBucket_];
+    }
     if (allocated_) context_.arena.Free(offset_);
     if (titleMemory_ != nullptr && context_.titleMemory != nullptr) context_.titleMemory->release(titleMemory_, titleMemoryAttributes_);
 }

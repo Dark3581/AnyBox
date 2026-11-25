@@ -91,6 +91,13 @@ Each value a library reads is logged with its source (`setting ... = 32 (from an
 | `d3d12_x.descriptor_size.render_target` | descriptor handle increment of render target heaps |
 | `d3d12_x.descriptor_size.depth_stencil` | descriptor handle increment of depth-stencil heaps |
 | `d3d12_x.vulkan_device` | part of the name of the GPU to use, case-insensitive, when several are installed (`python tools/gpu_report.py` lists them); without it the best native GPU is used, and a layered driver such as Dozen only when nothing else can run the title |
+| `d3d12_x.pipeline_cache` | path of the Vulkan pipeline cache file, loaded at start and saved while pipelines are built, so later runs do not compile them again |
+| `d3d12_x.pipeline_workers` | background pipeline build threads, 1 to 64 (default: half the hardware threads), at lowest priority, plus one thread for pipelines over 2 MiB of SPIR-V |
+| `d3d12_x.texture_reduce_above_mib` | texture memory, in MiB, past which large title textures are created without their top mip (default 4608, `0` turns it off); lower values save video memory and look visibly blurrier |
+| `d3d12_x.clamp_indirect_dispatches` | `0` turns off the GPU-side check of indirect dispatch records |
+| `d3d12_x.indirect_dispatch_guard` | `1` skips indirect compute dispatches in a frame where compute work was skipped |
+| `d3d12_x.frame_interval_us` | present pacing interval in microseconds, used instead of the interval the title asks for |
+| `runtime.title_watchdog_pause_rva` | RVA (hex) of the byte that pauses the title's own hang watchdog; AnyBox writes 1 there every 250 ms. Build-specific: record where it was found |
 
 ## Static analysis with Ghidra
 
@@ -183,3 +190,35 @@ Each step writes `build/shaders/build.json`: the translator's revision and wheth
 | `shaders_pipelines` | The last `shader_pipelines` run covered every entry, every chunk completed, and no module or pipeline failed. Skipped until it has run. |
 
 `build.json` and the logs name shaders: like the store, they stay on your machine.
+
+## Bring-up status
+
+How far each title gets. One table per title ID; the detail of each run belongs in the title's bring-up discussion.
+
+### 7952987A, version 1.0.2.1
+
+Tested on 2026-11-24 with an 8 GB desktop GPU (NVIDIA driver) and 12 hardware threads.
+
+| Stage | Status |
+|---|---|
+| Boot, first-run setup, legal screens | passed |
+| Start screen and intro video | renders |
+| Loading screen | renders at 30 to 60 fps; loading took 24 minutes on the run that reached the game |
+| Into the game | reached; gameplay telemetry fires, the title runs real frames for 10+ minutes without stopping |
+| HUD | renders (location box, markers) |
+| Game world | black on the runs so far: the world is drawn with mesh pipelines, which were not built. Mesh pipelines (subobject 24) and mesh draws are now built; not yet seen in game |
+| Frame rate in game | 1 to 3 fps on a first run, while pipelines are still being compiled |
+| Audio | silent: the DSP connection is accepted, its commands are dropped |
+| Ray tracing | the title's acceleration structure builder is not run, so scenes render without ray-traced effects |
+
+First in-game frame with the HUD (2026-11-24): location box and markers over the still-black world.
+
+![First in-game HUD of 7952987A](images/7952987A-first-hud.png)
+
+Open items, in order:
+
+1. Confirm mesh pipelines draw the world, and their first-use compile time in game.
+2. Loading time: most of the CPU goes to the driver's shader compiler during loading.
+3. Video memory: the title fills an 8 GB card; the small-texture pool never returns empty blocks.
+4. Compute shaders that read constants from their own code (shader code in title memory) are skipped.
+5. Indirect draws are not checked on the GPU like indirect dispatches.

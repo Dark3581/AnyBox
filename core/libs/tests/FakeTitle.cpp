@@ -83,7 +83,7 @@ __declspec(dllimport) HRESULT XTaskQueueRegisterMonitor(void* queue, void* conte
 __declspec(dllimport) void XTaskQueueUnregisterMonitor(void* queue, RegistrationToken token);
 __declspec(dllimport) HRESULT XTaskQueueRegisterWaiter(void* queue, std::uint32_t port, HANDLE waitHandle, void* context, void (*callback)(void*, bool), RegistrationToken* token);
 __declspec(dllimport) void XTaskQueueUnregisterWaiter(void* queue, RegistrationToken token);
-__declspec(dllimport) HRESULT XUserAddAsync();
+__declspec(dllimport) HRESULT XUserGetState();
 __declspec(dllimport) std::uint32_t XSystemGetDeviceType();
 __declspec(dllimport) bool XPackageIsPackagedProcess();
 __declspec(dllimport) HRESULT XGameRuntimeInitializeWithOptions(const void* options);
@@ -1724,7 +1724,7 @@ int ApiUnmapped() {
 int main(int argc, char** argv) {
     const char* scenario = argc > 1 ? argv[1] : "taskqueue";
     if (std::strcmp(scenario, "stub") == 0) {
-        XUserAddAsync();
+        XUserGetState();
         return Fail("stub returned");
     }
     if (std::strcmp(scenario, "device") == 0) {

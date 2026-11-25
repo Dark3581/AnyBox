@@ -58,6 +58,7 @@ private:
     VkSampler fallbackSampler_ = VK_NULL_HANDLE;
     std::vector<Fallback> fallbacks_;
     DeviceBuffer tableBuffer_;
+    std::vector<DeviceBuffer> retiredTables_;
     DescriptorHashTable table_;
     std::uint64_t uploaded_ = ~0ull;
 };

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <cstdio>
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -189,6 +190,10 @@ std::optional<std::vector<std::uint32_t>> ReadTitleModule(const std::filesystem:
         return std::nullopt;
     }
     usesCodeBase = usesCodeBase || translated->usesCodeBase;
+    if (translated->unrecognizedHeapUses != 0) {
+        std::fprintf(stderr, "DIAG %s: %zu uses of the heap base the address pass does not rewrite (%zu rewritten)\n", path.filename().string().c_str(),
+                     translated->unrecognizedHeapUses, translated->rewritten);
+    }
     return std::move(translated->words);
 }
 

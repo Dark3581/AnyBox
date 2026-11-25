@@ -59,6 +59,8 @@ HRESULT Unmapped(ApiObject* self) {
 
 HRESULT ThreadingAsyncGetStatus(ApiObject*, XAsyncBlock* block, bool wait) { return XAsyncGetStatus(block, wait); }
 void ThreadingAsyncCancel(ApiObject*, XAsyncBlock* block) { XAsyncCancel(block); }
+HRESULT ThreadingAsyncGetResultSize(ApiObject*, XAsyncBlock* block, std::size_t* size) { return XAsyncGetResultSize(block, size); }
+HRESULT ThreadingAsyncRun(ApiObject*, XAsyncBlock* block, XAsyncWork* work) { return XAsyncRun(block, work); }
 HRESULT ThreadingAsyncBegin(ApiObject*, XAsyncBlock* block, void* context, const void* identity, const char* identityName, XAsyncProvider* provider) {
     return XAsyncBegin(block, context, identity, identityName, provider);
 }
@@ -101,9 +103,9 @@ const void* const kThreadingTable[] = {
     Entry(&ObjectAddRef),
     Entry(&ObjectRelease),
     Entry(&ThreadingAsyncGetStatus),
-    Entry(&Unmapped<4>),
+    Entry(&ThreadingAsyncGetResultSize),
     Entry(&ThreadingAsyncCancel),
-    Entry(&Unmapped<6>),
+    Entry(&ThreadingAsyncRun),
     Entry(&ThreadingAsyncBegin),
     Entry(&Unmapped<8>),
     Entry(&ThreadingAsyncSchedule),
@@ -358,6 +360,118 @@ const void* const kDisplayTable[] = {
 
 ApiObject g_display{kDisplayTable, &kDisplayInterface, "display"};
 
+constexpr GUID kFeatureProvider{0x8836fe87, 0xedb9, 0x4fe3, {0x8d, 0xad, 0x05, 0xf0, 0xd2, 0xcd, 0x5b, 0x40}};
+
+bool FeatureIsAvailable(ApiObject*, std::uint32_t feature) {
+    const bool available = feature == 0 || (feature >= 2 && feature <= 13) || (feature >= 15 && feature <= 21);
+    static std::atomic<std::uint32_t> reported{0};
+    if (feature < 32 && (reported.fetch_or(1u << feature) & (1u << feature)) == 0) {
+        AbxLog("xgameruntime", "XGameRuntimeIsFeatureAvailable(%u) -> %s", feature, available ? "true" : "false (AnyBox refuses that API)");
+    }
+    return available;
+}
+
+const void* const kFeatureTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&FeatureIsAvailable),
+};
+
+ApiObject g_feature{kFeatureTable, &kFeatureProvider, "feature availability"};
+
+constexpr GUID kLaunchProvider{0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+
+HRESULT LaunchUri(ApiObject*, void* user, const char* uri) {
+    static_cast<void>(user);
+    AbxLog("xgameruntime", "XLaunchUri(%s): refused with E_NOTIMPL, as opening a link for the title would act on the host", uri != nullptr ? uri : "(null)");
+    return E_NOTIMPL;
+}
+
+HRESULT DisplayAcquireTimeoutDeferral(ApiObject*, void** handle) {
+    if (handle == nullptr) return E_INVALIDARG;
+    static std::atomic<std::uintptr_t> next{0};
+    *handle = reinterpret_cast<void*>(++next);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("xgameruntime", "XDisplayAcquireTimeoutDeferral: the title gets a deferral handle; AnyBox does not change the host's display timeout (slots 3 to 5 of this provider "
+                               "are XLaunchUri, acquire and close, as xcl maps them)");
+    }
+    return S_OK;
+}
+
+void DisplayCloseTimeoutDeferralHandle(ApiObject*, void* handle) {
+    static_cast<void>(handle);
+}
+
+const void* const kLaunchTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&LaunchUri),
+    Entry(&DisplayAcquireTimeoutDeferral),
+    Entry(&DisplayCloseTimeoutDeferralHandle),
+};
+
+ApiObject g_launch{kLaunchTable, &kLaunchProvider, "launch and display timeout"};
+
+constexpr GUID kGameEventProvider{0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
+
+HRESULT GameEventWrite(ApiObject*, void* user, const char* serviceConfigurationId, const char* playSessionId, const char* name, const char* dimensions, const char* measurements) {
+    static_cast<void>(user);
+    static_cast<void>(serviceConfigurationId);
+    static_cast<void>(playSessionId);
+    static_cast<void>(dimensions);
+    static_cast<void>(measurements);
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1) < 8) {
+        AbxLog("xgameruntime", "XGameEventWrite(%s): telemetry is accepted and dropped (AnyBox is offline)", name != nullptr ? name : "(null)");
+    }
+    return S_OK;
+}
+
+const void* const kGameEventTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&GameEventWrite),
+};
+
+ApiObject g_gameEvent{kGameEventTable, &kGameEventProvider, "game events"};
+
+constexpr GUID kErrorProvider{0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
+
+using ErrorCallback = bool (*)(HRESULT, const char*, void*);
+std::atomic<ErrorCallback> g_errorCallback{nullptr};
+std::atomic<void*> g_errorContext{nullptr};
+
+void ErrorReport(ApiObject*, HRESULT result, const char* message) {
+    AbxLog("xgameruntime", "XErrorReport 0x%08lx: %s", static_cast<unsigned long>(result), message != nullptr ? message : "(no message)");
+    if (const ErrorCallback callback = g_errorCallback.load()) callback(result, message, g_errorContext.load());
+}
+
+HRESULT ErrorSetCallback(ApiObject*, ErrorCallback callback, void* context) {
+    g_errorContext.store(context);
+    g_errorCallback.store(callback);
+    return S_OK;
+}
+
+HRESULT ErrorSetOptions(ApiObject*, std::uint32_t debuggerOptions, std::uint32_t eventOptions) {
+    AbxLog("xgameruntime", "XErrorSetOptions(0x%x, 0x%x): recorded; AnyBox reports errors to the log", debuggerOptions, eventOptions);
+    return S_OK;
+}
+
+const void* const kErrorTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&ErrorReport),
+    Entry(&ErrorSetCallback),
+    Entry(&ErrorSetOptions),
+};
+
+ApiObject g_error{kErrorTable, &kErrorProvider, "error reporting"};
+
 constexpr GUID kOptionalFeatureProvider{0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
 constexpr GUID kOptionalFeatureInterface{0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
 
@@ -377,6 +491,20 @@ const void* const kOptionalFeatureTable[] = {
 ApiObject g_optionalFeature{kOptionalFeatureTable, &kOptionalFeatureInterface, "provider 3e241977"};
 
 constexpr GUID kGameProvider{0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
+constexpr GUID kStoreProvider{0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
+constexpr GUID kAppBroadcastProvider{0x186d5592, 0xa72d, 0x45fb, {0x95, 0x60, 0x11, 0xae, 0xd0, 0xe6, 0x64, 0x7a}};
+constexpr GUID kAppCaptureProvider{0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+
+struct UnavailableProvider {
+    const GUID& provider;
+    const char* name;
+};
+
+const UnavailableProvider kUnavailableProviders[] = {
+    {kStoreProvider, "XStore"},
+    {kAppBroadcastProvider, "XAppBroadcast"},
+    {kAppCaptureProvider, "XAppCapture"},
+};
 constexpr GUID kGameInterface{0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}};
 
 HRESULT GameGetTitleId(ApiObject*, std::uint32_t* titleId) {
@@ -396,8 +524,12 @@ HRESULT SystemGetSandboxId(ApiObject*, std::size_t size, char* sandbox, std::siz
     return XSystemGetXboxLiveSandboxId(size, sandbox, used);
 }
 
+HRESULT SystemGetConsoleId(ApiObject*, std::size_t size, char* id, std::size_t* used) {
+    return XSystemGetConsoleId(size, id, used);
+}
+
 const void* const kSystemTable[] = {
-    Entry(&ObjectQueryInterface), Entry(&ObjectAddRef), Entry(&ObjectRelease), Entry(&Unmapped<3>), Entry(&SystemGetSandboxId), Entry(&Unmapped<5>),
+    Entry(&ObjectQueryInterface), Entry(&ObjectAddRef), Entry(&ObjectRelease), Entry(&SystemGetConsoleId), Entry(&SystemGetSandboxId), Entry(&Unmapped<5>),
 };
 
 ApiObject g_system{kSystemTable, &kSystemInterface, "system"};
@@ -412,6 +544,42 @@ HRESULT GameSaveInitializeProviderAsync(ApiObject*, XUserHandle user, const char
 HRESULT GameSaveInitializeProviderResult(ApiObject*, XAsyncBlock* async, XGameSaveProviderHandle* provider);
 void GameSaveCloseProvider(ApiObject*, XGameSaveProviderHandle provider);
 
+HRESULT GameSaveGetRemainingQuotaAsync(ApiObject*, XGameSaveProviderHandle provider, XAsyncBlock* async) { return XGameSaveGetRemainingQuotaAsync(provider, async); }
+HRESULT GameSaveGetRemainingQuotaResult(ApiObject*, XAsyncBlock* async, std::int64_t* quota) { return XGameSaveGetRemainingQuotaResult(async, quota); }
+HRESULT GameSaveDeleteContainerAsync(ApiObject*, XGameSaveProviderHandle provider, const char* name, XAsyncBlock* async) { return XGameSaveDeleteContainerAsync(provider, name, async); }
+HRESULT GameSaveDeleteContainerResult(ApiObject*, XAsyncBlock* async) { return XGameSaveDeleteContainerResult(async); }
+HRESULT GameSaveGetContainerInfo(ApiObject*, XGameSaveProviderHandle provider, const char* name, void* context, XGameSaveContainerInfoCallback* callback) {
+    return XGameSaveGetContainerInfo(provider, name, context, callback);
+}
+HRESULT GameSaveEnumerateContainerInfo(ApiObject*, XGameSaveProviderHandle provider, void* context, XGameSaveContainerInfoCallback* callback) {
+    return XGameSaveEnumerateContainerInfo(provider, context, callback);
+}
+HRESULT GameSaveCreateContainer(ApiObject*, XGameSaveProviderHandle provider, const char* name, XGameSaveContainerHandle* container) {
+    return XGameSaveCreateContainer(provider, name, container);
+}
+void GameSaveCloseContainer(ApiObject*, XGameSaveContainerHandle container) { XGameSaveCloseContainer(container); }
+HRESULT GameSaveEnumerateBlobInfoByName(ApiObject*, XGameSaveContainerHandle container, const char* prefix, void* context, XGameSaveBlobInfoCallback* callback) {
+    return XGameSaveEnumerateBlobInfoByName(container, prefix, context, callback);
+}
+HRESULT GameSaveReadBlobData(ApiObject*, XGameSaveContainerHandle container, const char** names, std::uint32_t* count, std::size_t size, XGameSaveBlob* data) {
+    return XGameSaveReadBlobData(container, names, count, size, data);
+}
+HRESULT GameSaveReadBlobDataAsync(ApiObject*, XGameSaveContainerHandle container, const char** names, std::uint32_t count, XAsyncBlock* async) {
+    return XGameSaveReadBlobDataAsync(container, names, count, async);
+}
+HRESULT GameSaveReadBlobDataResult(ApiObject*, XAsyncBlock* async, std::size_t size, XGameSaveBlob* data, std::uint32_t* count) {
+    return XGameSaveReadBlobDataResult(async, size, data, count);
+}
+HRESULT GameSaveCreateUpdate(ApiObject*, XGameSaveContainerHandle container, const char* displayName, XGameSaveUpdateHandle* update) {
+    return XGameSaveCreateUpdate(container, displayName, update);
+}
+void GameSaveCloseUpdate(ApiObject*, XGameSaveUpdateHandle update) { XGameSaveCloseUpdate(update); }
+HRESULT GameSaveSubmitBlobWrite(ApiObject*, XGameSaveUpdateHandle update, const char* name, const std::uint8_t* data, std::size_t bytes) {
+    return XGameSaveSubmitBlobWrite(update, name, data, bytes);
+}
+HRESULT GameSaveSubmitUpdateAsync(ApiObject*, XGameSaveUpdateHandle update, XAsyncBlock* async) { return XGameSaveSubmitUpdateAsync(update, async); }
+HRESULT GameSaveSubmitUpdateResult(ApiObject*, XAsyncBlock* async) { return XGameSaveSubmitUpdateResult(async); }
+
 const void* const kGameSaveTable[] = {
     Entry(&ObjectQueryInterface),
     Entry(&ObjectAddRef),
@@ -421,28 +589,28 @@ const void* const kGameSaveTable[] = {
     Entry(&GameSaveInitializeProviderResult),
     Entry(&GameSaveCloseProvider),
     Entry(&Unmapped<7>),
-    Entry(&Unmapped<8>),
-    Entry(&Unmapped<9>),
+    Entry(&GameSaveGetRemainingQuotaAsync),
+    Entry(&GameSaveGetRemainingQuotaResult),
     Entry(&Unmapped<10>),
-    Entry(&Unmapped<11>),
-    Entry(&Unmapped<12>),
-    Entry(&Unmapped<13>),
-    Entry(&Unmapped<14>),
+    Entry(&GameSaveDeleteContainerAsync),
+    Entry(&GameSaveDeleteContainerResult),
+    Entry(&GameSaveGetContainerInfo),
+    Entry(&GameSaveEnumerateContainerInfo),
     Entry(&Unmapped<15>),
-    Entry(&Unmapped<16>),
-    Entry(&Unmapped<17>),
+    Entry(&GameSaveCreateContainer),
+    Entry(&GameSaveCloseContainer),
     Entry(&Unmapped<18>),
-    Entry(&Unmapped<19>),
-    Entry(&Unmapped<20>),
-    Entry(&Unmapped<21>),
-    Entry(&Unmapped<22>),
-    Entry(&Unmapped<23>),
-    Entry(&Unmapped<24>),
-    Entry(&Unmapped<25>),
+    Entry(&GameSaveEnumerateBlobInfoByName),
+    Entry(&GameSaveReadBlobData),
+    Entry(&GameSaveReadBlobDataAsync),
+    Entry(&GameSaveReadBlobDataResult),
+    Entry(&GameSaveCreateUpdate),
+    Entry(&GameSaveCloseUpdate),
+    Entry(&GameSaveSubmitBlobWrite),
     Entry(&Unmapped<26>),
     Entry(&Unmapped<27>),
-    Entry(&Unmapped<28>),
-    Entry(&Unmapped<29>),
+    Entry(&GameSaveSubmitUpdateAsync),
+    Entry(&GameSaveSubmitUpdateResult),
 };
 
 ApiObject g_gameSave{kGameSaveTable, &kGameSaveInterface, "game save"};
@@ -480,6 +648,10 @@ const ApiInterface kInterfaces[] = {
     {kPackageProvider, kPackageInterface, g_package},
     {kPersistentStorageProvider, kPersistentStorageInterface, g_persistentStorage},
     {kDisplayProvider, kDisplayInterface, g_display},
+    {kFeatureProvider, kFeatureProvider, g_feature},
+    {kGameEventProvider, kGameEventProvider, g_gameEvent},
+    {kLaunchProvider, kLaunchProvider, g_launch},
+    {kErrorProvider, kErrorProvider, g_error},
     {kOptionalFeatureProvider, kOptionalFeatureInterface, g_optionalFeature},
     {kGameProvider, kGameInterface, g_game},
     {kSystemProvider, kSystemInterface, g_system},
@@ -499,6 +671,16 @@ ABX_API HRESULT QueryApiImpl(const GUID* providerId, const GUID* interfaceId, vo
             *implementation = &entry.object;
             return S_OK;
         }
+    }
+    for (const UnavailableProvider& unavailable : kUnavailableProviders) {
+        if (!Same(providerId, unavailable.provider)) continue;
+        static std::atomic<std::uint32_t> reported{0};
+        const std::uint32_t bit = 1u << static_cast<std::uint32_t>(&unavailable - kUnavailableProviders);
+        if ((reported.fetch_or(bit) & bit) == 0) {
+            AbxLog("xgameruntime", "QueryApiImpl: %s (interface %s) answers REGDB_E_CLASSNOTREG: the service is not available offline, as on a console without it",
+                   unavailable.name, GuidText(interfaceId).c_str());
+        }
+        return REGDB_E_CLASSNOTREG;
     }
     const std::string message = "the GDK API interface " + GuidText(interfaceId) + " of provider " + GuidText(providerId) +
                                 " is not implemented: its method table layout has to be mapped before AnyBox can serve it";

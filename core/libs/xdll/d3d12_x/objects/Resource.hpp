@@ -7,6 +7,7 @@
 #include "TitleBufferWindow.hpp"
 #include "VulkanDevice.hpp"
 
+#include <optional>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -60,10 +61,17 @@ public:
 
     bool IsBuffer() const { return desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER; }
     BufferRef Buffer() const;
+    std::optional<BufferRef> BufferSpan(UINT64 offset, UINT64 bytes) const;
     std::uint64_t TitleAddress() const { return titleAddress_; }
     std::uint64_t Width() const { return desc_.Width; }
     void AttachTitleMemory(void* memory, std::uint64_t attributes);
     void RememberTitleAddress(std::uint64_t address) { textureAddress_ = address; }
+    void SetSkippedMips(std::uint32_t skipped) { skippedMips_ = skipped; }
+    std::uint32_t SkippedMips() const { return skippedMips_; }
+    void RegisterGpuWritten(std::uint64_t address);
+    static Resource* GpuWrittenSame(std::uint64_t address, const D3D12_RESOURCE_DESC& desc);
+    std::uint64_t TextureBytes() const { return textureBytes_; }
+    static Resource* GpuWrittenAt(std::uint64_t address, const D3D12_RESOURCE_DESC& desc);
     const TextureRef& Texture() const { return texture_; }
     UINT Maps() const { return maps_; }
     VkImageView View(const VkImageViewCreateInfo& info, std::string& error);
@@ -86,12 +94,19 @@ private:
     D3D12_RESOURCE_DESC desc_;
     std::uint64_t offset_ = 0;
     std::uint64_t titleAddress_ = 0;
+    std::uint64_t gpuWrittenAddress_ = 0;
     std::uint64_t textureAddress_ = 0;
     void* titleMemory_ = nullptr;
     std::uint64_t titleMemoryAttributes_ = 0;
     bool allocated_ = false;
     TextureRef texture_;
+    std::uint64_t textureBytes_ = 0;
+    std::uint32_t textureBucket_ = 0;
+    std::uint32_t skippedMips_ = 0;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    void* poolBlock_ = nullptr;
+    VkDeviceSize poolOffset_ = 0;
+    VkDeviceSize poolSize_ = 0;
     std::atomic<UINT> maps_{0};
     mutable std::mutex viewLock_;
     std::vector<std::pair<VkImageViewCreateInfo, VkImageView>> views_;

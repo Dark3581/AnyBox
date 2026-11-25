@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <iterator>
 
 namespace abx::d3d12x {
 
@@ -19,6 +22,7 @@ struct FeatureChain {
     VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    VkPhysicalDeviceFaultFeaturesEXT fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
 
     FeatureChain() = default;
     FeatureChain(const FeatureChain&) = delete;
@@ -38,6 +42,7 @@ struct FeatureChain {
         if (extensions.count(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) != 0) chain(maintenance8);
         if (extensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) != 0) chain(maintenance5);
         if (extensions.count(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) != 0) chain(dynamic3);
+        if (extensions.count(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) != 0) chain(fault);
         *next = nullptr;
     }
 };
@@ -461,6 +466,13 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         getProperties2(physical_, &hostProperties);
         hostImportAlignment_ = host.minImportedHostPointerAlignment;
     }
+    if (bestExtensions.count(VK_EXT_MESH_SHADER_EXTENSION_NAME) != 0) {
+        VkPhysicalDeviceMeshShaderPropertiesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 meshProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &mesh};
+        getProperties2(physical_, &meshProperties);
+        for (int axis = 0; axis < 3; ++axis) meshMaxGroups_[axis] = mesh.maxMeshWorkGroupCount[axis];
+        meshMaxTotal_ = mesh.maxMeshWorkGroupTotalCount;
+    }
     if (requirements.presentation) {
         if (bestExtensions.count(VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
             error = "the device does not offer " VK_KHR_SWAPCHAIN_EXTENSION_NAME;
@@ -480,6 +492,24 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         useExtensions.insert(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
         useExtensions.insert(VK_NV_FILL_RECTANGLE_EXTENSION_NAME);
         rectangleFill_ = true;
+    }
+    if (bestExtensions.count(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) != 0 && supported.fault.deviceFault == VK_TRUE) {
+        enabled.fault.deviceFault = VK_TRUE;
+        enabled.fault.deviceFaultVendorBinary = VK_FALSE;
+        useExtensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        deviceFault_ = true;
+    }
+    if (bestExtensions.count(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) != 0) {
+        useExtensions.insert(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+        enabled_.emplace_back("conservativeRasterization");
+        conservative_ = true;
+    }
+    if (bestExtensions.count(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME) != 0) {
+        const char* value = std::getenv("ANYBOX_CHECKPOINTS");
+        if (value != nullptr && value[0] == '1') {
+            useExtensions.insert(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+            checkpoints_ = true;
+        }
     }
     if (requirements.maintenance8) {
         enabled.maintenance8.maintenance8 = VK_TRUE;
@@ -512,6 +542,11 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     }
     instanceLoader_ = loader;
     deviceLoader_ = getDeviceProcAddr;
+    if (deviceFault_) faultInfo_ = DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>(getDeviceProcAddr, device_, "vkGetDeviceFaultInfoEXT");
+    if (checkpoints_) {
+        setCheckpoint_ = DeviceFunction<PFN_vkCmdSetCheckpointNV>(getDeviceProcAddr, device_, "vkCmdSetCheckpointNV");
+        checkpointData_ = DeviceFunction<PFN_vkGetQueueCheckpointDataNV>(getDeviceProcAddr, device_, "vkGetQueueCheckpointDataNV");
+    }
     vk_.destroyDevice = DeviceFunction<PFN_vkDestroyDevice>(getDeviceProcAddr, device_, "vkDestroyDevice");
     vk_.getDeviceQueue = DeviceFunction<PFN_vkGetDeviceQueue>(getDeviceProcAddr, device_, "vkGetDeviceQueue");
     vk_.createShaderModule = DeviceFunction<PFN_vkCreateShaderModule>(getDeviceProcAddr, device_, "vkCreateShaderModule");
@@ -564,6 +599,8 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdEndRendering = DeviceFunction<PFN_vkCmdEndRendering>(getDeviceProcAddr, device_, "vkCmdEndRendering");
     vk_.cmdClearAttachments = DeviceFunction<PFN_vkCmdClearAttachments>(getDeviceProcAddr, device_, "vkCmdClearAttachments");
     vk_.cmdCopyBuffer = DeviceFunction<PFN_vkCmdCopyBuffer>(getDeviceProcAddr, device_, "vkCmdCopyBuffer");
+    vk_.cmdFillBuffer = DeviceFunction<PFN_vkCmdFillBuffer>(getDeviceProcAddr, device_, "vkCmdFillBuffer");
+    vk_.cmdUpdateBuffer = DeviceFunction<PFN_vkCmdUpdateBuffer>(getDeviceProcAddr, device_, "vkCmdUpdateBuffer");
     vk_.cmdCopyBufferToImage = DeviceFunction<PFN_vkCmdCopyBufferToImage>(getDeviceProcAddr, device_, "vkCmdCopyBufferToImage");
     vk_.cmdCopyImageToBuffer = DeviceFunction<PFN_vkCmdCopyImageToBuffer>(getDeviceProcAddr, device_, "vkCmdCopyImageToBuffer");
     vk_.cmdCopyImage = DeviceFunction<PFN_vkCmdCopyImage>(getDeviceProcAddr, device_, "vkCmdCopyImage");
@@ -584,6 +621,9 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.cmdDrawIndirectCount = DeviceFunction<PFN_vkCmdDrawIndirectCount>(getDeviceProcAddr, device_, "vkCmdDrawIndirectCount");
     vk_.cmdDrawIndexedIndirectCount = DeviceFunction<PFN_vkCmdDrawIndexedIndirectCount>(getDeviceProcAddr, device_, "vkCmdDrawIndexedIndirectCount");
     vk_.cmdDispatchIndirect = DeviceFunction<PFN_vkCmdDispatchIndirect>(getDeviceProcAddr, device_, "vkCmdDispatchIndirect");
+    vk_.cmdDrawMeshTasks = DeviceFunction<PFN_vkCmdDrawMeshTasksEXT>(getDeviceProcAddr, device_, "vkCmdDrawMeshTasksEXT");
+    vk_.cmdDrawMeshTasksIndirect = DeviceFunction<PFN_vkCmdDrawMeshTasksIndirectEXT>(getDeviceProcAddr, device_, "vkCmdDrawMeshTasksIndirectEXT");
+    vk_.cmdDrawMeshTasksIndirectCount = DeviceFunction<PFN_vkCmdDrawMeshTasksIndirectCountEXT>(getDeviceProcAddr, device_, "vkCmdDrawMeshTasksIndirectCountEXT");
     vk_.queueSubmit = DeviceFunction<PFN_vkQueueSubmit>(getDeviceProcAddr, device_, "vkQueueSubmit");
     vk_.createSemaphore = DeviceFunction<PFN_vkCreateSemaphore>(getDeviceProcAddr, device_, "vkCreateSemaphore");
     vk_.destroySemaphore = DeviceFunction<PFN_vkDestroySemaphore>(getDeviceProcAddr, device_, "vkDestroySemaphore");
@@ -594,6 +634,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
     vk_.createFence = DeviceFunction<PFN_vkCreateFence>(getDeviceProcAddr, device_, "vkCreateFence");
     vk_.destroyFence = DeviceFunction<PFN_vkDestroyFence>(getDeviceProcAddr, device_, "vkDestroyFence");
     vk_.waitForFences = DeviceFunction<PFN_vkWaitForFences>(getDeviceProcAddr, device_, "vkWaitForFences");
+    vk_.getFenceStatus = DeviceFunction<PFN_vkGetFenceStatus>(getDeviceProcAddr, device_, "vkGetFenceStatus");
     vk_.getBufferDeviceAddress = DeviceFunction<PFN_vkGetBufferDeviceAddress>(getDeviceProcAddr, device_, "vkGetBufferDeviceAddress");
     vk_.queueWaitIdle = DeviceFunction<PFN_vkQueueWaitIdle>(getDeviceProcAddr, device_, "vkQueueWaitIdle");
     if (vk_.destroyDevice == nullptr) {
@@ -614,6 +655,11 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         return false;
     }
     getMemoryProperties(physical_, &memory_);
+    formatProperties_ = LoadInstanceFunction<PFN_vkGetPhysicalDeviceFormatProperties>(loader, rawInstance, "vkGetPhysicalDeviceFormatProperties");
+    if (formatProperties_ == nullptr) {
+        error = "vkGetPhysicalDeviceFormatProperties is not available";
+        return false;
+    }
     if (requirements.hostMemoryImport) {
         hostPointerProperties_ = DeviceFunction<PFN_vkGetMemoryHostPointerPropertiesEXT>(getDeviceProcAddr, device_, "vkGetMemoryHostPointerPropertiesEXT");
         if (hostPointerProperties_ == nullptr || hostImportAlignment_ == 0) {
@@ -688,6 +734,22 @@ std::vector<std::string> VulkanDevice::ValidationMessages() const {
     return validationMessages_;
 }
 
+VkFormatFeatureFlags VulkanDevice::OptimalFeatures(VkFormat format) const {
+    VkFormatProperties properties{};
+    formatProperties_(physical_, format, &properties);
+    return properties.optimalTilingFeatures;
+}
+
+std::optional<std::uint32_t> VulkanDevice::SystemMemoryType(std::uint32_t typeBits) const {
+    for (std::uint32_t index = 0; index < memory_.memoryTypeCount; ++index) {
+        const VkMemoryType& type = memory_.memoryTypes[index];
+        if ((typeBits & (1u << index)) == 0 || (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) continue;
+        if ((memory_.memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
+        return index;
+    }
+    return std::nullopt;
+}
+
 std::optional<std::uint32_t> VulkanDevice::MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const {
     for (std::uint32_t index = 0; index < memory_.memoryTypeCount; ++index) {
         if ((typeBits & (1u << index)) != 0 && (memory_.memoryTypes[index].propertyFlags & required) == required) {
@@ -697,22 +759,21 @@ std::optional<std::uint32_t> VulkanDevice::MemoryType(std::uint32_t typeBits, Vk
     return std::nullopt;
 }
 
-bool VulkanDevice::Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const {
+std::optional<VulkanDevice::PendingSubmit> VulkanDevice::SubmitWithoutWaiting(const std::function<void(VkCommandBuffer)>& record, std::string& error) const {
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     poolInfo.queueFamilyIndex = queueFamily_;
-    VkCommandPool pool = VK_NULL_HANDLE;
-    if (vk_.createCommandPool(device_, &poolInfo, nullptr, &pool) != VK_SUCCESS) {
+    PendingSubmit pending;
+    if (vk_.createCommandPool(device_, &poolInfo, nullptr, &pending.pool) != VK_SUCCESS) {
         error = "vkCreateCommandPool failed";
-        return false;
+        return std::nullopt;
     }
-    VkFence fence = VK_NULL_HANDLE;
     const auto cleanup = [&] {
-        if (fence != VK_NULL_HANDLE) vk_.destroyFence(device_, fence, nullptr);
-        vk_.destroyCommandPool(device_, pool, nullptr);
+        if (pending.fence != VK_NULL_HANDLE) vk_.destroyFence(device_, pending.fence, nullptr);
+        vk_.destroyCommandPool(device_, pending.pool, nullptr);
     };
     VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocateInfo.commandPool = pool;
+    allocateInfo.commandPool = pending.pool;
     allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocateInfo.commandBufferCount = 1;
     VkCommandBuffer commands = VK_NULL_HANDLE;
@@ -721,30 +782,104 @@ bool VulkanDevice::Submit(const std::function<void(VkCommandBuffer)>& record, st
     if (vk_.allocateCommandBuffers(device_, &allocateInfo, &commands) != VK_SUCCESS || vk_.beginCommandBuffer(commands, &begin) != VK_SUCCESS) {
         cleanup();
         error = "cannot start a command buffer";
-        return false;
+        return std::nullopt;
     }
     record(commands);
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &commands;
-    if (vk_.endCommandBuffer(commands) != VK_SUCCESS || vk_.createFence(device_, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+    if (vk_.endCommandBuffer(commands) != VK_SUCCESS || vk_.createFence(device_, &fenceInfo, nullptr, &pending.fence) != VK_SUCCESS) {
         cleanup();
         error = "cannot finish a command buffer";
-        return false;
+        return std::nullopt;
     }
     VkResult submitted = VK_SUCCESS;
     {
         std::lock_guard<std::mutex> guard(queueLock_);
-        submitted = vk_.queueSubmit(queue_, 1, &submit, fence);
+        submitted = vk_.queueSubmit(queue_, 1, &submit, pending.fence);
     }
-    const VkResult waited = submitted == VK_SUCCESS ? vk_.waitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX) : submitted;
-    cleanup();
+    if (submitted != VK_SUCCESS) {
+        cleanup();
+        error = "vkQueueSubmit failed with " + std::to_string(static_cast<int>(submitted));
+        if (submitted == VK_ERROR_DEVICE_LOST) error += "; " + FaultReport();
+        return std::nullopt;
+    }
+    return pending;
+}
+
+VkResult VulkanDevice::Finish(PendingSubmit& pending, bool wait) const {
+    if (pending.fence == VK_NULL_HANDLE) return VK_SUCCESS;
+    const VkResult state = wait ? vk_.waitForFences(device_, 1, &pending.fence, VK_TRUE, UINT64_MAX) : vk_.getFenceStatus(device_, pending.fence);
+    if (state == VK_NOT_READY || state == VK_TIMEOUT) return VK_NOT_READY;
+    vk_.destroyFence(device_, pending.fence, nullptr);
+    vk_.destroyCommandPool(device_, pending.pool, nullptr);
+    pending = {};
+    return state;
+}
+
+bool VulkanDevice::Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const {
+    std::optional<PendingSubmit> pending = SubmitWithoutWaiting(record, error);
+    if (!pending) return false;
+    const VkResult waited = Finish(*pending, true);
     if (waited != VK_SUCCESS) {
-        error = "vkQueueSubmit or vkWaitForFences failed with " + std::to_string(static_cast<int>(waited));
+        error = "vkWaitForFences failed with " + std::to_string(static_cast<int>(waited));
+        if (waited == VK_ERROR_DEVICE_LOST) error += "; " + FaultReport();
         return false;
     }
     return true;
+}
+
+void VulkanDevice::Checkpoint(VkCommandBuffer commands, const char* marker) const {
+    if (setCheckpoint_ != nullptr) setCheckpoint_(commands, marker);
+}
+
+std::string VulkanDevice::CheckpointReport() const {
+    if (checkpointData_ == nullptr) return "";
+    std::uint32_t count = 0;
+    checkpointData_(queue_, &count, nullptr);
+    std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+    checkpointData_(queue_, &count, data.data());
+    std::string report = "; checkpoints:";
+    for (const VkCheckpointDataNV& entry : data) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " [stage 0x%x] ", static_cast<unsigned>(entry.stage));
+        report += text;
+        report += entry.pCheckpointMarker != nullptr ? static_cast<const char*>(entry.pCheckpointMarker) : "(none)";
+    }
+    return report;
+}
+
+std::string VulkanDevice::FaultReport() const {
+    if (faultInfo_ == nullptr) return "the device offers no fault report (VK_EXT_device_fault)" + CheckpointReport();
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (faultInfo_(device_, &counts, nullptr) != VK_SUCCESS) return "the device fault report could not be read";
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+    info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+    const VkResult read = faultInfo_(device_, &counts, &info);
+    if (read != VK_SUCCESS && read != VK_INCOMPLETE) return "the device fault report could not be read";
+    std::string report = std::string("device fault: ") + info.description;
+    static const char* const kTypes[] = {"none", "read invalid", "write invalid", "execute invalid", "instruction pointer unknown", "instruction pointer invalid",
+                                         "instruction pointer fault"};
+    for (const VkDeviceFaultAddressInfoEXT& address : addresses) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "; %s at 0x%llx (precision 0x%llx)",
+                      static_cast<std::size_t>(address.addressType) < std::size(kTypes) ? kTypes[address.addressType] : "unknown",
+                      static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
+        report += text;
+        if (faultDescriber_) report += " [" + faultDescriber_(address.reportedAddress) + "]";
+    }
+    for (const VkDeviceFaultVendorInfoEXT& vendor : vendors) {
+        char text[320];
+        std::snprintf(text, sizeof(text), "; vendor: %s (code 0x%llx, data 0x%llx)", vendor.description, static_cast<unsigned long long>(vendor.vendorFaultCode),
+                      static_cast<unsigned long long>(vendor.vendorFaultData));
+        report += text;
+    }
+    return report + CheckpointReport();
 }
 
 bool VulkanDevice::HasFeature(const std::string& name) const {

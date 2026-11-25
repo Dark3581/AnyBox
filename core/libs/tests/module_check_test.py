@@ -8,7 +8,7 @@ from pathlib import Path
 EXPECTED = {
     "fake_module_ok.dll": {"result": "loaded"},
     "fake_module_fail.dll": {"result": "failed", "error": 1114},
-    "fake_module_stop.dll": {"result": "stopped", "kind": "not-implemented", "library": "d3d12_x", "function": "D3D12XboxCreateDevice", "message": None},
+    "fake_module_stop.dll": {"result": "stopped", "kind": "not-implemented", "library": "d3d12_x", "function": "D3D12GetDebugInterface", "message": None},
 }
 
 

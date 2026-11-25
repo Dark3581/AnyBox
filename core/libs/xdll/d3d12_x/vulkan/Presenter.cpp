@@ -1,6 +1,7 @@
 #include "Presenter.hpp"
 
 #include <vulkan/vulkan_win32.h>
+#include <string_view>
 
 #include <algorithm>
 
@@ -23,7 +24,10 @@ Function Device(const VulkanDevice& device, const char* name) {
 BOOL CALLBACK FindWindowOfProcess(HWND window, LPARAM found) {
     DWORD process = 0;
     GetWindowThreadProcessId(window, &process);
-    if (process != GetCurrentProcessId() || !IsWindowVisible(window) || GetWindow(window, GW_OWNER) != nullptr) return TRUE;
+    if (process != GetCurrentProcessId() || !IsWindowVisible(window) || GetWindow(window, GW_OWNER) != nullptr || window == GetConsoleWindow()) return TRUE;
+    wchar_t className[64] = {};
+    GetClassNameW(window, className, 64);
+    if (std::wstring_view(className) == L"ConsoleWindowClass" || std::wstring_view(className) == L"PseudoConsoleWindow") return TRUE;
     *reinterpret_cast<HWND*>(found) = window;
     return FALSE;
 }

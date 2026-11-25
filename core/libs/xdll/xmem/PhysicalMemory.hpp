@@ -13,5 +13,6 @@ constexpr std::uint32_t kReplacePlaceholder = 0x00004000;
 void* ReservePhysicalWindow(std::size_t size, std::uint32_t protection, bool gpu);
 void* AdoptPhysicalWindow(void* address, std::size_t size, std::uint32_t protection, bool gpu);
 void* AllocateWithPlaceholders(void* address, std::size_t size, std::uint32_t type, std::uint32_t protection);
+void* AllocateBelowGpuLimit(void* address, std::size_t size, std::uint32_t type, std::uint32_t protection);
 
 }

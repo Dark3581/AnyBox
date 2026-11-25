@@ -16,7 +16,7 @@
 
 - CMake 3.20 or newer and Ninja.
 - A C++20 compiler.
-  - **Full build (Windows):** MinGW-w64 GCC 13 or newer (tested with WinLibs GCC 15.2 UCRT, POSIX threads, SEH) or MSVC 2022. MSVC needs a Windows SDK that provides `gameinput.lib` and `xaudio2.lib` (checked with 10.0.26100).
+  - **Full build (Windows):** MinGW-w64 GCC 13 or newer (tested with WinLibs GCC 15.2 UCRT, POSIX threads, SEH) or MSVC 2022. MSVC needs a Windows SDK that provides `xaudio2.lib` (checked with 10.0.26100).
   - **Relinker only (any OS):** GCC, Clang or MSVC.
 - Python 3.10 or newer for the tool tests and the end-to-end tests (optional; without it those tests are not registered). `pip install jsonschema` enables the schema check of run reports.
 

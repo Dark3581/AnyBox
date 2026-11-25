@@ -2,6 +2,10 @@
 
 #include "ResourceState.hpp"
 
+#include "AbxApi.hpp"
+
+#include <atomic>
+
 #include <algorithm>
 #include <cmath>
 
@@ -92,15 +96,24 @@ bool CommandRecorder::BeginRendering(const std::vector<AttachmentRef>& colors, c
         const bool hasStencil = (depthStencil->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
         const bool depthReadOnly = (readOnly & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0 || (depthStencil->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) == 0;
         const bool stencilReadOnly = (readOnly & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0 || !hasStencil;
-        if (readOnly != 0 && depthReadOnly != stencilReadOnly) {
-            error = "a depth-stencil pass that is read-only for only one of its planes is not supported";
-            return false;
-        }
+        const bool mixed = readOnly != 0 && depthReadOnly != stencilReadOnly;
         depth.imageView = depthStencil->view;
         depth.imageLayout = readOnly != 0 ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = readOnly != 0 ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
         stencil = depth;
+        if (mixed) {
+            const VkImageLayout layout = depthReadOnly ? VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL;
+            depth.imageLayout = layout;
+            stencil.imageLayout = layout;
+            depth.storeOp = depthReadOnly ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
+            stencil.storeOp = stencilReadOnly ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
+                AbxLog("d3d12_x", "a depth-stencil pass read-only for only its %s plane renders with the mixed Vulkan layout for that case; the image's layout outside the pass is not changed for it",
+                       depthReadOnly ? "depth" : "stencil");
+            }
+        }
         if ((depthStencil->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) rendering.pDepthAttachment = &depth;
         if ((depthStencil->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) rendering.pStencilAttachment = &stencil;
     }
@@ -243,6 +256,16 @@ void CommandRecorder::Dispatch(UINT x, UINT y, UINT z) {
     device_.Vk().cmdDispatch(commands_, x, y, z);
 }
 
+bool CommandRecorder::DrawMesh(UINT x, UINT y, UINT z, std::string& error) {
+    if (device_.Vk().cmdDrawMeshTasks == nullptr) {
+        error = "the device has no vkCmdDrawMeshTasksEXT";
+        return false;
+    }
+    if (x == 0 || y == 0 || z == 0) return true;
+    device_.Vk().cmdDrawMeshTasks(commands_, x, y, z);
+    return true;
+}
+
 bool CommandRecorder::ExecuteIndirect(const IndirectSignature& signature, UINT maxCount, const BufferRef& arguments, UINT64 argumentOffset, const BufferRef* count,
                                       UINT64 countOffset, std::string& error) {
     if (maxCount == 0) {
@@ -266,6 +289,28 @@ bool CommandRecorder::ExecuteIndirect(const IndirectSignature& signature, UINT m
         }
         for (UINT index = 0; index < maxCount; ++index) {
             vk.cmdDispatchIndirect(commands_, arguments.buffer, offset + static_cast<VkDeviceSize>(index) * signature.stride);
+        }
+        return true;
+    }
+    if (signature.kind == IndirectKind::DispatchMesh) {
+        if (vk.cmdDrawMeshTasksIndirect == nullptr) {
+            error = "the device has no vkCmdDrawMeshTasksIndirectEXT";
+            return false;
+        }
+        if (count != nullptr) {
+            if (vk.cmdDrawMeshTasksIndirectCount == nullptr || !device_.HasFeature("drawIndirectCount")) {
+                error = "an indirect mesh dispatch with a count buffer needs vkCmdDrawMeshTasksIndirectCountEXT and drawIndirectCount";
+                return false;
+            }
+            vk.cmdDrawMeshTasksIndirectCount(commands_, arguments.buffer, offset, count->buffer, count->offset + countOffset, maxCount, signature.stride);
+            return true;
+        }
+        if (device_.HasFeature("multiDrawIndirect")) {
+            vk.cmdDrawMeshTasksIndirect(commands_, arguments.buffer, offset, maxCount, signature.stride);
+        } else {
+            for (UINT index = 0; index < maxCount; ++index) {
+                vk.cmdDrawMeshTasksIndirect(commands_, arguments.buffer, offset + static_cast<VkDeviceSize>(index) * signature.stride, 1, signature.stride);
+            }
         }
         return true;
     }
@@ -452,6 +497,37 @@ bool CommandRecorder::CopyBufferRegion(const BufferRef& destination, UINT64 dest
     return true;
 }
 
+bool CommandRecorder::FillBuffer(const BufferRef& destination, UINT64 bytes, std::uint32_t value, std::string& error) {
+    if (bytes == 0 || bytes > destination.size || bytes % 4 != 0 || destination.offset % 4 != 0) {
+        error = "the buffer fill is empty, runs past the buffer, or is not 4-byte aligned";
+        return false;
+    }
+    if (device_.Vk().cmdFillBuffer == nullptr) {
+        error = "the Vulkan device has no vkCmdFillBuffer";
+        return false;
+    }
+    device_.Vk().cmdFillBuffer(commands_, destination.buffer, destination.offset, bytes, value);
+    return true;
+}
+
+bool CommandRecorder::UpdateBuffer(const BufferRef& destination, const std::uint8_t* data, UINT64 bytes, std::string& error) {
+    if (bytes == 0 || bytes > destination.size || bytes % 4 != 0 || destination.offset % 4 != 0 || data == nullptr) {
+        error = "the buffer update is empty, runs past the buffer, or is not 4-byte aligned";
+        return false;
+    }
+    if (device_.Vk().cmdUpdateBuffer == nullptr) {
+        error = "the Vulkan device has no vkCmdUpdateBuffer";
+        return false;
+    }
+    UINT64 done = 0;
+    while (done != bytes) {
+        const UINT64 piece = (std::min)(bytes - done, UINT64{65536});
+        device_.Vk().cmdUpdateBuffer(commands_, destination.buffer, destination.offset + done, piece, data + done);
+        done += piece;
+    }
+    return true;
+}
+
 bool CommandRecorder::CopyBufferToTexture(const TextureRef& destination, D3D12_RESOURCE_STATES state, UINT subresource, UINT x, UINT y, UINT z, const BufferRef& source,
                                           const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, const D3D12_BOX* box, std::string& error) {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -524,6 +600,90 @@ bool CommandRecorder::CopyTextureToFootprint(const BufferRef& destination, const
     return true;
 }
 
+namespace {
+
+std::uint32_t AspectTexelBytes(const TextureRef& texture, VkImageAspectFlags aspect) {
+    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) return 1;
+    if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
+        return texture.layout.info.format == VK_FORMAT_D16_UNORM || texture.layout.info.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u;
+    }
+    const std::optional<CopyBlock> block = CopyBlockOf(texture.desc.Format);
+    return block && block->width == 1 && block->height == 1 ? block->bytes : 0u;
+}
+
+}
+
+bool CopyNeedsBuffer(const TextureRef& destination, UINT destinationSubresource, const TextureRef& source, UINT sourceSubresource) {
+    const std::optional<Subresource> to = SplitSubresource(destination.desc, destinationSubresource, destination.layout.info.mipLevels);
+    const std::optional<Subresource> from = SplitSubresource(source.desc, sourceSubresource, source.layout.info.mipLevels);
+    const std::optional<VkImageAspectFlags> toAspect = to ? PlaneAspect(destination.layout.format.aspects, to->plane) : std::nullopt;
+    const std::optional<VkImageAspectFlags> fromAspect = from ? PlaneAspect(source.layout.format.aspects, from->plane) : std::nullopt;
+    if (!toAspect || !fromAspect) return false;
+    const bool planeToColor = *toAspect != *fromAspect && ((*toAspect | *fromAspect) & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+    const bool depthFormats = *toAspect == *fromAspect && *toAspect != VK_IMAGE_ASPECT_COLOR_BIT && destination.layout.info.format != source.layout.info.format;
+    if (!planeToColor && !depthFormats) return false;
+    const std::uint32_t bytes = AspectTexelBytes(destination, *toAspect);
+    return bytes != 0 && bytes == AspectTexelBytes(source, *fromAspect);
+}
+
+bool CommandRecorder::CopyTextureThroughBuffer(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, UINT x, UINT y, UINT z,
+                                               const TextureRef& source, D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, const D3D12_BOX* box, const BufferRef& scratch,
+                                               std::string& error) {
+    if (!CopyNeedsBuffer(destination, destinationSubresource, source, sourceSubresource)) {
+        error = "a copy through a buffer between planes of different texel sizes";
+        return false;
+    }
+    VkImageLayout destinationLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!LayoutFor(destination, destinationState, D3D12_RESOURCE_STATE_COPY_DEST, destinationLayout, error) ||
+        !LayoutFor(source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceLayout, error)) {
+        return false;
+    }
+    const Subresource to = *SplitSubresource(destination.desc, destinationSubresource, destination.layout.info.mipLevels);
+    const Subresource from = *SplitSubresource(source.desc, sourceSubresource, source.layout.info.mipLevels);
+    const VkImageAspectFlags toAspect = *PlaneAspect(destination.layout.format.aspects, to.plane);
+    const VkImageAspectFlags fromAspect = *PlaneAspect(source.layout.format.aspects, from.plane);
+    const auto extentOf = [](const TextureRef& texture, std::uint32_t mip) {
+        return VkExtent3D{MipExtent(texture.desc.Width, mip), texture.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1u : MipExtent(texture.desc.Height, mip),
+                          texture.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? MipExtent(texture.desc.DepthOrArraySize, mip) : 1u};
+    };
+    const VkExtent3D sourceExtent = extentOf(source, from.mip);
+    const VkExtent3D destinationExtent = extentOf(destination, to.mip);
+    const D3D12_BOX region = box != nullptr ? *box : D3D12_BOX{0, 0, 0, sourceExtent.width, sourceExtent.height, sourceExtent.depth};
+    if (region.left >= region.right || region.top >= region.bottom || region.front >= region.back || region.right > sourceExtent.width || region.bottom > sourceExtent.height ||
+        region.back > sourceExtent.depth || x + (region.right - region.left) > destinationExtent.width || y + (region.bottom - region.top) > destinationExtent.height ||
+        z + (region.back - region.front) > destinationExtent.depth) {
+        error = "the texture copy box is empty or outside one of the textures";
+        return false;
+    }
+    const VkExtent3D extent{region.right - region.left, region.bottom - region.top, region.back - region.front};
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(extent.width) * extent.height * extent.depth * AspectTexelBytes(source, fromAspect);
+    if (bytes > scratch.size) {
+        error = "the copy scratch buffer is too small";
+        return false;
+    }
+    VkBufferImageCopy out{};
+    out.bufferOffset = scratch.offset;
+    out.imageSubresource = {fromAspect, from.mip, source.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : from.layer, 1};
+    out.imageOffset = {static_cast<std::int32_t>(region.left), static_cast<std::int32_t>(region.top), static_cast<std::int32_t>(region.front)};
+    out.imageExtent = extent;
+    device_.Vk().cmdCopyImageToBuffer(commands_, source.image, sourceLayout, scratch.buffer, 1, &out);
+    VkMemoryBarrier2 written{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    written.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    written.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    written.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    written.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &written;
+    device_.Vk().cmdPipelineBarrier2(commands_, &dependency);
+    VkBufferImageCopy in = out;
+    in.imageSubresource = {toAspect, to.mip, destination.desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 0u : to.layer, 1};
+    in.imageOffset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), static_cast<std::int32_t>(z)};
+    device_.Vk().cmdCopyBufferToImage(commands_, scratch.buffer, destination.image, destinationLayout, 1, &in);
+    return true;
+}
+
 bool CommandRecorder::CopyTexture(const TextureRef& destination, D3D12_RESOURCE_STATES destinationState, UINT destinationSubresource, UINT x, UINT y, UINT z,
                                   const TextureRef& source, D3D12_RESOURCE_STATES sourceState, UINT sourceSubresource, const D3D12_BOX* box, std::string& error) {
     VkImageLayout destinationLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -542,7 +702,10 @@ bool CommandRecorder::CopyTexture(const TextureRef& destination, D3D12_RESOURCE_
     }
     if (*toAspect != *fromAspect || (*toAspect == VK_IMAGE_ASPECT_COLOR_BIT && (TexelBytes(destination) == 0 || TexelBytes(destination) != TexelBytes(source))) ||
         (*toAspect != VK_IMAGE_ASPECT_COLOR_BIT && destination.layout.info.format != source.layout.info.format)) {
-        error = "the two textures' formats or planes are not copy compatible";
+        error = "the two textures' formats or planes are not copy compatible: destination format " + std::to_string(static_cast<int>(destination.desc.Format)) + " " +
+                std::to_string(destination.desc.Width) + "x" + std::to_string(destination.desc.Height) + " subresource " + std::to_string(destinationSubresource) +
+                ", source format " + std::to_string(static_cast<int>(source.desc.Format)) + " " + std::to_string(source.desc.Width) + "x" + std::to_string(source.desc.Height) +
+                " subresource " + std::to_string(sourceSubresource);
         return false;
     }
     const auto extentOf = [](const TextureRef& texture, std::uint32_t mip) {

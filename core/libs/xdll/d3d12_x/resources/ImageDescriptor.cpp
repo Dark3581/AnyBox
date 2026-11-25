@@ -49,6 +49,7 @@ std::optional<ImageFormatInfo> ImageFormatOf(VkFormat format) {
     case VK_FORMAT_R8_UINT: return Uint(5);
     case VK_FORMAT_R8_SINT: return Sint(6);
     case VK_FORMAT_R16_UNORM: return Float(7);
+    case VK_FORMAT_D16_UNORM: return Float(7);
     case VK_FORMAT_R16_SNORM: return Float(8);
     case VK_FORMAT_R16_UINT: return Uint(11);
     case VK_FORMAT_R16_SINT: return Sint(12);
@@ -89,6 +90,9 @@ std::optional<ImageFormatInfo> ImageFormatOf(VkFormat format) {
     case VK_FORMAT_R32G32B32A32_SINT: return Sint(76);
     case VK_FORMAT_R32G32B32A32_SFLOAT: return Float(77);
     case VK_FORMAT_R8_SRGB: return Float(128);
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: return Float(133);
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return Float(134);
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16: return Float(136);
     case VK_FORMAT_R8G8_SRGB: return Float(129);
     case VK_FORMAT_R8G8B8A8_SRGB: return Float(130);
     case VK_FORMAT_B8G8R8A8_SRGB: return Float(130);

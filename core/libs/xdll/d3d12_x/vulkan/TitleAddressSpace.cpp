@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 namespace abx::d3d12x {
 
@@ -23,6 +24,7 @@ std::uint64_t AlignUp(std::uint64_t value, std::uint64_t alignment) {
 }
 
 constexpr std::uint64_t kAliasReservationBytes = 1ull << 30;
+constexpr std::uint64_t kBackingChunkBytes = 256ull << 20;
 
 }
 
@@ -34,6 +36,7 @@ std::unique_ptr<TitleAddressSpace> TitleAddressSpace::Create(const VulkanDevice&
 
 TitleAddressSpace::~TitleAddressSpace() {
     for (auto& [start, range] : ranges_) Destroy(range.imported);
+    for (auto& [start, chunk] : chunks_) Destroy(chunk);
     for (Allocation& region : regions_) Destroy(region);
     if (aliasReservation_ != nullptr) VirtualFree(aliasReservation_, 0, MEM_RELEASE);
     Destroy(root_);
@@ -97,11 +100,11 @@ bool TitleAddressSpace::Initialize(std::string& error) {
         error = "the device was created without host memory import or buffer device addresses";
         return false;
     }
-    if (!CreateTable(kTitlePageBytes, nullPage_, error) || !CreateTable(kTitlePagesPerRegion * sizeof(std::uint64_t), nullRegion_, error) ||
+    if (!CreateTable(2 * kTitlePageBytes, nullPage_, error) || !CreateTable(kTitlePagesPerRegion * sizeof(std::uint64_t), nullRegion_, error) ||
         !CreateTable(kTitleRegionCount * sizeof(std::uint64_t), root_, error)) {
         return false;
     }
-    std::memset(nullPage_.mapped, 0, kTitlePageBytes);
+    std::memset(nullPage_.mapped, 0, 2 * kTitlePageBytes);
     std::fill_n(static_cast<std::uint64_t*>(nullRegion_.mapped), kTitlePagesPerRegion, nullPage_.address);
     std::fill_n(static_cast<std::uint64_t*>(root_.mapped), kTitleRegionCount, nullRegion_.address);
     regions_.resize(kTitleRegionCount);
@@ -194,15 +197,24 @@ void TitleAddressSpace::Clear(std::uint64_t start, std::uint64_t bytes) {
 }
 
 bool TitleAddressSpace::ImportLocked(std::uint64_t start, std::uint64_t bytes, std::string& error) {
-    const DeviceFunctions& vk = device_.Vk();
     Range range;
     range.bytes = bytes;
+    if (!ImportHost(start, bytes, range.imported, error)) return false;
+    range.device = range.imported.address;
+    range.buffer = range.imported.buffer;
+    Point(start, bytes, range.device, start);
+    importedBytes_ += bytes;
+    ranges_[start] = range;
+    return true;
+}
+
+bool TitleAddressSpace::ImportHost(std::uint64_t start, std::uint64_t bytes, Allocation& imported, std::string& error) {
+    const DeviceFunctions& vk = device_.Vk();
     VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
     bufferInfo.size = bytes;
     bufferInfo.usage = kImportUsage;
-    Allocation& imported = range.imported;
     if (vk.createBuffer(device_.Handle(), &bufferInfo, nullptr, &imported.buffer) != VK_SUCCESS) {
         imported.buffer = VK_NULL_HANDLE;
         error = "vkCreateBuffer failed for imported title memory";
@@ -250,12 +262,131 @@ bool TitleAddressSpace::ImportLocked(std::uint64_t start, std::uint64_t bytes, s
         error = "imported title memory has no device address";
         return false;
     }
-    range.device = imported.address;
-    range.buffer = imported.buffer;
-    Point(start, bytes, range.device, start);
-    importedBytes_ += bytes;
-    ranges_[start] = range;
     return true;
+}
+
+std::map<std::uint64_t, TitleAddressSpace::Range>::iterator TitleAddressSpace::FirstOverlap(std::uint64_t start) {
+    auto it = ranges_.upper_bound(start);
+    if (it != ranges_.begin()) {
+        auto previous = std::prev(it);
+        if (previous->first + previous->second.bytes > start) return previous;
+    }
+    return it;
+}
+
+void TitleAddressSpace::AddBacking(std::uint64_t view, std::uint64_t bytes) {
+    if (bytes == 0) return;
+    std::lock_guard<std::mutex> guard(lock_);
+    backings_[view] = bytes;
+}
+
+void TitleAddressSpace::RemoveBacking(std::uint64_t view, std::uint64_t bytes) {
+    std::lock_guard<std::mutex> guard(lock_);
+    backings_.erase(view);
+    const std::uint64_t end = view + bytes;
+    auto first = chunks_.lower_bound(view);
+    if (first == chunks_.end() || first->first >= end) return;
+    {
+        std::lock_guard<std::mutex> queue(device_.QueueLock());
+        device_.Vk().queueWaitIdle(device_.Queue());
+    }
+    for (auto it = first; it != chunks_.end() && it->first < end;) {
+        const VkBuffer buffer = it->second.buffer;
+        for (auto range = ranges_.begin(); range != ranges_.end();) {
+            if (range->second.imported.memory == VK_NULL_HANDLE && range->second.buffer == buffer) {
+                Clear(range->first, range->second.bytes);
+                range = ranges_.erase(range);
+                continue;
+            }
+            ++range;
+        }
+        importedBytes_ -= (std::min)(kBackingChunkBytes, end - it->first);
+        Destroy(it->second);
+        it = chunks_.erase(it);
+    }
+    PointAliases();
+}
+
+const TitleAddressSpace::Allocation* TitleAddressSpace::BackingChunk(std::uint64_t source, std::uint64_t& chunkStart, std::uint64_t& chunkBytes, std::string& error) {
+    auto backing = backings_.upper_bound(source);
+    if (backing == backings_.begin()) {
+        error = "the source address is in no physical page allocation";
+        return nullptr;
+    }
+    --backing;
+    if (source - backing->first >= backing->second) {
+        error = "the source address is in no physical page allocation";
+        return nullptr;
+    }
+    chunkStart = backing->first + (source - backing->first) / kBackingChunkBytes * kBackingChunkBytes;
+    chunkBytes = (std::min)(kBackingChunkBytes, backing->first + backing->second - chunkStart);
+    auto found = chunks_.find(chunkStart);
+    if (found != chunks_.end()) return &found->second;
+    Allocation imported;
+    if (!ImportHost(chunkStart, chunkBytes, imported, error)) return nullptr;
+    importedBytes_ += chunkBytes;
+    return &chunks_.emplace(chunkStart, imported).first->second;
+}
+
+const std::uint8_t* TitleAddressSpace::HostAt(std::uint64_t address) const {
+    constexpr std::uint64_t kHostPage = 0x10000;
+    std::lock_guard<std::mutex> guard(lock_);
+    const auto found = hostPages_.find(address & ~(kHostPage - 1));
+    if (found == hostPages_.end()) return nullptr;
+    return reinterpret_cast<const std::uint8_t*>(found->second + (address & (kHostPage - 1)));
+}
+
+bool TitleAddressSpace::AliasPhysical(std::uint64_t start, std::uint64_t bytes, std::uint64_t source, std::string& error) {
+    if (bytes == 0) return true;
+    std::lock_guard<std::mutex> guard(lock_);
+    {
+        constexpr std::uint64_t kHostPage = 0x10000;
+        if ((start & (kHostPage - 1)) == 0 && (bytes & (kHostPage - 1)) == 0) {
+            for (std::uint64_t page = 0; page < bytes; page += kHostPage) hostPages_[start + page] = source + page;
+        }
+    }
+    const std::uint64_t end = start + bytes;
+    for (auto it = FirstOverlap(start); it != ranges_.end() && it->first < end;) {
+        if (it->second.imported.memory != VK_NULL_HANDLE) {
+            error = "the aliased range overlaps title memory imported on its own";
+            return false;
+        }
+        const Range kept = it->second;
+        const std::uint64_t keptStart = it->first;
+        const std::uint64_t keptEnd = keptStart + kept.bytes;
+        Clear(keptStart, kept.bytes);
+        it = ranges_.erase(it);
+        if (keptStart < start) {
+            Point(keptStart, start - keptStart, kept.device, keptStart);
+            ranges_[keptStart] = Range{start - keptStart, kept.device, {}, kept.buffer, kept.bufferOffset};
+        }
+        if (keptEnd > end) {
+            Point(end, keptEnd - end, kept.device + (end - keptStart), end);
+            ranges_[end] = Range{keptEnd - end, kept.device + (end - keptStart), {}, kept.buffer, kept.bufferOffset + (end - keptStart)};
+            break;
+        }
+    }
+    std::uint64_t at = start;
+    std::uint64_t from = source;
+    bool complete = true;
+    while (at < end) {
+        std::uint64_t chunkStart = 0;
+        std::uint64_t chunkBytes = 0;
+        const Allocation* chunk = BackingChunk(from, chunkStart, chunkBytes, error);
+        if (chunk == nullptr) {
+            Clear(at, end - at);
+            complete = false;
+            break;
+        }
+        const std::uint64_t piece = (std::min)(end - at, chunkStart + chunkBytes - from);
+        const VkDeviceAddress device = chunk->address + (from - chunkStart);
+        Point(at, piece, device, at);
+        ranges_[at] = Range{piece, device, {}, chunk->buffer, from - chunkStart};
+        at += piece;
+        from += piece;
+    }
+    PointAliases();
+    return complete;
 }
 
 bool TitleAddressSpace::Import(std::uint64_t start, std::uint64_t bytes, std::string& error) {
@@ -264,11 +395,15 @@ bool TitleAddressSpace::Import(std::uint64_t start, std::uint64_t bytes, std::st
     std::uint64_t first = AlignDown(start, alignment);
     std::uint64_t last = AlignUp(start + bytes, alignment);
     std::lock_guard<std::mutex> guard(lock_);
-    for (const auto& [rangeStart, range] : ranges_) {
-        if (rangeStart <= first && rangeStart + range.bytes >= last) return true;
+    {
+        auto containing = ranges_.upper_bound(first);
+        if (containing != ranges_.begin()) {
+            --containing;
+            if (containing->first + containing->second.bytes >= last) return true;
+        }
     }
     bool overlapped = false;
-    for (auto it = ranges_.begin(); it != ranges_.end();) {
+    for (auto it = FirstOverlap(first); it != ranges_.end() && it->first < last;) {
         const std::uint64_t rangeEnd = it->first + it->second.bytes;
         if (it->first < last && rangeEnd > first && it->second.imported.memory != VK_NULL_HANDLE) {
             if (!overlapped) {
@@ -309,9 +444,10 @@ void TitleAddressSpace::Release(std::uint64_t start, std::uint64_t bytes) {
     if (bytes == 0) return;
     const std::uint64_t end = start + bytes;
     std::lock_guard<std::mutex> guard(lock_);
+    hostPages_.erase(hostPages_.lower_bound(start & ~std::uint64_t{0xFFFF}), hostPages_.lower_bound(end));
     std::vector<std::pair<std::uint64_t, Range>> released;
-    for (auto it = ranges_.begin(); it != ranges_.end();) {
-        if (it->first < end && it->first + it->second.bytes > start) {
+    for (auto it = FirstOverlap(start); it != ranges_.end() && it->first < end;) {
+        if (it->first + it->second.bytes > start) {
             released.emplace_back(it->first, it->second);
             it = ranges_.erase(it);
             continue;
@@ -345,8 +481,8 @@ void TitleAddressSpace::Release(std::uint64_t start, std::uint64_t bytes) {
         if (rangeStart < start) ImportLocked(rangeStart, start - rangeStart, ignored);
         if (rangeEnd > end) ImportLocked(end, rangeEnd - end, ignored);
     }
-    for (const auto& [rangeStart, range] : ranges_) {
-        if (rangeStart < AlignUp(end, kTitlePageBytes) && rangeStart + range.bytes > AlignDown(start, kTitlePageBytes)) Point(rangeStart, range.bytes, range.device, rangeStart);
+    for (auto it = FirstOverlap(AlignDown(start, kTitlePageBytes)); it != ranges_.end() && it->first < AlignUp(end, kTitlePageBytes); ++it) {
+        Point(it->first, it->second.bytes, it->second.device, it->first);
     }
     PointAliases();
 }
@@ -367,6 +503,69 @@ std::optional<TitleAddressSpace::Location> TitleAddressSpace::Locate(std::uint64
     const std::uint64_t offset = address - it->first;
     if (offset > it->second.bytes || bytes > it->second.bytes - offset || it->second.buffer == VK_NULL_HANDLE) return std::nullopt;
     return Location{it->second.buffer, it->second.bufferOffset + offset};
+}
+
+std::optional<TitleAddressSpace::Location> TitleAddressSpace::LocateRun(std::uint64_t address, std::uint64_t& available) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    available = 0;
+    auto it = ranges_.upper_bound(address);
+    if (it == ranges_.begin()) return std::nullopt;
+    --it;
+    const std::uint64_t offset = address - it->first;
+    if (offset >= it->second.bytes || it->second.buffer == VK_NULL_HANDLE) return std::nullopt;
+    available = it->second.bytes - offset;
+    return Location{it->second.buffer, it->second.bufferOffset + offset};
+}
+
+std::string TitleAddressSpace::DescribeTitleAddress(std::uint64_t address) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    auto it = ranges_.upper_bound(address);
+    char text[160];
+    if (it != ranges_.begin()) {
+        --it;
+        std::snprintf(text, sizeof(text), "nearest range below starts 0x%llx, 0x%llx bytes, %s", static_cast<unsigned long long>(it->first),
+                      static_cast<unsigned long long>(it->second.bytes), it->second.imported.memory != VK_NULL_HANDLE ? "imported" : "mapped");
+        return text;
+    }
+    return "no range below";
+}
+
+std::string TitleAddressSpace::DescribeDeviceAddress(std::uint64_t device) const {
+    std::lock_guard<std::mutex> guard(lock_);
+    std::string best = "in no title address range";
+    std::uint64_t bestDistance = UINT64_MAX;
+    const auto consider = [&](const char* kind, std::uint64_t title, std::uint64_t start, std::uint64_t bytes) {
+        if (start == 0) return;
+        char text[192];
+        if (device >= start && device - start < bytes) {
+            std::snprintf(text, sizeof(text), "inside %s for title 0x%llx (+0x%llx of 0x%llx bytes)", kind, static_cast<unsigned long long>(title),
+                          static_cast<unsigned long long>(device - start), static_cast<unsigned long long>(bytes));
+            best = text;
+            bestDistance = 0;
+            return;
+        }
+        if (device >= start + bytes && device - (start + bytes) < bestDistance) {
+            bestDistance = device - (start + bytes);
+            std::snprintf(text, sizeof(text), "0x%llx past the end of %s for title 0x%llx (0x%llx bytes)", static_cast<unsigned long long>(bestDistance), kind,
+                          static_cast<unsigned long long>(title), static_cast<unsigned long long>(bytes));
+            best = text;
+        }
+    };
+    for (const auto& [start, range] : ranges_) {
+        if (bestDistance == 0) break;
+        consider(range.imported.memory != VK_NULL_HANDLE ? "imported title memory" : "a mapped range", start, range.device, range.bytes);
+    }
+    for (const auto& [view, chunk] : chunks_) {
+        if (bestDistance == 0) break;
+        consider("a physical page chunk", view, chunk.address, kBackingChunkBytes);
+    }
+    if (bestDistance != 0) consider("the null page", 0, nullPage_.address, 2 * kTitlePageBytes);
+    if (bestDistance != 0) consider("the null region table", 0, nullRegion_.address, kTitlePagesPerRegion * sizeof(std::uint64_t));
+    for (std::size_t region = 0; region < regions_.size() && bestDistance != 0; ++region) {
+        if (regions_[region].buffer != VK_NULL_HANDLE) consider("a region page table", region << 32, regions_[region].address, kTitlePagesPerRegion * sizeof(std::uint64_t));
+    }
+    if (bestDistance != 0) consider("the page table root", 0, root_.address, kTitleRegionCount * sizeof(std::uint64_t));
+    return best;
 }
 
 std::uint64_t TitleAddressSpace::ImportedBytes() const {

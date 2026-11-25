@@ -16,7 +16,9 @@ constexpr GUID kCommandListInterface{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x
 HRESULT Deliver(Kind kind, IUnknown* inner, REFIID riid, void** object);
 void SetTimestampFrequency(UINT64 frequency);
 void SetVulkanDevice(const VulkanDevice* device);
-void SetAddressSpace(const TitleAddressSpace* addresses);
+void SetAddressSpace(TitleAddressSpace* addresses);
+void RegisterPagePool(const void* handle, std::uint64_t start, std::uint64_t bytes);
+const TitleAddressSpace* AddressSpace();
 
 template <typename Object>
 Object* Unwrap(void* object) {

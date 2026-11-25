@@ -140,10 +140,7 @@ std::optional<ParsedPipelineStream> ParsePipelineStream(const void* stream, std:
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: desc.DepthStencilState = Read<D3D12_DEPTH_STENCIL_DESC>(inner); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
             const D3D12_DEPTH_STENCIL_DESC1 depth = Read<D3D12_DEPTH_STENCIL_DESC1>(inner);
-            if (depth.DepthBoundsTestEnable) {
-                error = "depth bounds tests in a pipeline state stream are not supported";
-                return std::nullopt;
-            }
+            if (depth.DepthBoundsTestEnable) parsed.depthBounds = true;
             std::memcpy(&desc.DepthStencilState, &depth, sizeof(desc.DepthStencilState));
             break;
         }
