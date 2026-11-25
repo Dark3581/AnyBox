@@ -142,7 +142,10 @@ Resource* TitleTextures::At(std::uint64_t address, const D3D12_RESOURCE_DESC& de
         if (waiting != pending_.end()) {
             std::string retry;
             const Filled filled = Upload(*known->second, waiting->second.first, waiting->second.second, retry);
-            if (filled == Filled::Yes) pending_.erase(waiting);
+            if (filled == Filled::Yes) {
+                pending_.erase(waiting);
+                if (tracked_.count(known->second) != 0) ScheduleRecheck(known->second, true);
+            }
         }
         const auto used = tracked_.find(known->second);
         if (used != tracked_.end()) used->second.lastUsed = frame_;
@@ -229,6 +232,7 @@ Resource* TitleTextures::At(std::uint64_t address, const D3D12_RESOURCE_DESC& de
         }
     }
     const Filled filled = Upload(*texture, address, mips, error);
+    if (filled == Filled::Yes && tracked_.count(texture) != 0) ScheduleRecheck(texture, true);
     if (filled == Filled::Failed) {
         tracked_.erase(texture);
         layouts_.erase(texture);
@@ -342,7 +346,45 @@ bool TitleTextures::Visit(Resource* texture, Tracked& tracked, bool& uploaded) {
     if (waiting) pending_.erase(texture);
     tracked.sample = sample;
     uploaded = true;
+    ScheduleRecheck(texture, true);
     return true;
+}
+
+void TitleTextures::ScheduleRecheck(Resource* texture, bool restart) {
+    static constexpr std::uint64_t kAfterFrames[] = {4, 12, 40, 120, 400};
+    constexpr std::uint32_t kSteps = sizeof(kAfterFrames) / sizeof(kAfterFrames[0]);
+    std::uint32_t& step = recheckStep_[texture];
+    step = restart ? 0 : step + 1;
+    if (step >= kSteps) {
+        recheckStep_.erase(texture);
+        return;
+    }
+    recheckDue_.emplace(frame_ + kAfterFrames[step], texture);
+}
+
+void TitleTextures::RunRechecks() {
+    constexpr std::size_t kPerFrame = 512;
+    std::size_t done = 0;
+    while (!recheckDue_.empty() && recheckDue_.begin()->first <= frame_ && done < kPerFrame) {
+        Resource* const texture = recheckDue_.begin()->second;
+        recheckDue_.erase(recheckDue_.begin());
+        ++done;
+        const auto tracked = tracked_.find(texture);
+        if (tracked == tracked_.end() || recheckStep_.count(texture) == 0) continue;
+        bool uploaded = false;
+        Visit(texture, tracked->second, uploaded);
+        if (!uploaded) {
+            ScheduleRecheck(texture, false);
+            continue;
+        }
+        static std::atomic<std::uint64_t> changed{0};
+        const std::uint64_t count = ++changed;
+        if (count == 1 || (count & (count - 1)) == 0) {
+            AbxLog("d3d12_x", "a title texture checked again a few frames after its upload had changed in title memory and was uploaded again (%llu so far): titles often fill "
+                              "a texture's memory after creating it",
+                   static_cast<unsigned long long>(count));
+        }
+    }
 }
 
 void TitleTextures::EvictOverlapping(Resource* kept, std::uint64_t address, std::uint64_t bytes) {
@@ -377,6 +419,7 @@ void TitleTextures::EvictOverlapping(Resource* kept, std::uint64_t address, std:
         }
         layouts_.erase(victim);
         skippedMips_.erase(victim);
+        recheckStep_.erase(victim);
         pending_.erase(victim);
         if (resumeAfter_ == victim) resumeAfter_ = nullptr;
         graveyard_.emplace_back(victim, frame_);
@@ -403,6 +446,7 @@ void TitleTextures::Refresh() {
         grave->first->Release();
         grave = graveyard_.erase(grave);
     }
+    RunRechecks();
     for (auto& [texture, tracked] : tracked_) {
         if (!tracked.whole || !tracked.readable) continue;
         if (((frame_ + (reinterpret_cast<std::uintptr_t>(texture) >> 6)) & 3) != 0) continue;

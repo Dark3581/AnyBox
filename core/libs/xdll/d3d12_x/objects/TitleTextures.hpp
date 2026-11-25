@@ -77,6 +77,10 @@ private:
     std::uint64_t largestBytes_ = 0;
     bool Visit(Resource* texture, struct Tracked& tracked, bool& uploaded);
     std::uint64_t refreshMicroseconds_ = 0;
+    std::multimap<std::uint64_t, Resource*> recheckDue_;
+    std::map<Resource*, std::uint32_t> recheckStep_;
+    void ScheduleRecheck(Resource* texture, bool restart);
+    void RunRechecks();
     std::map<Resource*, Tracked> tracked_;
     std::map<Resource*, std::shared_ptr<const gfx10::ConsoleTexture>> layouts_;
     std::set<std::string> linearReasons_;
