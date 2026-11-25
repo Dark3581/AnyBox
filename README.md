@@ -1,5 +1,13 @@
 # AnyBox
 
+## Status
+
+Title 7952987A (version 1.0.2.1) boots through its first-run legal screens, plays its loading screen and loads into the game world, where the HUD renders. The world itself is still black and runs at 1 to 6 fps on a first run while shaders compile. Details: [Bring-up status](docs/dev/GAME_TESTING.md#bring-up-status).
+
+| Legal screens | Loading screen | First in-game HUD |
+|---|---|---|
+| ![Legal screens](docs/dev/images/7952987A-legal-screen.png) | ![Loading screen](docs/dev/images/7952987A-loading-screen.png) | ![First in-game HUD](docs/dev/images/7952987A-first-hud.png) |
+
 <!-- docs:start -->
 <details>
 <summary><b>Usage</b> (<a href="docs/user/USAGE.md">docs/user/USAGE.md</a>)</summary>
