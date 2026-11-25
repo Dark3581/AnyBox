@@ -19,23 +19,9 @@ const char* PipelineOriginName(PipelineOrigin origin) {
         return "refused";
     case PipelineOrigin::Failed:
         return "failed";
-    case PipelineOrigin::Deferred:
-        return "deferred until first use";
     }
     return "unknown";
 }
-
-namespace {
-
-thread_local bool t_cacheOnly = false;
-
-}
-
-CacheOnlyBuilds::CacheOnlyBuilds(bool enabled) : previous_(t_cacheOnly) { t_cacheOnly = enabled; }
-
-CacheOnlyBuilds::~CacheOnlyBuilds() { t_cacheOnly = previous_; }
-
-bool CacheOnlyBuilds::Active() { return t_cacheOnly; }
 
 PipelineLibrary::PipelineLibrary(const VulkanDevice& device, VkPipelineCache cache, std::uintmax_t compileLimitBytes)
     : device_(device), cache_(cache), compileLimitBytes_(compileLimitBytes) {}
@@ -69,13 +55,13 @@ PipelineEntry PipelineLibrary::Graphics(const GraphicsRequest& request) {
 PipelineEntry PipelineLibrary::Obtain(const std::string& key, const std::function<PipelineEntry()>& create) {
     std::unique_lock<std::mutex> guard(lock_);
     const auto [found, inserted] = slots_.try_emplace(key);
-    if (inserted) found->second = std::make_unique<Slot>();
-    Slot& slot = *found->second;
     if (!inserted) {
+        Slot& slot = *found->second;
         finished_.wait(guard, [&slot] { return slot.done; });
-        if (slot.entry.origin != PipelineOrigin::Deferred || t_cacheOnly) return slot.entry;
-        slot.done = false;
+        return slot.entry;
     }
+    found->second = std::make_unique<Slot>();
+    Slot& slot = *found->second;
     guard.unlock();
     PipelineEntry entry;
     try {
@@ -99,8 +85,6 @@ PipelineEntry PipelineLibrary::Obtain(const std::string& key, const std::functio
         break;
     case PipelineOrigin::Failed:
         ++stats_.failed;
-        break;
-    case PipelineOrigin::Deferred:
         break;
     }
     finished_.notify_all();
@@ -173,11 +157,6 @@ PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) co
         if (result == VK_SUCCESS) {
             entry.origin = PipelineOrigin::Ready;
         }
-    }
-    if (result == VK_PIPELINE_COMPILE_REQUIRED && t_cacheOnly && device_.PipelineCacheControl()) {
-        release();
-        entry.origin = PipelineOrigin::Deferred;
-        return finish();
     }
     if (result == VK_PIPELINE_COMPILE_REQUIRED) {
         if (overLimit) {

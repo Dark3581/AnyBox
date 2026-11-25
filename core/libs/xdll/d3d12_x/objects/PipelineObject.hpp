@@ -68,7 +68,7 @@ private:
     static RootSignature* SignatureOf(ID3D12RootSignature* signature, std::string& error);
     static HRESULT Finish(PipelineStateObject* created, REFIID riid, void** state, std::string& error);
     void BuildInBackground(std::function<PipelineEntry()> build, std::uint64_t moduleBytes);
-    void RunBuild(bool cacheOnly = false);
+    void RunBuild();
 
     std::uint32_t alive_ = kAlive;
     VkPipelineBindPoint point_;

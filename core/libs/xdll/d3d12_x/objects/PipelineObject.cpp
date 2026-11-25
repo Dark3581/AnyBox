@@ -94,18 +94,16 @@ public:
         return *queue;
     }
 
-    void Push(std::function<void()> task, bool urgent, bool heavy, bool quick = false) {
+    void Push(std::function<void()> task, bool urgent, bool heavy) {
         {
             const std::lock_guard guard(lock_);
-            if (quick && !urgent) {
-                quick_.push_back(std::move(task));
-            } else if (heavy) {
+            if (heavy) {
                 if (urgent) heavy_.push_front(std::move(task));
                 else heavy_.push_back(std::move(task));
             } else {
                 (urgent ? urgent_ : tasks_).push_back(std::move(task));
             }
-            Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size() + quick_.size());
+            Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size());
         }
         ready_.notify_all();
     }
@@ -135,12 +133,12 @@ private:
                 if (heavy) {
                     ready_.wait(guard, [this] { return !heavy_.empty(); });
                 } else {
-                    ready_.wait(guard, [this] { return !urgent_.empty() || !quick_.empty() || !tasks_.empty(); });
+                    ready_.wait(guard, [this] { return !urgent_.empty() || !tasks_.empty(); });
                 }
-                std::deque<std::function<void()>>& lane = heavy ? heavy_ : !urgent_.empty() ? urgent_ : !quick_.empty() ? quick_ : tasks_;
+                std::deque<std::function<void()>>& lane = heavy ? heavy_ : urgent_.empty() ? tasks_ : urgent_;
                 task = std::move(lane.front());
                 lane.pop_front();
-                Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size() + quick_.size());
+                Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size());
             }
             WaitForCommit();
             ++Stats().pipelinesBuilding;
@@ -149,7 +147,7 @@ private:
             std::size_t queued = 0;
             {
                 const std::lock_guard guard(lock_);
-                queued = tasks_.size() + urgent_.size() + heavy_.size() + quick_.size();
+                queued = tasks_.size() + urgent_.size() + heavy_.size();
             }
             const std::uint64_t done = ++done_;
             if (done % 500 == 0) AbxLog("d3d12_x", "background pipeline builds: %llu done, %zu queued", static_cast<unsigned long long>(done), queued);
@@ -173,7 +171,6 @@ private:
     std::deque<std::function<void()>> tasks_;
     std::deque<std::function<void()>> urgent_;
     std::deque<std::function<void()>> heavy_;
-    std::deque<std::function<void()>> quick_;
 };
 
 constexpr std::uint64_t kHeavyBytes = 2ull << 20;
@@ -220,13 +217,21 @@ void PipelineStateObject::BuildInBackground(std::function<PipelineEntry()> build
     moduleBytes_ = moduleBytes;
     build_ = std::move(build);
     pending_.store(true, std::memory_order_release);
+    if (point_ == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "graphics pipelines are built when a draw first uses them, from the pipeline cache when it holds them, not in the background: a background build reads "
+                              "and translates every shader module the title names, which competes with the title's own reads while it loads");
+        }
+        return;
+    }
     AddRef();
     BuildQueue::Instance().Push(
         [this] {
-            RunBuild(point_ == VK_PIPELINE_BIND_POINT_GRAPHICS);
+            RunBuild();
             Release();
         },
-        false, heavy_, point_ == VK_PIPELINE_BIND_POINT_GRAPHICS);
+        false, heavy_);
 }
 
 void PipelineStateObject::Prioritize() {
@@ -257,7 +262,7 @@ void PipelineStateObject::BuildNow() {
     for (int waited = 0; Pending() && waited < 50; ++waited) Sleep(1);
 }
 
-void PipelineStateObject::RunBuild(bool cacheOnly) {
+void PipelineStateObject::RunBuild() {
     if (started_.exchange(true)) return;
     {
         const std::string key = PipelineKey(shaders_);
@@ -265,23 +270,8 @@ void PipelineStateObject::RunBuild(bool cacheOnly) {
         std::memcpy(t_building, key.data(), length);
         t_building[length] = 0;
         const auto buildBegin = std::chrono::steady_clock::now();
-        PipelineEntry entry;
-        {
-            const CacheOnlyBuilds scope(cacheOnly);
-            entry = build_();
-        }
+        const PipelineEntry entry = build_();
         t_building[0] = 0;
-        if (entry.origin == PipelineOrigin::Deferred) {
-            static std::atomic<std::uint64_t> deferred{0};
-            const std::uint64_t count = ++deferred;
-            if (count == 1 || (count & (count - 1)) == 0) {
-                AbxLog("d3d12_x", "graphics pipelines not in the pipeline cache are compiled when a draw first uses them instead of in the background, so loading is not slowed by "
-                                  "compiling pipelines the title may never draw with (%llu so far)",
-                       static_cast<unsigned long long>(count));
-            }
-            started_.store(false, std::memory_order_release);
-            return;
-        }
         {
             const long long took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - buildBegin).count();
             static std::atomic<long long> totalMs{0};
