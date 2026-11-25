@@ -94,16 +94,18 @@ public:
         return *queue;
     }
 
-    void Push(std::function<void()> task, bool urgent, bool heavy) {
+    void Push(std::function<void()> task, bool urgent, bool heavy, bool quick = false) {
         {
             const std::lock_guard guard(lock_);
-            if (heavy) {
+            if (quick && !urgent) {
+                quick_.push_back(std::move(task));
+            } else if (heavy) {
                 if (urgent) heavy_.push_front(std::move(task));
                 else heavy_.push_back(std::move(task));
             } else {
                 (urgent ? urgent_ : tasks_).push_back(std::move(task));
             }
-            Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size());
+            Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size() + quick_.size());
         }
         ready_.notify_all();
     }
@@ -133,12 +135,12 @@ private:
                 if (heavy) {
                     ready_.wait(guard, [this] { return !heavy_.empty(); });
                 } else {
-                    ready_.wait(guard, [this] { return !urgent_.empty() || !tasks_.empty(); });
+                    ready_.wait(guard, [this] { return !urgent_.empty() || !quick_.empty() || !tasks_.empty(); });
                 }
-                std::deque<std::function<void()>>& lane = heavy ? heavy_ : urgent_.empty() ? tasks_ : urgent_;
+                std::deque<std::function<void()>>& lane = heavy ? heavy_ : !urgent_.empty() ? urgent_ : !quick_.empty() ? quick_ : tasks_;
                 task = std::move(lane.front());
                 lane.pop_front();
-                Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size());
+                Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size() + quick_.size());
             }
             WaitForCommit();
             ++Stats().pipelinesBuilding;
@@ -147,7 +149,7 @@ private:
             std::size_t queued = 0;
             {
                 const std::lock_guard guard(lock_);
-                queued = tasks_.size() + urgent_.size() + heavy_.size();
+                queued = tasks_.size() + urgent_.size() + heavy_.size() + quick_.size();
             }
             const std::uint64_t done = ++done_;
             if (done % 500 == 0) AbxLog("d3d12_x", "background pipeline builds: %llu done, %zu queued", static_cast<unsigned long long>(done), queued);
@@ -171,6 +173,7 @@ private:
     std::deque<std::function<void()>> tasks_;
     std::deque<std::function<void()>> urgent_;
     std::deque<std::function<void()>> heavy_;
+    std::deque<std::function<void()>> quick_;
 };
 
 constexpr std::uint64_t kHeavyBytes = 2ull << 20;
@@ -223,7 +226,7 @@ void PipelineStateObject::BuildInBackground(std::function<PipelineEntry()> build
             RunBuild(point_ == VK_PIPELINE_BIND_POINT_GRAPHICS);
             Release();
         },
-        false, heavy_);
+        false, heavy_, point_ == VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
 void PipelineStateObject::Prioritize() {
