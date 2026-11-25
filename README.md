@@ -4,10 +4,6 @@
 
 Title 7952987A (version 1.0.2.1) boots through its first-run legal screens, plays its loading screen and loads into the game world, where the HUD renders. The world itself is still black and runs at 1 to 6 fps on a first run while shaders compile. Details: [Bring-up status](docs/dev/GAME_TESTING.md#bring-up-status).
 
-| Legal screens | Loading screen | First in-game HUD |
-|---|---|---|
-| ![Legal screens](docs/dev/images/7952987A-legal-screen.png) | ![Loading screen](docs/dev/images/7952987A-loading-screen.png) | ![First in-game HUD](docs/dev/images/7952987A-first-hud.png) |
-
 <!-- docs:start -->
 <details>
 <summary><b>Usage</b> (<a href="docs/user/USAGE.md">docs/user/USAGE.md</a>)</summary>
@@ -458,10 +454,6 @@ Tested on 2026-11-24 with an 8 GB desktop GPU (NVIDIA driver) and 12 hardware th
 | Frame rate in game | 1 to 3 fps on a first run, while pipelines are still being compiled |
 | Audio | silent: the DSP connection is accepted, its commands are dropped |
 | Ray tracing | the title's acceleration structure builder is not run, so scenes render without ray-traced effects |
-
-First in-game frame with the HUD (2026-11-24): location box and markers over the still-black world.
-
-![First in-game HUD of 7952987A](docs/dev/images/7952987A-first-hud.png)
 
 Open items, in order:
 

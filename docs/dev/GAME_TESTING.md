@@ -211,10 +211,6 @@ Tested on 2026-11-24 with an 8 GB desktop GPU (NVIDIA driver) and 12 hardware th
 | Audio | silent: the DSP connection is accepted, its commands are dropped |
 | Ray tracing | the title's acceleration structure builder is not run, so scenes render without ray-traced effects |
 
-First in-game frame with the HUD (2026-11-24): location box and markers over the still-black world.
-
-![First in-game HUD of 7952987A](images/7952987A-first-hud.png)
-
 Open items, in order:
 
 1. Confirm mesh pipelines draw the world, and their first-use compile time in game.
