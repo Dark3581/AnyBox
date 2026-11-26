@@ -27,6 +27,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -265,10 +266,28 @@ std::size_t CallerFrame(const std::uint64_t* frames, std::size_t count) {
     return count;
 }
 
+bool InRuntimeModule(std::uintptr_t address) {
+    static const std::pair<std::uintptr_t, std::uintptr_t> range = [] {
+        HMODULE self = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(&InRuntimeModule), &self) || self == nullptr) {
+            return std::pair<std::uintptr_t, std::uintptr_t>{0, 0};
+        }
+        const auto base = reinterpret_cast<std::uintptr_t>(self);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<std::uintptr_t>(dos->e_lfanew));
+        return std::pair<std::uintptr_t, std::uintptr_t>{base, base + nt->OptionalHeader.SizeOfImage};
+    }();
+    return address >= range.first && address < range.second;
+}
+
 std::size_t CaptureFrames(std::uint64_t* frames) {
-    void* raw[MaxFrames]{};
-    const USHORT count = RtlCaptureStackBackTrace(2, static_cast<DWORD>(MaxFrames), raw, nullptr);
-    for (USHORT index = 0; index < count; ++index) frames[index] = reinterpret_cast<std::uintptr_t>(raw[index]);
+    void* raw[MaxFrames + 8]{};
+    const USHORT captured = RtlCaptureStackBackTrace(0, static_cast<DWORD>(MaxFrames + 8), raw, nullptr);
+    USHORT first = 0;
+    while (first < captured && InRuntimeModule(reinterpret_cast<std::uintptr_t>(raw[first]))) ++first;
+    std::size_t count = 0;
+    for (USHORT index = first; index < captured && count < MaxFrames; ++index) frames[count++] = reinterpret_cast<std::uintptr_t>(raw[index]);
     return count;
 }
 

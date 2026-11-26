@@ -40,7 +40,7 @@ jobs:
           python tools/progress.py site
           python tools/progress_history.py site --ref HEAD
           python tools/needs.py site >> "$GITHUB_STEP_SUMMARY"
-          python tools/stats_page.py README.md site/index.html
+          python tools/stats_page.py README.md site/index.html --banner site/progress.html site/needs.html site/history.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site

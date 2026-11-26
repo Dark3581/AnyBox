@@ -2,6 +2,9 @@
 """Write the Pages front page from the README's "Status" and "Stats" sections.
 
     python tools/stats_page.py README.md site/index.html
+    python tools/stats_page.py README.md site/index.html --banner site/progress.html site/needs.html site/history.html
+
+--banner also puts the links and the stats table at the top of the other pages.
 """
 
 import argparse
@@ -10,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-LINKS = (("progress.html", "Library progress"), ("needs.html", "What titles need"), ("history.html", "Progress history"))
+LINKS = (("index.html", "Status and stats"), ("progress.html", "Library progress"), ("needs.html", "What titles need"), ("history.html", "Progress history"))
 REPOSITORY = "https://github.com/Dark3581/AnyBox"
 
 
@@ -83,18 +86,44 @@ nav{{margin:8px 0 16px;color:#8b949e}}
 """
 
 
+def banner(markdown):
+    """The links and the Stats section as a block for the top of another page."""
+    stats = section(markdown, "Stats")
+    links = " &nbsp;·&nbsp; ".join(f'<a href="{href}">{label}</a>' for href, label in LINKS)
+    table = f"<details open><summary>Current stats</summary>\n{blocks(stats)}\n</details>" if stats is not None else ""
+    return (f'<div class="stats-banner" style="border-bottom:1px solid #30363d;margin-bottom:16px;padding-bottom:8px">'
+            f"<nav>{links}</nav>\n{table}</div>\n")
+
+
+def add_banner(page_html, markdown):
+    """page_html with the banner right after its <body> tag; unchanged when it already has one or has no <body>."""
+    if 'class="stats-banner"' in page_html:
+        return page_html
+    match = re.search(r"<body[^>]*>", page_html)
+    if match is None:
+        return page_html
+    return page_html[:match.end()] + "\n" + banner(markdown) + page_html[match.end():]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     parser.add_argument("readme", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--banner", type=Path, nargs="*", default=[], help="pages to put the links and stats at the top of")
     args = parser.parse_args(argv)
+    markdown = args.readme.read_text(encoding="utf-8")
     try:
-        text = page(args.readme.read_text(encoding="utf-8"))
+        text = page(markdown)
     except ValueError as error:
         print(f"stats_page: {error}", file=sys.stderr)
         return 1
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(text, encoding="utf-8")
+    for other in args.banner:
+        if other.is_file():
+            other.write_text(add_banner(other.read_text(encoding="utf-8"), markdown), encoding="utf-8")
+        else:
+            print(f"stats_page: {other} does not exist, no banner added", file=sys.stderr)
     return 0
 
 

@@ -48,6 +48,15 @@ class StatsPageTest(unittest.TestCase):
         self.assertNotIn("Serves", text)
         self.assertIn('href="progress.html"', text)
 
+    def test_banner(self):
+        other = "<html><head></head><body><h1>Needs</h1></body></html>"
+        text = stats_page.add_banner(other, README)
+        self.assertLess(text.index('class="stats-banner"'), text.index("<h1>Needs</h1>"))
+        self.assertIn("<td>3 to 4 fps</td>", text)
+        self.assertIn('href="index.html"', text)
+        self.assertEqual(stats_page.add_banner(text, README), text)
+        self.assertEqual(stats_page.add_banner("no body here", README), "no body here")
+
     def test_no_sections(self):
         with self.assertRaises(ValueError):
             stats_page.page("# AnyBox\n\nnothing\n")
