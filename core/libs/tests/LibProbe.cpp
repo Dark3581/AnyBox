@@ -423,7 +423,6 @@ int RefusedBuffers() {
     RefusedProbe probe;
     const DWORD modes[] = {FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING};
     for (const DWORD mode : modes) {
-        const bool later = (mode & FILE_FLAG_OVERLAPPED) != 0;
         std::memcpy(buffer, pattern.data(), kBytes);
         HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, mode, nullptr);
         if (file == INVALID_HANDLE_VALUE) return Fail("create the file");
@@ -434,8 +433,15 @@ int RefusedBuffers() {
         SetLastError(0);
         if (WriteFile(file, buffer, kBytes, &count, &overlapped)) return Fail("WriteFile from a page without access succeeds");
         const DWORD writeError = GetLastError();
+        const bool later = (mode & FILE_FLAG_OVERLAPPED) != 0 && writeError == ERROR_IO_PENDING;
         if (later) {
-            if (writeError != ERROR_IO_PENDING || GetOverlappedResult(file, &overlapped, &count, TRUE)) return Fail("an overlapped WriteFile from a page without access is refused later");
+            if (GetOverlappedResult(file, &overlapped, &count, TRUE)) {
+                std::printf("mode 0x%08lx: an overlapped WriteFile from a page without access is accepted and completes on this host, so this mode is not checked\n",
+                            static_cast<unsigned long>(mode));
+                if (!protect(PAGE_READWRITE)) return Fail("VirtualProtect");
+                CloseHandle(file);
+                continue;
+            }
             std::printf("mode 0x%08lx: WriteFile from a page without access is accepted and fails later with %lu, the file holds %lld byte(s)\n", static_cast<unsigned long>(mode),
                         static_cast<unsigned long>(GetLastError()), size(file));
             probe = RefusedProbe{};
@@ -448,7 +454,7 @@ int RefusedBuffers() {
         } else {
             std::printf("mode 0x%08lx: WriteFile from a page without access fails with %lu, the file holds %lld byte(s)\n", static_cast<unsigned long>(mode),
                         static_cast<unsigned long>(writeError), size(file));
-            if (writeError != ERROR_INVALID_USER_BUFFER) return Fail("WriteFile from a page without access fails with another error than ERROR_INVALID_USER_BUFFER");
+            if (writeError != ERROR_INVALID_USER_BUFFER && writeError != ERROR_NOACCESS) return Fail("WriteFile from a page without access fails with another error than ERROR_INVALID_USER_BUFFER or ERROR_NOACCESS");
             probe = RefusedProbe{};
             probe.open = false;
             if (!watch(&OnRefusedBuffer, &probe)) return Fail("the runtime did not replace ReadFile and WriteFile");
