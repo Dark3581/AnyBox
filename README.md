@@ -641,7 +641,7 @@ python tools/progress.py --root ../other-checkout --json  # count another checko
 
 ## Publishing
 
-- [Pages workflow](.github/workflows/pages.yml): on pushes to `main` that touch `core/libs`, the tools or the docs, it publishes the progress page, map, badge and history to GitHub Pages.
+- [Pages workflow](.github/workflows/pages.yml): on pushes to `main` that touch `core/libs`, the tools, the docs or the README, it publishes the progress page, map, badge and history to GitHub Pages. Its front page is written by [`tools/stats_page.py`](tools/stats_page.py) from the README's Status and Stats sections.
 - [Progress report workflow](.github/workflows/progress-report.yml): on pull requests, it counts the base (`--root`) and the merged head with the same version of the tool and compares them. [Progress comment](.github/workflows/progress-comment.yml) posts the result on the pull request as one comment, updated on each push and deleted when the change no longer touches a library: the new percentage and its change, the functions implemented, forwarded, newly stubbed, removed or no longer done, and a table of the changed libraries. It runs in a separate workflow because pull requests from forks get a read-only token.
 
 ## What still needs implementing

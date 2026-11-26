@@ -8,6 +8,7 @@ on:
       - tools/**
       - docs/needs/**
       - docs/inventory/**
+      - README.md
       - .github/workflows/pages.yml
   schedule:
     - cron: "17 3 * * *"
@@ -39,7 +40,7 @@ jobs:
           python tools/progress.py site
           python tools/progress_history.py site --ref HEAD
           python tools/needs.py site >> "$GITHUB_STEP_SUMMARY"
-          cp site/progress.html site/index.html
+          python tools/stats_page.py README.md site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
