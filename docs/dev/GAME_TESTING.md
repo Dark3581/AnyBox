@@ -197,24 +197,25 @@ How far each title gets. One table per title ID; the detail of each run belongs 
 
 ### 7952987A, version 1.0.2.1
 
-Tested on 2026-11-24 with an 8 GB desktop GPU (NVIDIA driver) and 12 hardware threads.
+Tested on 2026-11-25 with an 8 GB desktop GPU (NVIDIA driver, PCIe 4.0 x16), 12 hardware threads, 32 GB of memory and the title on a hard disk.
 
 | Stage | Status |
 |---|---|
 | Boot, first-run setup, legal screens | passed |
 | Start screen and intro video | renders |
-| Loading screen | renders at 30 to 60 fps; loading took 24 minutes on the run that reached the game |
-| Into the game | reached; gameplay telemetry fires, the title runs real frames for 10+ minutes without stopping |
-| HUD | renders (location box, markers) |
-| Game world | black on the runs so far: the world is drawn with mesh pipelines, which were not built. Mesh pipelines (subobject 24) and mesh draws are now built; not yet seen in game |
-| Frame rate in game | 1 to 3 fps on a first run, while pipelines are still being compiled |
+| Loading screen | renders at 28 to 32 fps; the first in-world frame comes about 13 minutes after start (longer right after a reboot, when the title's files are not cached) |
+| Into the game | reached; the opening sequence with its credits plays for 35 minutes and more |
+| Game world | drawn and lit: geometry, materials, sky and lighting render. Directly indexed descriptor heaps, the stencil plane, the title's one-time lookup tables and textures shared between two formats were the missing pieces |
+| Frame rate in game | 1 to 2 fps: each frame keeps the GPU busy for 1 to 2 seconds, most of it on title buffers in system memory that shaders reach over the bus (26 to 1,100 times slower than video memory, measured offline) |
+| Video memory | over an 8 GB card's budget in the world; allocations past it succeed as pageable memory instead of stopping the title |
+| Known artifacts | a grid of black squares (the material mask written through a depth view is not applied yet), banding in the sky |
 | Audio | silent: the DSP connection is accepted, its commands are dropped |
 | Ray tracing | the title's acceleration structure builder is not run, so scenes render without ray-traced effects |
 
 Open items, in order:
 
-1. Confirm mesh pipelines draw the world, and their first-use compile time in game.
-2. Loading time: most of the CPU goes to the driver's shader compiler during loading.
-3. Video memory: the title fills an 8 GB card; the small-texture pool never returns empty blocks.
-4. Compute shaders that read constants from their own code (shader code in title memory) are skipped.
-5. Indirect draws are not checked on the GPU like indirect dispatches.
+1. Keep GPU-written title buffers (about 1 GiB) in video memory and copy a page back only when the CPU touches it: the main frame-rate lever.
+2. A wave-sum lowering in the shader converter makes the screen-probe final gather run 16 times too many groups.
+3. The material mask written through a depth-texture view: every way tried so far lost the device in the world.
+4. The GI shaders over the 16 MiB SPIR-V limit and the acceleration structure builder.
+5. Loading: DirectStorage reads, the title's streaming thread priority, and pipelines used in an earlier run built while loading.
