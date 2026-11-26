@@ -1,7 +1,11 @@
 #include "ConsoleObjects.hpp"
 #include "FrameDump.hpp"
+#include "FrameTiming.hpp"
+#include "GpuProfile.hpp"
+#include "HangReport.hpp"
 #include "LiveStats.hpp"
 #include "TitleTextures.hpp"
+#include "TextureReadback.hpp"
 
 #include "AbxApi.hpp"
 #include "CommandAllocator.hpp"
@@ -22,6 +26,7 @@
 #include <optional>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -144,6 +149,7 @@ void ClearLabels(const CommandList* list) {
 }
 
 HRESULT STDMETHODCALLTYPE ListClose(Facade* self) {
+    CheckFacadeGuard(self, "ID3D12GraphicsCommandList::Close");
     return InnerOf<CommandList>(self)->Close();
 }
 
@@ -230,6 +236,7 @@ HRESULT STDMETHODCALLTYPE QueueUpdateGpuPages(Facade*, UINT count, const GpuPage
     constexpr std::uint32_t kMaxEntries = 65536;
     if (count > kMaxRecords || (count != 0 && records == nullptr)) RefuseGpuPages("more than 4096 records or a null record array");
     if (count == 0) return S_OK;
+    const abx::d3d12x::TimedScope timed(abx::d3d12x::TimedPart::GpuPages);
     if (g_addresses == nullptr) RefuseGpuPages("GPU page mapping before the device's address space exists");
     const PhysicalPageView view = PageView();
     const PhysicalPageView viewAt = ViewAt();
@@ -314,7 +321,7 @@ HRESULT STDMETHODCALLTYPE QueueUpdateGpuPages(Facade*, UINT count, const GpuPage
                     }
                 }
                 std::string error;
-                if (!g_addresses->AliasPhysical(at, kGpuPageBytes, reinterpret_cast<std::uint64_t>(source), error)) {
+                if (!g_addresses->AliasPhysical(at, kGpuPageBytes, reinterpret_cast<std::uint64_t>(source), error, page.operation == kMapPoolPage)) {
                     RefuseGpuPages("aliasing a physical page at GPU address failed: " + error);
                 }
             }
@@ -349,6 +356,7 @@ void STDMETHODCALLTYPE QueueExecuteCommandLists(Facade* self, UINT count, void* 
         TraceLine("execute queue %p thread %lu lists%s", static_cast<void*>(queue), GetCurrentThreadId(), ids.c_str());
     }
     if (TitleTextures* textures = TitleTextures::Active()) textures->Flush();
+    if (TextureReadback* readback = TextureReadback::Active()) readback->Deliver(false);
     std::vector<ID3D12CommandList*> segment;
     std::vector<CommandQueue::MemoryWait> segmentWaits;
     std::vector<CommandQueue::MemoryLabel> segmentLabels;
@@ -386,7 +394,10 @@ void STDMETHODCALLTYPE QueueExecuteCommandLists(Facade* self, UINT count, void* 
                 }
             }
             if (const auto found = g_labels.find(list); found != g_labels.end()) {
-                for (const Label& label : found->second) labels.push_back({label.address, label.value});
+                for (const Label& label : found->second) {
+                    if (g_addresses != nullptr) g_addresses->HostAt(reinterpret_cast<std::uintptr_t>(label.address));
+                    labels.push_back({label.address, label.value});
+                }
             }
         }
         if (!waits.empty()) submit();
@@ -406,10 +417,98 @@ HRESULT STDMETHODCALLTYPE QueueSignal(Facade* self, void* fence, UINT64 value) {
 std::mutex g_presentLock;
 std::unique_ptr<Presenter> g_presenter;
 
+void RestForDesktop() {
+    static const unsigned long percent = [] {
+        const char* value = AbxSetting("d3d12_x.gpu_rest_percent");
+        const unsigned long asked = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        if (asked < 1 || asked > 400) return 0ul;
+        AbxLog("d3d12_x", "after each present the title's thread sleeps %lu %% of the time the frame took, 500 ms at most, with nothing queued for the GPU, so the desktop and other "
+                          "programs get it (d3d12_x.gpu_rest_percent)",
+               asked);
+        return asked;
+    }();
+    if (percent == 0) return;
+    static std::chrono::steady_clock::time_point resumed{};
+    const auto now = std::chrono::steady_clock::now();
+    if (resumed != std::chrono::steady_clock::time_point{}) {
+        const auto rest = (std::min)(std::chrono::duration_cast<std::chrono::milliseconds>(now - resumed) * percent / 100, std::chrono::milliseconds(500));
+        if (rest.count() > 0) {
+            const abx::d3d12x::TimedScope timed(abx::d3d12x::TimedPart::DesktopRest);
+            Sleep(static_cast<DWORD>(rest.count()));
+        }
+    }
+    resumed = std::chrono::steady_clock::now();
+}
+
 HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std::uint8_t* planes, const void* parameters) {
+    abx::d3d12x::HangReport::NotePresent();
+    const abx::d3d12x::TimedScope timed(abx::d3d12x::TimedPart::Present);
     constexpr std::size_t kPlaneResources = 0x10;
     static_cast<void>(parameters);
     if (planeCount == 0 || planes == nullptr) AbxUnsupported("D3D12 command queue slot 32", "a present without planes");
+    PollFrameTraceRequest();
+    static std::atomic<UINT> dumpedPlanes{1};
+    UINT seenPlanes = dumpedPlanes.load();
+    if (planeCount > seenPlanes && dumpedPlanes.compare_exchange_strong(seenPlanes, planeCount)) {
+        std::string dump;
+        char text[40];
+        for (std::size_t at = 0; at < 0x100; at += 8) {
+            std::uint64_t word = 0;
+            std::memcpy(&word, planes + at, sizeof(word));
+            std::snprintf(text, sizeof(text), " +0x%zx=%016llx", at, static_cast<unsigned long long>(word));
+            dump += text;
+        }
+        AbxLog("d3d12_x", "DIAG present with %u planes: first 0x100 bytes of the plane array at %p:%s", planeCount, static_cast<const void*>(planes), dump.c_str());
+        constexpr std::size_t kPlaneStride = 0x48;
+        for (UINT plane = 0; plane < planeCount && plane < 4; ++plane) {
+            const std::uint8_t* at = planes + plane * kPlaneStride;
+            std::uint64_t count = 0;
+            void* const* list = nullptr;
+            const std::uint8_t* first = nullptr;
+            const std::uint8_t* second = nullptr;
+            std::memcpy(&count, at + 0x8, sizeof(count));
+            std::memcpy(&list, at + 0x10, sizeof(list));
+            std::memcpy(&first, at + 0x18, sizeof(first));
+            std::memcpy(&second, at + 0x20, sizeof(second));
+            std::string words;
+            for (const std::uint8_t* pointed : {first, second}) {
+                words += " |";
+                for (std::size_t offset = 0; pointed != nullptr && offset < 0x20; offset += 4) {
+                    std::uint32_t word = 0;
+                    std::memcpy(&word, pointed + offset, sizeof(word));
+                    std::snprintf(text, sizeof(text), " %08x", word);
+                    words += text;
+                }
+            }
+            const Resource* texture = list != nullptr && count >= 1 && list[0] != nullptr ? dynamic_cast<Resource*>(FacadeInner(list[0])) : nullptr;
+            if (texture == nullptr || texture->IsBuffer()) {
+                AbxLog("d3d12_x", "DIAG present plane %u: %llu resource(s), first is not a texture AnyBox handed out; words at +0x18 and +0x20:%s", plane,
+                       static_cast<unsigned long long>(count), words.c_str());
+                continue;
+            }
+            const D3D12_RESOURCE_DESC& desc = texture->Texture().desc;
+            AbxLog("d3d12_x", "DIAG present plane %u: %llu resource(s), first %llux%u format %d; words at +0x18 and +0x20:%s", plane, static_cast<unsigned long long>(count),
+                   static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<int>(desc.Format), words.c_str());
+        }
+    }
+    static const int chosenPlane = [] {
+        const char* value = AbxSetting("d3d12_x.present_plane");
+        return value != nullptr && value[0] >= '0' && value[0] <= '3' && value[1] == 0 ? value[0] - '0' : -1;
+    }();
+    static const bool premultipliedOverlay = [] {
+        const char* value = AbxSetting("d3d12_x.present_overlay_premultiplied");
+        return value != nullptr && value[0] == '1';
+    }();
+    constexpr std::size_t kPresentPlaneStride = 0x48;
+    const auto planeTexture = [&](UINT plane) -> Resource* {
+        void* const* list = nullptr;
+        std::memcpy(&list, planes + plane * kPresentPlaneStride + kPlaneResources, sizeof(list));
+        Resource* texture = list != nullptr ? dynamic_cast<Resource*>(FacadeInner(list[0])) : nullptr;
+        return texture != nullptr && !texture->IsBuffer() ? texture : nullptr;
+    };
+    Resource* overlay = nullptr;
+    if (chosenPlane > 0 && static_cast<UINT>(chosenPlane) < planeCount) planes += static_cast<UINT>(chosenPlane) * kPresentPlaneStride;
+    else if (chosenPlane < 0 && planeCount >= 2) overlay = planeTexture(1);
     void* const* resources = nullptr;
     std::memcpy(&resources, planes + kPlaneResources, sizeof(resources));
     Resource* image = resources != nullptr ? static_cast<Resource*>(FacadeInner(resources[0])) : nullptr;
@@ -426,9 +525,10 @@ HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std:
         DescriptorHeap::ReportForeignDescriptors();
         if (TitleTextures* textures = TitleTextures::Active()) textures->Report();
     }
-    ++Stats().presents;
+    abx::d3d12x::GpuProfile::FramePresented(++Stats().presents);
     StartLiveStats();
     if (TitleTextures* textures = TitleTextures::Active()) textures->Refresh();
+    if (TextureReadback* readback = TextureReadback::Active()) readback->Deliver(true);
     const std::lock_guard guard(g_presentLock);
     std::string error;
     static std::chrono::steady_clock::time_point failingSince{};
@@ -460,10 +560,23 @@ HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std:
             Sleep(16);
             return S_OK;
         }
-        if (failingSince == std::chrono::steady_clock::time_point{}) AbxLog("d3d12_x", "presenting to the title's window (%u plane(s); only the first is shown)", planeCount);
+        if (failingSince == std::chrono::steady_clock::time_point{}) AbxLog("d3d12_x", "presenting to the title's window (%u plane(s); two planes are composited unless d3d12_x.present_plane names one)", planeCount);
     }
     const D3D12_RESOURCE_DESC& desc = image->Texture().desc;
-    if (!g_presenter->Present(image->Texture().image, {static_cast<std::uint32_t>(desc.Width), desc.Height}, VK_IMAGE_LAYOUT_GENERAL, error)) {
+    if (overlay != nullptr) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "a present with two planes is composited: plane 0 (%llux%u) scaled to the window, plane 1 (%llux%u) blended over it with its alpha (%s; "
+                              "d3d12_x.present_overlay_premultiplied, d3d12_x.present_plane picks one plane instead)",
+                   static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<unsigned long long>(overlay->Texture().desc.Width), overlay->Texture().desc.Height,
+                   premultipliedOverlay ? "premultiplied" : "straight");
+        }
+    }
+    const bool shown = overlay != nullptr
+                           ? g_presenter->PresentComposited({image->Texture().image, image->Texture().layout.info.format},
+                                                            {overlay->Texture().image, overlay->Texture().layout.info.format}, VK_IMAGE_LAYOUT_GENERAL, premultipliedOverlay, error)
+                           : g_presenter->Present(image->Texture().image, {static_cast<std::uint32_t>(desc.Width), desc.Height}, VK_IMAGE_LAYOUT_GENERAL, error);
+    if (!shown) {
         failed("presenting failed");
         Sleep(16);
         return S_OK;
@@ -473,7 +586,19 @@ HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std:
         failingSince = {};
         dropped = 0;
     }
+    RestForDesktop();
     return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE PipelineQueryObject(Facade*, void* first, void* second, void** object) {
+    if (object != nullptr) *object = nullptr;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "pipeline state slot 11 (first: %p, %p, an object output) answers E_NOTIMPL: its meaning is not measured; the bundled module that calls it "
+                          "treats a failure as a size of 0",
+               first, second);
+    }
+    return E_NOTIMPL;
 }
 
 HRESULT STDMETHODCALLTYPE QueueGetTimestampFrequency(Facade* self, UINT64* frequency) {
@@ -489,6 +614,7 @@ HRESULT STDMETHODCALLTYPE AllocatorSetMemoryCallback(Facade*, void* callback, vo
 }
 
 HRESULT STDMETHODCALLTYPE ListReset(Facade* self, void* allocator, void* initial, std::uint64_t extra) {
+    CheckFacadeGuard(self, "ID3D12GraphicsCommandList::Reset");
     if (extra != 0) {
         AbxUnsupported("D3D12 command list slot 139", "a nonzero third argument, which is not measured");
     }
@@ -867,9 +993,17 @@ void* STDMETHODCALLTYPE ListAllocateTransient(Facade* self, UINT bytes, UINT ali
 
 void STDMETHODCALLTYPE ListDispatchX(Facade* self, UINT x, UINT y, UINT z, UINT flags) {
     static std::atomic<bool> reported{false};
-    ReportSlotOnce(reported, "command list slot 80 is DispatchX(x, y, z, flags): a Dispatch, the flags recorded");
-    static_cast<void>(flags);
-    InnerOf<CommandList>(self)->Dispatch(x, y, z);
+    ReportSlotOnce(reported, "command list slot 80 is DispatchX(x, y, z, flags): flag 0x20 makes the counts threads, not thread groups");
+    static std::mutex seenLock;
+    static std::vector<UINT> seenFlags;
+    {
+        std::lock_guard<std::mutex> guard(seenLock);
+        if (std::find(seenFlags.begin(), seenFlags.end(), flags) == seenFlags.end() && seenFlags.size() < 32) {
+            seenFlags.push_back(flags);
+            AbxLog("d3d12_x", "DIAG DispatchX flags 0x%x seen first with counts %u x %u x %u", flags, x, y, z);
+        }
+    }
+    InnerOf<CommandList>(self)->DispatchThreads(x, y, z, flags);
 }
 
 void STDMETHODCALLTYPE ListWrite32Top(Facade*, std::uint32_t* address, std::uint32_t value, std::uint32_t flags) {
@@ -968,8 +1102,22 @@ void STDMETHODCALLTYPE ListSetCoverageMask(Facade*, std::uint64_t mask) {
     }
 }
 
-void STDMETHODCALLTYPE ListSetDepthBounds(Facade*, FLOAT minimum, FLOAT maximum) {
+void STDMETHODCALLTYPE ListSetDepthBounds(Facade* self, FLOAT minimum, FLOAT maximum) {
     AbxTrace("console command list slot 70: depth bounds %g..%g; no pipeline AnyBox builds enables the depth bounds test", static_cast<double>(minimum), static_cast<double>(maximum));
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE     depth bounds %g..%g asked for and not applied | list %04x", static_cast<double>(minimum), static_cast<double>(maximum),
+               static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(InnerOf<CommandList>(self)) >> 4) & 0xFFFFu));
+    }
+}
+
+void STDMETHODCALLTYPE ListClearUnorderedAccessViewUint(Facade* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu, void* resource, const UINT values[4],
+                                                        UINT rectCount, const D3D12_RECT* rects) {
+    InnerOf<CommandList>(self)->ClearUnorderedAccessViewUint(gpu, cpu, dynamic_cast<ID3D12Resource*>(FacadeInner(resource)), values, rectCount, rects);
+}
+
+void STDMETHODCALLTYPE ListClearUnorderedAccessViewFloat(Facade* self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu, void* resource, const FLOAT values[4],
+                                                         UINT rectCount, const D3D12_RECT* rects) {
+    InnerOf<CommandList>(self)->ClearUnorderedAccessViewFloat(gpu, cpu, dynamic_cast<ID3D12Resource*>(FacadeInner(resource)), values, rectCount, rects);
 }
 
 void STDMETHODCALLTYPE ListClearRenderTargetView(Facade* self, D3D12_CPU_DESCRIPTOR_HANDLE target, const FLOAT color[4], UINT rectCount, const D3D12_RECT* rects) {
@@ -1084,6 +1232,7 @@ const FacadeType& TypeOf(Kind kind) {
     }();
     static const FacadeType list = [] {
         FacadeType type = MakeFacadeType("command list", {kCommandListInterface, __uuidof(ID3D12GraphicsCommandList)});
+        type.titleBytes = 0x4000;
         Map(type, 9, &ListClose);
         Map(type, 12, &ListForward<&CommandList::DrawInstanced, UINT, UINT, UINT, UINT>);
         Map(type, 13, &ListForward<&CommandList::DrawIndexedInstanced, UINT, UINT, UINT, INT, UINT>);
@@ -1120,6 +1269,8 @@ const FacadeType& TypeOf(Kind kind) {
         Map(type, 50, &ListForward<&CommandList::OMSetRenderTargets, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*>);
         Map(type, 51, &ListForward<&CommandList::ClearDepthStencilView, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*>);
         Map(type, 52, &ListClearRenderTargetView);
+        Map(type, 53, &ListClearUnorderedAccessViewUint);
+        Map(type, 54, &ListClearUnorderedAccessViewFloat);
         Map(type, 62, &ListCopyMemoryToMemory);
         Map(type, 70, &ListSetDepthBounds);
         Map(type, 71, &ListWriteValue);
@@ -1177,7 +1328,11 @@ const FacadeType& TypeOf(Kind kind) {
         return type;
     }();
     static const FacadeType signature = MakeFacadeType("root signature", {__uuidof(ID3D12RootSignature)});
-    static const FacadeType pipeline = MakeFacadeType("pipeline state", {__uuidof(ID3D12PipelineState)});
+    static const FacadeType pipeline = [] {
+        FacadeType type = MakeFacadeType("pipeline state", {__uuidof(ID3D12PipelineState)});
+        Map(type, 11, &PipelineQueryObject);
+        return type;
+    }();
     static const FacadeType queries = MakeFacadeType("query heap", {__uuidof(ID3D12QueryHeap)});
     static const FacadeType indirect = MakeFacadeType("command signature", {__uuidof(ID3D12CommandSignature)});
     static const FacadeType range = MakeFacadeType("registered title memory", {__uuidof(ID3D12Pageable)});

@@ -5,6 +5,7 @@
 #include "Resource.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -31,6 +32,8 @@ public:
     void Refresh();
     void Flush();
     void Report();
+    std::string Describe(Resource* texture);
+    void FillFloats(std::uint32_t width, std::uint32_t height, float value, bool on);
 
 private:
     enum class Filled { Yes, NotMapped, Failed };
@@ -51,7 +54,51 @@ private:
         bool whole = false;
         bool direct = true;
         std::uint64_t lastUsed = 0;
+        bool settling = false;
+        std::uint64_t candidate = 0;
+        std::uint32_t changedChecks = 0;
+        std::uint64_t uploads = 0;
+        std::uint64_t lastUpload = 0;
+        std::uint64_t fillGeneration = 0;
     };
+    struct FloatFill {
+        bool on = false;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        float value = 0.0f;
+        std::uint64_t generation = 0;
+    };
+    FloatFill floatFill_;
+    bool FloatFilled(const Resource& texture) const;
+    Resource* SameMemoryLocked(std::uint64_t address, const D3D12_RESOURCE_DESC& applied);
+    std::set<std::pair<std::pair<int, int>, bool>> sameMemoryPairs_;
+    std::uint64_t sameMemoryShared_ = 0;
+    std::uint64_t sameMemoryApart_ = 0;
+    static constexpr std::uint32_t kLiveAfterChecks = 16;
+    std::set<Resource*> live_;
+    bool liveCheck_ = false;
+    std::uint64_t liveUploads_ = 0;
+    std::chrono::steady_clock::time_point liveNext_{};
+    std::uint64_t liveGroupUs_ = 0;
+    std::uint64_t liveGroups_ = 0;
+    std::uint64_t liveGroupBytes_ = 0;
+    struct UploadParts {
+        std::uint64_t readUs = 0;
+        std::uint64_t readBytes = 0;
+        std::uint64_t detileUs = 0;
+        std::uint64_t stagingUs = 0;
+        std::uint64_t stagingWaits = 0;
+        std::uint64_t ownStaging = 0;
+    };
+    UploadParts uploadParts_;
+    UploadParts liveParts_;
+    std::uint64_t livePartGroups_ = 0;
+    std::uint64_t livePartUs_ = 0;
+    std::uint64_t livePartBytes_ = 0;
+    std::uint64_t livePartTextures_ = 0;
+    std::vector<std::uint8_t> scratch_;
+    void RefreshLiveLocked();
+    std::uint64_t settleWaits_ = 0;
     std::uint64_t frame_ = 0;
     Resource* resumeAfter_ = nullptr;
     std::map<Resource*, std::pair<std::uint64_t, std::vector<std::uint8_t>>> keys_;
@@ -78,8 +125,22 @@ private:
     bool Visit(Resource* texture, struct Tracked& tracked, bool& uploaded);
     std::uint64_t refreshMicroseconds_ = 0;
     std::multimap<std::uint64_t, Resource*> recheckDue_;
-    std::map<Resource*, std::uint32_t> recheckStep_;
-    void ScheduleRecheck(Resource* texture, bool restart);
+    struct RecheckState {
+        std::uint32_t step = 0;
+        bool queued = false;
+    };
+    std::map<Resource*, RecheckState> recheckStep_;
+    bool refreshing_ = false;
+    bool deferred_ = false;
+    std::uint64_t frameUploadBytes_ = 0;
+    std::uint64_t deferredUploads_ = 0;
+    std::uint64_t visitCount_ = 0;
+    std::uint64_t visitNotMapped_ = 0;
+    std::uint64_t visitAccessUs_ = 0;
+    std::uint64_t visitHashUs_ = 0;
+    std::uint64_t visitHashIndirectUs_ = 0;
+    std::uint64_t visitUploadUs_ = 0;
+    void ScheduleRecheck(Resource* texture, bool restart, bool nextFrame = false);
     void RunRechecks();
     std::map<Resource*, Tracked> tracked_;
     std::map<Resource*, std::shared_ptr<const gfx10::ConsoleTexture>> layouts_;

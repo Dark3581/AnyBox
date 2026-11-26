@@ -1,4 +1,6 @@
 #include "VulkanDevice.hpp"
+
+#include "FrameTiming.hpp"
 #include "TitleLayout.hpp"
 
 #include <algorithm>
@@ -23,6 +25,8 @@ struct FeatureChain {
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceFaultFeaturesEXT fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT memoryPriority{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
 
     FeatureChain() = default;
     FeatureChain(const FeatureChain&) = delete;
@@ -43,6 +47,8 @@ struct FeatureChain {
         if (extensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) != 0) chain(maintenance5);
         if (extensions.count(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) != 0) chain(dynamic3);
         if (extensions.count(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) != 0) chain(fault);
+        if (extensions.count(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) != 0) chain(memoryPriority);
+        if (extensions.count(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME) != 0) chain(pageable);
         *next = nullptr;
     }
 };
@@ -499,6 +505,15 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         useExtensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
         deviceFault_ = true;
     }
+    if (requirements.pageableMemory && bestExtensions.count(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) != 0 &&
+        bestExtensions.count(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME) != 0 && supported.memoryPriority.memoryPriority == VK_TRUE &&
+        supported.pageable.pageableDeviceLocalMemory == VK_TRUE) {
+        enabled.memoryPriority.memoryPriority = VK_TRUE;
+        enabled.pageable.pageableDeviceLocalMemory = VK_TRUE;
+        useExtensions.insert(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        useExtensions.insert(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+        pageableMemory_ = true;
+    }
     if (bestExtensions.count(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) != 0) {
         useExtensions.insert(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
         enabled_.emplace_back("conservativeRasterization");
@@ -818,9 +833,36 @@ VkResult VulkanDevice::Finish(PendingSubmit& pending, bool wait) const {
     return state;
 }
 
+std::uint64_t VulkanDevice::SubmitDetached(const std::function<void(VkCommandBuffer)>& record, std::string& error) const {
+    constexpr std::size_t kMostPending = 256;
+    const std::lock_guard guard(detachedLock_);
+    std::optional<PendingSubmit> pending = SubmitWithoutWaiting(record, error);
+    if (!pending) return 0;
+    detached_.push_back(*pending);
+    const std::uint64_t serial = ++detachedSubmitted_;
+    while (!detached_.empty()) {
+        if (Finish(detached_.front(), detached_.size() > kMostPending) == VK_NOT_READY) break;
+        detached_.pop_front();
+        detachedFinished_.fetch_add(1, std::memory_order_release);
+    }
+    return serial;
+}
+
+void VulkanDevice::WaitDetached(std::uint64_t serial) const {
+    if (serial == 0 || detachedFinished_.load(std::memory_order_acquire) >= serial) return;
+    const TimedScope timed(TimedPart::SyncSubmit);
+    const std::lock_guard guard(detachedLock_);
+    while (!detached_.empty() && detachedFinished_.load(std::memory_order_acquire) < serial) {
+        Finish(detached_.front(), true);
+        detached_.pop_front();
+        detachedFinished_.fetch_add(1, std::memory_order_release);
+    }
+}
+
 bool VulkanDevice::Submit(const std::function<void(VkCommandBuffer)>& record, std::string& error) const {
     std::optional<PendingSubmit> pending = SubmitWithoutWaiting(record, error);
     if (!pending) return false;
+    const TimedScope timed(TimedPart::SyncSubmit);
     const VkResult waited = Finish(*pending, true);
     if (waited != VK_SUCCESS) {
         error = "vkWaitForFences failed with " + std::to_string(static_cast<int>(waited));
@@ -871,7 +913,10 @@ std::string VulkanDevice::FaultReport() const {
                       static_cast<std::size_t>(address.addressType) < std::size(kTypes) ? kTypes[address.addressType] : "unknown",
                       static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
         report += text;
-        if (faultDescriber_) report += " [" + faultDescriber_(address.reportedAddress) + "]";
+        const bool instructionPointer = address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT ||
+                                        address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT ||
+                                        address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT;
+        if (faultDescriber_ && !instructionPointer) report += " [" + faultDescriber_(address.reportedAddress) + "]";
     }
     for (const VkDeviceFaultVendorInfoEXT& vendor : vendors) {
         char text[320];
@@ -879,6 +924,7 @@ std::string VulkanDevice::FaultReport() const {
                       static_cast<unsigned long long>(vendor.vendorFaultData));
         report += text;
     }
+    if (faultExtra_) report += faultExtra_();
     return report + CheckpointReport();
 }
 

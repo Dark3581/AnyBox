@@ -415,6 +415,54 @@ const void* const kLaunchTable[] = {
 
 ApiObject g_launch{kLaunchTable, &kLaunchProvider, "launch and display timeout"};
 
+constexpr GUID kAnalyticsProvider{0xb884675d, 0xb738, 0x4a9c, {0x81, 0x5d, 0x9a, 0x9a, 0x1e, 0x0c, 0x6c, 0x9b}};
+
+struct AnalyticsVersion {
+    std::uint16_t major;
+    std::uint16_t minor;
+    std::uint16_t build;
+    std::uint16_t revision;
+};
+
+struct AnalyticsInfo {
+    AnalyticsVersion osVersion;
+    AnalyticsVersion hostingOsVersion;
+    char family[64];
+    char form[64];
+};
+static_assert(sizeof(AnalyticsInfo) == 0x90);
+
+AnalyticsInfo* SystemGetAnalyticsInfo(ApiObject*, AnalyticsInfo* info) {
+    if (info == nullptr) return nullptr;
+    std::memset(info, 0, sizeof(*info));
+    info->osVersion = {10, 0, 25398, 0};
+    info->hostingOsVersion = info->osVersion;
+    const char* form = AbxSetting("runtime.analytics_form");
+    if (form == nullptr || form[0] == 0) {
+        const char* model = AbxSetting("runtime.console_model");
+        form = model != nullptr && std::strcmp(model, "series_s") == 0 ? "Xbox Series S" : "Xbox Series X";
+    }
+    std::snprintf(info->family, sizeof(info->family), "%s", "Windows.Xbox");
+    std::snprintf(info->form, sizeof(info->form), "%s", form);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("xgameruntime", "XSystemGetAnalyticsInfo (slot 3 of its own provider, as xcl maps it; the 0x90-byte result is written to the caller's buffer and its address returned, "
+                               "as the title's call site shows): OS version 10.0.25398.0 and family \"Windows.Xbox\" as xcl answers, form \"%s\" "
+                               "(runtime.analytics_form, else from runtime.console_model)",
+               info->form);
+    }
+    return info;
+}
+
+const void* const kAnalyticsTable[] = {
+    Entry(&ObjectQueryInterface),
+    Entry(&ObjectAddRef),
+    Entry(&ObjectRelease),
+    Entry(&SystemGetAnalyticsInfo),
+};
+
+ApiObject g_analytics{kAnalyticsTable, &kAnalyticsProvider, "system analytics info"};
+
 constexpr GUID kGameEventProvider{0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
 
 HRESULT GameEventWrite(ApiObject*, void* user, const char* serviceConfigurationId, const char* playSessionId, const char* name, const char* dimensions, const char* measurements) {
@@ -651,6 +699,7 @@ const ApiInterface kInterfaces[] = {
     {kFeatureProvider, kFeatureProvider, g_feature},
     {kGameEventProvider, kGameEventProvider, g_gameEvent},
     {kLaunchProvider, kLaunchProvider, g_launch},
+    {kAnalyticsProvider, kAnalyticsProvider, g_analytics},
     {kErrorProvider, kErrorProvider, g_error},
     {kOptionalFeatureProvider, kOptionalFeatureInterface, g_optionalFeature},
     {kGameProvider, kGameInterface, g_game},

@@ -3,11 +3,13 @@
 #include "AbxApi.hpp"
 #include "BindlessSet.hpp"
 #include "BufferDescriptor.hpp"
+#include "GraphicsState.hpp"
 #include "ImageDescriptor.hpp"
 #include "ViewDesc.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -160,6 +162,20 @@ void DescriptorWriter::WriteImageView(Resource* resource, const std::optional<Im
     record.resource = resource;
     record.view = resource->View(view->info, error);
     Check(record.view != VK_NULL_HANDLE, function, error);
+    if (unorderedAccess && (context_.device.OptimalFeatures(view->info.format) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0) {
+        static std::mutex formatLock;
+        static std::map<int, std::uint64_t> formats;
+        const std::lock_guard formatGuard(formatLock);
+        const std::uint64_t count = ++formats[static_cast<int>(view->info.format)];
+        if (count == 1 || (count & (count - 1)) == 0) {
+            const D3D12_RESOURCE_DESC& desc = resource->Texture().desc;
+            AbxLog("d3d12_x",
+                   "%s: an unordered access view in Vulkan format %d, which this device does not offer as a storage image (texture %llux%u, format %d, at title 0x%llx): what shaders "
+                   "write through it is not defined on this device, and a texture written only this way may stay empty (%llu so far in that format)",
+                   function, static_cast<int>(view->info.format), static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<int>(desc.Format),
+                   static_cast<unsigned long long>(resource->TextureAddress()), static_cast<unsigned long long>(count));
+        }
+    }
     if (encode) {
         const ImageDescriptorWords words = BindImage(resource, view->info, record.view, unorderedAccess, function);
         WriteWords(target, words.data(), sizeof(words));
@@ -395,6 +411,7 @@ void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D1
         if (desc == nullptr) {
             AbxUnsupported(function, "a buffer unordered access view without a description");
         }
+        if (ours->TitleAddress() != 0 && context_.addresses != nullptr) context_.addresses->MarkGpuWritten(ours->TitleAddress(), ours->Width());
         const std::optional<BufferDescriptorWords> words = UnorderedAccessBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Width(), *desc, counter != nullptr, error);
         Check(words.has_value(), function, error);
         WriteWords(target, words->data(), kBufferDescriptorBytes);
@@ -410,6 +427,49 @@ void DescriptorWriter::CreateUnorderedAccessView(ID3D12Resource* resource, ID3D1
     }
     const TextureImage& layout = ours->Texture().layout;
     if (layout.depthUnorderedAccess && (layout.info.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
+        const unsigned long shadowedFormats = Resource::DepthUnorderedAccess();
+        const DXGI_FORMAT stored = ours->Texture().desc.Format;
+        const bool narrow = stored == DXGI_FORMAT_R16_TYPELESS || stored == DXGI_FORMAT_D16_UNORM || stored == kConsoleD16UnormS8Uint || stored == kConsoleR16UnormX8Typeless ||
+                            stored == kConsoleX16TypelessG8Uint;
+        const bool shadowed = (shadowedFormats & (narrow ? 1ul : 2ul)) != 0;
+        const DXGI_FORMAT asked = desc != nullptr ? desc->Format : ours->Texture().desc.Format;
+        const bool stencilPlane = asked == DXGI_FORMAT_X24_TYPELESS_G8_UINT || asked == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT || asked == kConsoleX16TypelessG8Uint ||
+                                  asked == DXGI_FORMAT_R8_UINT || (desc != nullptr && desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D && desc->Texture2D.PlaneSlice != 0);
+        const bool wholePlane = desc == nullptr || (desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D && desc->Texture2D.MipSlice == 0);
+        std::string refused = !shadowed ? std::string("d3d12_x.depth_unordered_access does not turn it on for this depth format (bit 1 = 16-bit depth, bit 2 = other depth; unset = 0)")
+                              : stencilPlane ? std::string("it names the stencil plane")
+                              : !wholePlane ? std::string("it is not a 2D view of mip 0")
+                              : context_.bindless == nullptr ? std::string("there is no bindless set") : std::string();
+        Resource::DepthShadow* const shadow = refused.empty() ? ours->EnsureDepthShadow(refused) : nullptr;
+        static std::atomic<int> views{0};
+        if (views.fetch_add(1) < 12) {
+            const D3D12_RESOURCE_DESC& texture = ours->Texture().desc;
+            AbxLog("d3d12_x",
+                   "%s: an unordered access view of a depth texture (%llux%u, format %d, at title 0x%llx; view format %d, dimension %d, plane %u) %s%s",
+                   function, static_cast<unsigned long long>(texture.Width), texture.Height, static_cast<int>(texture.Format),
+                   static_cast<unsigned long long>(ours->TextureAddress()), static_cast<int>(asked), desc != nullptr ? static_cast<int>(desc->ViewDimension) : -1,
+                   desc != nullptr && desc->ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D ? desc->Texture2D.PlaneSlice : 0u,
+                   shadow == nullptr ? "stays a null view: "
+                   : (shadowedFormats & 4ul) != 0
+                       ? "is given a 32-bit float color image of its own, cleared to 0, and the depth plane is left as it is: bit 4 of d3d12_x.depth_unordered_access asks for the "
+                         "views alone, to tell what the views cost from what the written depth plane changes"
+                       : "is given a 32-bit float color image of its own, cleared to 0, which one full-screen draw writes into the depth plane (values brought into 0 to 1, not "
+                         "rounded to the depth format's bits) when the texture leaves the unordered access state; the depth plane is copied to the image when the texture "
+                         "enters that state after a draw, clear or copy wrote the plane (d3d12_x.depth_unordered_access: bit 1 = 16-bit depth, bit 2 = other depth, bit 4 = "
+                         "views alone)",
+                   shadow != nullptr ? "" : refused.c_str());
+        }
+        if (shadow != nullptr) {
+            const ImageDescriptorWords words = BindImage(ours, shadow->info, shadow->view, true, function);
+            WriteWords(target, words.data(), sizeof(words));
+            DescriptorRecord record;
+            record.kind = HeapEntry::Image;
+            record.unorderedAccess = true;
+            record.resource = ours;
+            record.view = shadow->view;
+            target.heap->Record(target.index) = record;
+            return;
+        }
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true)) {
             AbxLog("d3d12_x",
@@ -600,7 +660,20 @@ void DescriptorWriter::CopyDescriptors(UINT destinationRanges, const D3D12_CPU_D
     }
 }
 
-std::string DescriptorWriter::DescribeImageWords(const std::uint32_t* words) {
+bool DescriptorWriter::WhileBound(const Resource* resource, const std::function<void()>& work) {
+    DescriptorWriter* writer = g_writer.load();
+    if (writer == nullptr || resource == nullptr) return false;
+    const std::lock_guard guard(writer->imageLock_);
+    for (const auto& [view, bound] : writer->images_) {
+        if (bound.resource != resource) continue;
+        work();
+        return true;
+    }
+    return false;
+}
+
+std::string DescriptorWriter::DescribeImageWords(const std::uint32_t* words, Resource** resource, int* format) {
+    if (resource != nullptr) *resource = nullptr;
     DescriptorWriter* writer = g_writer.load();
     if (writer == nullptr) return "no writer";
     const std::lock_guard guard(writer->imageLock_);
@@ -608,9 +681,12 @@ std::string DescriptorWriter::DescribeImageWords(const std::uint32_t* words) {
         if (std::memcmp(bound.words.data(), words, sizeof(std::uint32_t) * 8) != 0) continue;
         if (bound.resource == nullptr) return "a known view";
         const D3D12_RESOURCE_DESC& desc = bound.resource->Texture().desc;
-        char text[160];
-        std::snprintf(text, sizeof(text), "texture %p %llux%u f%d at title 0x%llx", static_cast<void*>(bound.resource->Texture().image), static_cast<unsigned long long>(desc.Width),
-                      desc.Height, static_cast<int>(desc.Format), static_cast<unsigned long long>(bound.resource->TitleAddress()));
+        if (resource != nullptr) *resource = bound.resource;
+        if (format != nullptr) *format = static_cast<int>(desc.Format);
+        char text[200];
+        std::snprintf(text, sizeof(text), "texture %p %llux%u f%d at title 0x%llx, view format code %u", static_cast<void*>(bound.resource->Texture().image),
+                      static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<int>(desc.Format), static_cast<unsigned long long>(bound.resource->TextureAddress()),
+                      (bound.words[1] >> 20) & 0x1FFu);
         return text;
     }
     char text[200];

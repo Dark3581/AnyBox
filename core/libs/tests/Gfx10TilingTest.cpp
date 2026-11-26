@@ -1,5 +1,6 @@
 #include "Gfx10Tiling.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -287,6 +288,77 @@ void ConsoleDescriptions() {
     Expect(ordered, "a linear texture detiles to its rows: " + error);
 }
 
+void DetileMatchesElementOffsets() {
+    struct Case {
+        DXGI_FORMAT format;
+        UINT64 width;
+        UINT height;
+        UINT16 array;
+        UINT16 mips;
+        UINT layout;
+    };
+    const Case cases[] = {
+        {DXGI_FORMAT_R8G8B8A8_UNORM, 300, 200, 1, 9, 0x100}, {DXGI_FORMAT_R8G8B8A8_UNORM, 512, 512, 2, 10, 0}, {DXGI_FORMAT_BC7_UNORM, 1024, 512, 1, 11, 0},
+        {DXGI_FORMAT_R8_UNORM, 640, 360, 1, 1, 0},           {DXGI_FORMAT_BC1_UNORM, 256, 256, 3, 9, 0x105},   {DXGI_FORMAT_R16G16B16A16_FLOAT, 320, 180, 1, 1, 0},
+    };
+    for (const Case& item : cases) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = item.width;
+        desc.Height = item.height;
+        desc.DepthOrArraySize = item.array;
+        desc.MipLevels = item.mips;
+        desc.Format = item.format;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(item.layout);
+        std::string error;
+        const std::optional<ConsoleTexture> texture = DescribeConsoleTexture(desc, kSeriesXPipes, error);
+        const std::string name = "format " + std::to_string(static_cast<int>(item.format)) + " " + std::to_string(item.width) + "x" + std::to_string(item.height) + " layout " +
+                                 std::to_string(item.layout);
+        Expect(texture.has_value(), name + " is described: " + error);
+        if (!texture) continue;
+        const std::size_t bytes = static_cast<std::size_t>((std::min)(texture->texelBytes, texture->size - texture->texelOffset));
+        std::vector<std::uint8_t> tiled(bytes);
+        std::uint32_t seed = 0x1234567u + static_cast<std::uint32_t>(item.width);
+        for (std::uint8_t& byte : tiled) {
+            seed = seed * 1664525u + 1013904223u;
+            byte = static_cast<std::uint8_t>(seed >> 24);
+        }
+        const std::size_t element = std::size_t{1} << texture->chain.layout->elementLog2;
+        bool same = true;
+        bool windowed = true;
+        std::size_t unionFirst = bytes;
+        std::size_t unionEnd = 0;
+        for (std::uint32_t slice = 0; slice < texture->array && same && windowed; ++slice) {
+            for (std::uint32_t mip = 0; mip < texture->chain.levels.size() && same && windowed; ++mip) {
+                const MipLevel& level = texture->chain.levels[mip];
+                const std::size_t rowBytes = level.width * element;
+                std::vector<std::uint8_t> expected(rowBytes * level.height, 0);
+                for (std::size_t y = 0; y < level.height; ++y) {
+                    for (std::size_t x = 0; x < level.width; ++x) {
+                        const std::size_t at = static_cast<std::size_t>(slice) * texture->chain.sliceBytes + texture->chain.ElementAt(level, x, y, slice);
+                        if (at + element <= bytes) std::memcpy(expected.data() + y * rowBytes + x * element, tiled.data() + at, element);
+                    }
+                }
+                std::vector<std::uint8_t> whole(expected.size(), 0xEE);
+                same = DetileSubresource(*texture, tiled.data(), bytes, mip, slice, whole.data(), rowBytes, level.height, rowBytes, error) && whole == expected;
+                const std::optional<std::pair<std::size_t, std::size_t>> range = SubresourceBytes(*texture, mip, slice);
+                windowed = range.has_value();
+                if (!range) break;
+                const std::size_t first = (std::min)(range->first, bytes);
+                const std::size_t end = (std::min)(range->second, bytes);
+                unionFirst = (std::min)(unionFirst, first);
+                unionEnd = (std::max)(unionEnd, end);
+                std::vector<std::uint8_t> part(expected.size(), 0xEE);
+                windowed = DetileSubresource(*texture, tiled.data() + first, end - first, mip, slice, part.data(), rowBytes, level.height, rowBytes, error, first) && part == expected;
+            }
+        }
+        Expect(same, name + " detiles every mip as the element offsets say: " + error);
+        Expect(windowed, name + " detiles every mip from only the bytes SubresourceBytes names: " + error);
+        Expect(unionFirst < unionEnd && unionEnd <= bytes, name + " byte ranges lie inside the texel bytes");
+    }
+}
+
 }
 
 int main() {
@@ -301,6 +373,7 @@ int main() {
     LinearAndRowMajor();
     RetailSwizzleBits();
     ConsoleDescriptions();
+    DetileMatchesElementOffsets();
     if (g_failures != 0) {
         std::printf("%d failures\n", g_failures);
         return 1;

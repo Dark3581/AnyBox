@@ -2,8 +2,11 @@
 
 #include "AbxApi.hpp"
 
+#include "FrameTiming.hpp"
 #include "LiveStats.hpp"
+#include "PipelineCompiler.hpp"
 #include "PipelineState.hpp"
+#include "ThreadLimit.hpp"
 
 #include <windows.h>
 
@@ -87,6 +90,95 @@ std::string PipelineKey(const std::vector<std::string>& shaders) {
     return key;
 }
 
+std::wstring UsedPipelineFile() {
+    const std::wstring bad = BadPipelineFile();
+    return bad.substr(0, bad.find_last_of(L'\\')) + L"\\anybox_used_pipelines.txt";
+}
+
+class UsedPipelines {
+public:
+    static UsedPipelines& Instance() {
+        static UsedPipelines* used = new UsedPipelines();
+        return *used;
+    }
+
+    bool UsedBefore(const std::string& key) const { return enabled_ && before_.count(key) != 0; }
+
+    void Note(const std::string& key) {
+        if (!enabled_ || key.empty() || before_.count(key) != 0) return;
+        const std::lock_guard guard(lock_);
+        if (noted_.insert(key).second) fresh_.push_back(key);
+    }
+
+    void Save() {
+        std::vector<std::string> fresh;
+        {
+            const std::lock_guard guard(lock_);
+            fresh.swap(fresh_);
+        }
+        if (fresh.empty()) return;
+        std::string text;
+        for (const std::string& key : fresh) text += key + "\r\n";
+        const HANDLE out = CreateFileW(UsedPipelineFile().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (out == INVALID_HANDLE_VALUE) return;
+        DWORD written = 0;
+        WriteFile(out, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+        CloseHandle(out);
+    }
+
+private:
+    UsedPipelines() {
+        const char* value = AbxSetting("d3d12_x.warm_pipelines");
+        enabled_ = value == nullptr || std::strtoul(value, nullptr, 10) != 0;
+        if (!enabled_) {
+            AbxLog("d3d12_x", "pipelines bound in earlier runs are not built ahead (d3d12_x.warm_pipelines = 0)");
+            return;
+        }
+        const HANDLE in = CreateFileW(UsedPipelineFile().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (in != INVALID_HANDLE_VALUE) {
+            std::string text;
+            char buffer[65536];
+            DWORD read = 0;
+            while (ReadFile(in, buffer, sizeof(buffer), &read, nullptr) && read != 0) text.append(buffer, read);
+            CloseHandle(in);
+            std::size_t start = 0;
+            while (start < text.size()) {
+                std::size_t end = text.find_first_of("\r\n", start);
+                if (end == std::string::npos) end = text.size();
+                if (end > start) before_.insert(text.substr(start, end - start));
+                start = end + 1;
+            }
+        }
+        AbxLog("d3d12_x",
+               "%zu pipelines the title bound in earlier runs (anybox_used_pipelines.txt, written as pipelines are first bound) are built by the background threads as soon as "
+               "the title creates them, so their first draw or dispatch does not wait for the build (d3d12_x.warm_pipelines = 0 turns this off)",
+               before_.size());
+        std::thread([this] {
+            for (;;) {
+                Sleep(30000);
+                Save();
+            }
+        }).detach();
+    }
+
+    bool enabled_ = false;
+    std::set<std::string> before_;
+    std::mutex lock_;
+    std::set<std::string> noted_;
+    std::vector<std::string> fresh_;
+};
+
+int PipelineWaitMs() {
+    static const int limit = [] {
+        const char* value = AbxSetting("d3d12_x.pipeline_wait_ms");
+        const unsigned long asked = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        if (asked < 1 || asked > 600000) return 30000;
+        AbxLog("d3d12_x", "a draw or dispatch waits at most %lu ms for a pipeline that is still being built and is skipped after that (d3d12_x.pipeline_wait_ms; 30000 when unset)", asked);
+        return static_cast<int>(asked);
+    }();
+    return limit;
+}
+
 class BuildQueue {
 public:
     static BuildQueue& Instance() {
@@ -120,7 +212,8 @@ private:
         std::thread([this] { Run(true); }).detach();
         AbxLog("d3d12_x",
                "pipelines are built in the background by %u threads at lowest priority plus one for pipelines over 2 MiB of SPIR-V (d3d12_x.pipeline_workers; %u hardware threads), each "
-               "starting only while %llu GiB of commit is free; a draw or dispatch with a pipeline still being built is skipped and moves that pipeline to the front",
+               "starting only while %llu GiB of commit is free; a draw or dispatch with a pipeline still being built waits for it up to 30 s (one over 2 MiB of SPIR-V is skipped "
+               "and moved to the front instead)",
                workers, concurrency, static_cast<unsigned long long>(kFreeCommit >> 30));
     }
 
@@ -133,9 +226,16 @@ private:
                 if (heavy) {
                     ready_.wait(guard, [this] { return !heavy_.empty(); });
                 } else {
-                    ready_.wait(guard, [this] { return !urgent_.empty() || !tasks_.empty(); });
+                    ready_.wait(guard, [this] { return !urgent_.empty() || !tasks_.empty() || !heavy_.empty(); });
                 }
-                std::deque<std::function<void()>>& lane = heavy ? heavy_ : urgent_.empty() ? tasks_ : urgent_;
+                std::deque<std::function<void()>>& lane = heavy ? heavy_ : !urgent_.empty() ? urgent_ : !tasks_.empty() ? tasks_ : heavy_;
+                if (!heavy && &lane == &heavy_) {
+                    static std::atomic<bool> reported{false};
+                    if (!reported.exchange(true)) {
+                        AbxLog("d3d12_x", "a pipeline over 2 MiB of SPIR-V is built by an idle worker: workers take those whenever their own queues are empty, so large graphics "
+                                          "pipelines do not wait behind the build thread for large ones");
+                    }
+                }
                 task = std::move(lane.front());
                 lane.pop_front();
                 Stats().pipelinesQueued.store(tasks_.size() + urgent_.size() + heavy_.size());
@@ -174,6 +274,14 @@ private:
 };
 
 constexpr std::uint64_t kHeavyBytes = 2ull << 20;
+
+bool ComputeOnFirstUse() {
+    static const bool enabled = [] {
+        const char* value = AbxSetting("d3d12_x.compute_pipelines_on_first_use");
+        return value != nullptr && value[0] == '1' && value[1] == 0;
+    }();
+    return enabled;
+}
 constexpr std::uint64_t kRefusedBytes = 16ull << 20;
 
 std::uint64_t ModuleBytes(const std::filesystem::path& module) {
@@ -217,11 +325,35 @@ void PipelineStateObject::BuildInBackground(std::function<PipelineEntry()> build
     moduleBytes_ = moduleBytes;
     build_ = std::move(build);
     pending_.store(true, std::memory_order_release);
+    if (UsedPipelines::Instance().UsedBefore(PipelineKey(shaders_))) {
+        static std::atomic<std::uint64_t> warmed{0};
+        const std::uint64_t count = ++warmed;
+        if (count == 1 || (count & (count - 1)) == 0) {
+            AbxLog("d3d12_x", "a pipeline the title bound in an earlier run is built in the background from its creation (%llu so far)", static_cast<unsigned long long>(count));
+        }
+        AddRef();
+        BuildQueue::Instance().Push(
+            [this] {
+                RunBuild();
+                Release();
+            },
+            false, heavy_);
+        return;
+    }
     if (point_ == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true)) {
             AbxLog("d3d12_x", "graphics pipelines are built when a draw first uses them, from the pipeline cache when it holds them, not in the background: a background build reads "
                               "and translates every shader module the title names, which competes with the title's own reads while it loads");
+        }
+        return;
+    }
+    if (ComputeOnFirstUse()) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "compute pipelines are built when a dispatch first uses them, not in the background (d3d12_x.compute_pipelines_on_first_use = 1): a pipeline the "
+                              "title creates and never uses takes no build time and no driver memory; the first dispatch waits for its pipeline up to 30 s, and one over "
+                              "2 MiB of SPIR-V is skipped until the build thread for those has it");
         }
         return;
     }
@@ -249,17 +381,21 @@ void PipelineStateObject::Prioritize() {
 void PipelineStateObject::BuildNow() {
     constexpr std::uint64_t kQuickBytes = 512u << 10;
     if (!Pending() || heavy_) return;
+    const TimedScope timed(TimedPart::PipelineWait);
     if (!started_.load(std::memory_order_acquire) && moduleBytes_ <= kQuickBytes) {
         const auto begin = std::chrono::steady_clock::now();
         RunBuild();
-        static std::atomic<int> logged{0};
-        if (logged.fetch_add(1) < 12) {
+        static std::atomic<int> logged[2]{};
+        if (logged[point_ == VK_PIPELINE_BIND_POINT_COMPUTE ? 0 : 1].fetch_add(1) < 12) {
             const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
-            AbxLog("d3d12_x", "a compute pipeline was built on the recording thread (%llu KiB of SPIR-V) in %lld ms", static_cast<unsigned long long>(moduleBytes_ >> 10),
-                   static_cast<long long>(took));
+            AbxLog("d3d12_x", "a %s pipeline was built on the recording thread (%llu KiB of SPIR-V) in %lld ms", point_ == VK_PIPELINE_BIND_POINT_COMPUTE ? "compute" : "graphics",
+                   static_cast<unsigned long long>(moduleBytes_ >> 10), static_cast<long long>(took));
         }
     }
-    for (int waited = 0; Pending() && waited < 50; ++waited) Sleep(1);
+    Prioritize();
+    const auto limit = std::chrono::milliseconds(ComputeOnFirstUse() || point_ != VK_PIPELINE_BIND_POINT_COMPUTE ? PipelineWaitMs() : 50);
+    const auto begin = std::chrono::steady_clock::now();
+    while (Pending() && std::chrono::steady_clock::now() - begin < limit) Sleep(1);
 }
 
 void PipelineStateObject::RunBuild() {
@@ -297,13 +433,25 @@ void PipelineStateObject::RunBuild() {
             if (reported++ < 20) AbxLog("d3d12_x", "a pipeline built in the background failed (%s): %s", shaders_.empty() ? "no shaders" : shaders_.front().c_str(), error.c_str());
         } else {
             ++Stats().pipelinesBuilt;
+            if (entry.origin == PipelineOrigin::Ready) ++Stats().pipelinesFromCache;
+            else Stats().pipelineCompileMs += static_cast<std::uint64_t>(entry.seconds * 1000.0);
             usesCodeBase_ = entry.usesCodeBase;
+            codeBaseModules_ = entry.codeBaseModules;
             origin_ = entry.origin;
             pipeline_.store(entry.pipeline, std::memory_order_release);
         }
         build_ = nullptr;
         pending_.store(false, std::memory_order_release);
     }
+}
+
+void PipelineStateObject::NoteBound() {
+    const std::uint32_t minute = Stats().pipelineMinute.load(std::memory_order_relaxed);
+    const std::uint32_t before = boundMinute_.exchange(minute, std::memory_order_relaxed);
+    if (before == minute) return;
+    if (before == 0) UsedPipelines::Instance().Note(PipelineKey(shaders_));
+    ++Stats().pipelinesBoundThisMinute;
+    if (before != 0 && minute - before > 2) ++Stats().pipelinesBackThisMinute;
 }
 
 PipelineStateObject::~PipelineStateObject() {
@@ -387,6 +535,51 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsDescription::Rebuilt() const {
     return rebuilt;
 }
 
+bool PipelineStateObject::GroupSize(std::array<std::uint32_t, 3>& size, std::string& error) {
+    const std::lock_guard guard(threadLock_);
+    if (!groupSize_ && groupSizeError_.empty()) {
+        if (!computeSource_) {
+            groupSizeError_ = "the pipeline has no compute module";
+        } else {
+            bool usesCodeBase = false;
+            const std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(computeSource_->module, usesCodeBase, groupSizeError_);
+            if (words) groupSize_ = ComputeGroupSize(*words, groupSizeError_);
+            if (!groupSize_ && groupSizeError_.empty()) groupSizeError_ = "the module could not be read";
+        }
+    }
+    if (!groupSize_) {
+        error = groupSizeError_;
+        return false;
+    }
+    size = *groupSize_;
+    return true;
+}
+
+VkPipeline PipelineStateObject::ThreadLimited(std::uint32_t limitRegister, std::string& error) {
+    const std::lock_guard guard(threadLock_);
+    if (limitRegister_ && *limitRegister_ != limitRegister) {
+        error = "a thread-limited pipeline asked for with two different limit registers";
+        return VK_NULL_HANDLE;
+    }
+    if (!limitRegister_) {
+        limitRegister_ = limitRegister;
+        if (!computeSource_ || library_ == nullptr) {
+            threadLimitedError_ = "the pipeline has no compute module";
+        } else {
+            PipelineSource source = *computeSource_;
+            source.threadLimited = true;
+            source.limitRegister = limitRegister;
+            const PipelineEntry entry = library_->Compute(source);
+            threadLimited_ = entry.pipeline;
+            if (threadLimited_ == VK_NULL_HANDLE) threadLimitedError_ = entry.error.empty() ? std::string("the thread-limited pipeline was not built") : entry.error;
+            AbxLog("d3d12_x", "compute pipeline %s got a second pipeline whose threads past a thread count return at once, for dispatches that count threads and end in a partial group: %s",
+                   shaders_.empty() ? "(no shader)" : shaders_.front().c_str(), threadLimited_ != VK_NULL_HANDLE ? PipelineOriginName(entry.origin) : threadLimitedError_.c_str());
+        }
+    }
+    if (threadLimited_ == VK_NULL_HANDLE) error = threadLimitedError_;
+    return threadLimited_;
+}
+
 bool PipelineStateObject::HasStage(const char* stage) const {
     const std::string prefix = std::string(stage) + " ";
     for (const std::string& shader : shaders_) {
@@ -423,6 +616,8 @@ HRESULT PipelineStateObject::CreateCompute(const PipelineContext& context, IUnkn
     }
     PipelineStateObject* created = new PipelineStateObject(parent, VK_PIPELINE_BIND_POINT_COMPUTE, VK_NULL_HANDLE, PipelineOrigin{}, signature);
     created->shaders_.push_back("cs " + source->key);
+    created->computeSource_ = *source;
+    created->library_ = &context.library;
     created->BuildInBackground([&library = context.library, source = *source] { return library.Compute(source); }, ModuleBytes(source->module));
     return Finish(created, riid, state, error);
 }

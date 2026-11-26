@@ -103,6 +103,7 @@ public:
     const std::optional<AttachmentRef>& DepthStencil() const { return depthStencil_; }
     const PipelineStateObject* Pipeline() const { return pipeline_; }
     void DispatchMesh(UINT x, UINT y, UINT z);
+    void DispatchThreads(UINT x, UINT y, UINT z, UINT flags);
     const RootArguments& GraphicsArguments() const { return graphics_; }
     const RootArguments& ComputeArguments() const { return compute_; }
 
@@ -111,6 +112,25 @@ protected:
 
 private:
     CommandList(const ResourceContext& context, IUnknown* parent, D3D12_COMMAND_LIST_TYPE type) : DeviceChildBase(parent), context_(context), type_(type) {}
+    ~CommandList() override { alive_ = 0; }
+    void BeforeDelete() override;
+    void ProtectHead(bool readOnly);
+
+public:
+    static void* operator new(std::size_t size);
+    static void operator delete(void* object);
+
+private:
+    void ReportDamage(const char* function) const;
+    void ClearUnorderedAccess(ID3D12Resource* resource, const VkClearColorValue& value, UINT count, const char* function);
+
+public:
+    bool Alive() const { return alive_ == kAlive; }
+    std::uint32_t AliveTag() const { return alive_; }
+
+private:
+    static constexpr std::uint32_t kAlive = 0x4C495354u;
+    std::uint32_t alive_ = kAlive;
     bool Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial, std::string& error);
     Resource* Ours(ID3D12Resource* resource, const char* function) const;
     D3D12_RESOURCE_STATES StateOf(const Resource* resource, UINT subresource, D3D12_RESOURCE_STATES expected) const;
@@ -127,7 +147,8 @@ private:
     void EndPass();
     bool PrepareDraw(const char* function);
     bool SkippedWork(const char* function);
-    void PushUserData(RootArguments& arguments, std::uint32_t firstSgpr, const char* function);
+    bool ResolveCodeBase(const char* function, std::string& reason);
+    void PushUserData(RootArguments& arguments, std::uint32_t firstSgpr, const char* function, std::uint32_t threadLimit = 0);
     void BindTitleSet(VkPipelineBindPoint point);
     const RootParameterLayout& Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const;
     void SetConstants(RootArguments& arguments, UINT index, UINT count, const void* data, UINT offset, const char* function);
@@ -139,6 +160,8 @@ private:
     ResourceContext context_;
     D3D12_COMMAND_LIST_TYPE type_;
     VkCommandBuffer commands_ = VK_NULL_HANDLE;
+    std::uint32_t profileGeneration_ = 0;
+    std::uint64_t profileList_ = 0;
     bool closed_ = true;
     bool copied_ = false;
     std::map<std::pair<const Resource*, UINT>, D3D12_RESOURCE_STATES> states_;
@@ -146,10 +169,14 @@ private:
     DescriptorHeap* samplerHeap_ = nullptr;
     std::vector<AttachmentRef> renderTargets_;
     std::vector<Resource*> targetResources_;
+    std::vector<Resource*> readbackWritten_;
+    void RecordReadback(Resource* resource, D3D12_RESOURCE_STATES state, const char* function);
+    void RecordDepthShadow(Resource* resource, D3D12_RESOURCE_STATES state, bool enters, const char* function);
     std::array<D3D12_VERTEX_BUFFER_VIEW, 4> traceViews_{};
     D3D12_INDEX_BUFFER_VIEW indexView_{};
     CommandAllocator* allocator_ = nullptr;
     std::optional<AttachmentRef> depthStencil_;
+    Resource* depthResource_ = nullptr;
     bool targetsSet_ = false;
     UINT emptyTargets_ = 0;
     bool depthHandleGiven_ = false;
@@ -184,6 +211,10 @@ private:
     RootArguments compute_;
     bool rendering_ = false;
     bool rectangles_ = false;
+    std::vector<D3D12_VIEWPORT> viewports_;
+    std::vector<D3D12_RECT> scissors_;
+    std::optional<D3D12_PRIMITIVE_TOPOLOGY> topology_;
+    const char* checkpointDetail_ = nullptr;
     bool pipelineBound_ = false;
     bool graphicsSetBound_ = false;
     bool computeSetBound_ = false;

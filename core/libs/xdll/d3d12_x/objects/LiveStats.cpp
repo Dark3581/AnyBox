@@ -2,7 +2,9 @@
 
 #include "AbxApi.hpp"
 #include "DiscordPresence.hpp"
+#include "FrameTiming.hpp"
 #include "Presenter.hpp"
+#include "Resource.hpp"
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -14,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 namespace abx::d3d12x {
 
@@ -126,8 +129,56 @@ std::wstring Widen(const std::string& text) {
     return wide;
 }
 
+struct TimingSnapshot {
+    std::uint64_t presents = 0;
+    std::uint64_t nanoseconds[kTimedParts] = {};
+    std::uint64_t calls[kTimedParts] = {};
+    std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+};
+
+void ReportFrameTiming(TimingSnapshot& last, std::uint64_t presents) {
+    TimingSnapshot now;
+    now.presents = presents;
+    for (std::size_t index = 0; index < kTimedParts; ++index) {
+        now.nanoseconds[index] = g_frameTiming.nanoseconds[index].load(std::memory_order_relaxed);
+        now.calls[index] = g_frameTiming.calls[index].load(std::memory_order_relaxed);
+    }
+    const std::uint64_t frames = now.presents - last.presents;
+    if (frames != 0) {
+        const double share = 1.0 / static_cast<double>(frames);
+        const auto ms = [&](TimedPart part) {
+            const std::size_t index = static_cast<std::size_t>(part);
+            return static_cast<double>(now.nanoseconds[index] - last.nanoseconds[index]) / 1.0e6 * share;
+        };
+        const auto calls = [&](TimedPart part) {
+            const std::size_t index = static_cast<std::size_t>(part);
+            return static_cast<double>(now.calls[index] - last.calls[index]) * share;
+        };
+        const double frameMs = std::chrono::duration<double, std::milli>(now.at - last.at).count() * share;
+        AbxLog("d3d12_x",
+               "frame time 1/2: %llu frames of %.1f ms each; wall-clock ms a frame by part, summed over all threads (parts can overlap; brackets are inside the part before "
+               "them): present %.1f [waiting for the window's next image %.1f, the frame's blit submitted, waited for and queued %.1f, resting for the desktop %.1f] | "
+               "ExecuteCommandLists %.1f in %.1f calls [vkQueueSubmit2 with its lock %.1f] | recording draws and dispatches %.1f [waiting for pipelines %.1f in %.2f "
+               "waits], barriers %.1f, copies and clears %.1f, list close %.1f in %.1f lists",
+               static_cast<unsigned long long>(frames), frameMs, ms(TimedPart::Present), ms(TimedPart::PresentAcquire), ms(TimedPart::PresentSync), ms(TimedPart::DesktopRest),
+               ms(TimedPart::Execute), calls(TimedPart::Execute), ms(TimedPart::QueueSubmit), ms(TimedPart::ListWork), ms(TimedPart::PipelineWait), calls(TimedPart::PipelineWait),
+               ms(TimedPart::ListBarriers), ms(TimedPart::ListCopies), ms(TimedPart::ListClose), calls(TimedPart::ListClose));
+        AbxLog("d3d12_x",
+               "frame time 2/2: title textures made %.1f (%.2f a frame), refreshed %.1f, flushed %.1f | readback %.1f | GPU page mapping %.1f (%.2f calls a frame) | waits "
+               "for the GPU to finish what it has: one-shot submits, the present's among them, %.1f (%.2f a frame), address space changes %.1f (%.2f a frame) | lists "
+               "held back by memory waits %.1f (%.2f a frame)",
+               ms(TimedPart::TextureMake), calls(TimedPart::TextureMake), ms(TimedPart::TextureRefresh), ms(TimedPart::TextureFlush), ms(TimedPart::Readback),
+               ms(TimedPart::GpuPages), calls(TimedPart::GpuPages), ms(TimedPart::SyncSubmit), calls(TimedPart::SyncSubmit), ms(TimedPart::AddressIdleWait),
+               calls(TimedPart::AddressIdleWait), ms(TimedPart::MemoryWaitHeld), calls(TimedPart::MemoryWaitHeld));
+    }
+    last = now;
+}
+
 void Run() {
     const bool showStats = Enabled();
+    long long lastDecade = 0;
+    long long lastMinute = 0;
+    TimingSnapshot timing;
     const std::wstring configuredTitle = ConfiguredTitle();
     const HANDLE console = showStats ? StatsConsole() : INVALID_HANDLE_VALUE;
     LiveStats& stats = Stats();
@@ -138,6 +189,7 @@ void Run() {
     std::uint64_t lastSkipped = 0;
     std::uint64_t lastBuilt = 0;
     std::wstring baseTitle;
+    std::wstring shownTitle;
     HWND window = nullptr;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -151,30 +203,69 @@ void Run() {
         static IDXGIAdapter3* const adapter = VideoAdapter();
         DXGI_QUERY_VIDEO_MEMORY_INFO video{};
         if (adapter != nullptr) adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &video);
+        stats.videoUsage.store(video.CurrentUsage, std::memory_order_relaxed);
+        stats.videoBudget.store(video.Budget, std::memory_order_relaxed);
         const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
         char line[512];
         std::snprintf(line, sizeof(line),
-                      "%02lld:%02lld:%02lld | %llu fps | draws %llu/s, dispatches %llu/s, skipped %llu/s | pipelines %llu built (+%llu/s), %llu building, %llu queued, "
+                      "%02lld:%02lld:%02lld | %llu fps | draws %llu/s, dispatches %llu/s, skipped %llu/s | pipelines %llu built (+%llu/s, %llu from cache, %llu s compiling), %llu building, %llu queued, "
                       "%llu failed | textures %llu, %.2f GB | VRAM %.2f of %.2f GB | free commit %.1f GB",
                       static_cast<long long>(seconds / 3600), static_cast<long long>(seconds / 60 % 60), static_cast<long long>(seconds % 60),
                       static_cast<unsigned long long>(presents - lastPresents), static_cast<unsigned long long>(draws - lastDraws),
                       static_cast<unsigned long long>(dispatches - lastDispatches), static_cast<unsigned long long>(skipped - lastSkipped),
                       static_cast<unsigned long long>(built), static_cast<unsigned long long>(built - lastBuilt),
+                      static_cast<unsigned long long>(stats.pipelinesFromCache.load()), static_cast<unsigned long long>(stats.pipelineCompileMs.load() / 1000),
                       static_cast<unsigned long long>(stats.pipelinesBuilding.load()), static_cast<unsigned long long>(stats.pipelinesQueued.load()),
                       static_cast<unsigned long long>(stats.pipelinesFailed.load()), static_cast<unsigned long long>(stats.textureCount.load()),
                       static_cast<double>(stats.textureBytes.load()) / (1ull << 30), static_cast<double>(video.CurrentUsage) / (1ull << 30), static_cast<double>(video.Budget) / (1ull << 30),
                       static_cast<double>(memory.ullAvailPageFile) / (1ull << 30));
-        if (showStats && seconds % 10 == 0) AbxLog("d3d12_x", "stats %s", line);
-        if (showStats && seconds % 60 == 0) {
+        const bool tenth = seconds / 10 != lastDecade;
+        const bool minute = seconds / 60 != lastMinute;
+        lastDecade = seconds / 10;
+        lastMinute = seconds / 60;
+        if (showStats && tenth) {
+            AbxLog("d3d12_x", "stats %s", line);
+            ReportFrameTiming(timing, presents);
+        }
+        if (showStats && minute) {
+            AbxLog("d3d12_x", "written targets of 4 MiB and more still at the normal memory priority because no command list has named them (what the system moves out first when video "
+                   "memory runs over): %llu MiB in %llu",
+                   static_cast<unsigned long long>(stats.unusedTargetBytes.load() >> 20), static_cast<unsigned long long>(stats.unusedTargetCount.load()));
+            const auto bufferKib = [&](const std::atomic<std::uint64_t>* values, int kind) { return static_cast<unsigned long long>(values[kind].load() >> 10); };
+            AbxLog("d3d12_x",
+                   "buffers at title addresses (system memory, which shaders reach over the bus): the GPU may write %llu KiB in %llu (%llu KiB in buffers of 64 KiB and more, "
+                   "%llu KiB as whole 64 KiB pages) | read only %llu KiB in %llu (%llu KiB in buffers of 64 KiB and more, %llu KiB as whole 64 KiB pages)",
+                   bufferKib(stats.titleBufferBytes, 1), static_cast<unsigned long long>(stats.titleBufferCount[1].load()), bufferKib(stats.titleBufferLargeBytes, 1),
+                   bufferKib(stats.titleBufferPageBytes, 1), bufferKib(stats.titleBufferBytes, 0), static_cast<unsigned long long>(stats.titleBufferCount[0].load()),
+                   bufferKib(stats.titleBufferLargeBytes, 0), bufferKib(stats.titleBufferPageBytes, 0));
             const auto mib = [&](int bucket) { return static_cast<unsigned long long>(stats.textureBucketBytes[bucket].load() >> 20); };
             const auto count = [&](int bucket) { return static_cast<unsigned long long>(stats.textureBucketCount[bucket].load()); };
             AbxLog("d3d12_x",
                    "texture memory by kind: written targets <256 KiB %llu MiB (%llu), <4 MiB %llu MiB (%llu), larger %llu MiB (%llu) | title textures <256 KiB %llu MiB (%llu), "
                    "<4 MiB %llu MiB (%llu), larger %llu MiB (%llu)",
                    mib(0), count(0), mib(1), count(1), mib(2), count(2), mib(3), count(3), mib(4), count(4), mib(5), count(5));
-            AbxLog("d3d12_x", "other video memory AnyBox holds: copy scratch buffers %llu MiB in %llu buffers (%llu MiB of them in system memory), small-texture pool blocks %llu MiB",
+            AbxLog("d3d12_x",
+                   "other video memory AnyBox holds: copy scratch buffers %llu MiB in %llu buffers (%llu MiB of them in system memory), small-texture pool blocks %llu MiB of which "
+                   "textures fill %llu MiB | video memory outside AnyBox's textures (pipelines and whatever else the driver keeps there): %lld MiB",
                    static_cast<unsigned long long>(stats.scratchBytes.load() >> 20), static_cast<unsigned long long>(stats.scratchBuffers.load()),
-                   static_cast<unsigned long long>(stats.scratchSystemBytes.load() >> 20), static_cast<unsigned long long>(stats.poolBlockBytes.load() >> 20));
+                   static_cast<unsigned long long>(stats.scratchSystemBytes.load() >> 20), static_cast<unsigned long long>(stats.poolBlockBytes.load() >> 20),
+                   static_cast<unsigned long long>(stats.poolUsedBytes.load() >> 20),
+                   (static_cast<long long>(video.CurrentUsage) - static_cast<long long>(stats.textureBytes.load())) / (1ll << 20));
+            ++stats.pipelineMinute;
+            AbxLog("d3d12_x",
+                   "pipelines the title bound in the last minute: %llu different ones of %llu built so far, %llu of them not bound in the two minutes before (what releasing idle "
+                   "pipelines would have to build again)",
+                   static_cast<unsigned long long>(stats.pipelinesBoundThisMinute.exchange(0)), static_cast<unsigned long long>(built),
+                   static_cast<unsigned long long>(stats.pipelinesBackThisMinute.exchange(0)));
+            const WrittenUse use = Resource::MeasureWrittenUse(120);
+            const auto part = [](const WrittenUse::Part& value) { return std::pair<unsigned long long, unsigned long long>(value.bytes >> 20, value.count); };
+            AbxLog("d3d12_x",
+                   "written targets of 4 MiB and more by what command lists did with them: %llu MiB in %llu | never named by a barrier, bind, clear or copy %llu MiB in %llu (of "
+                   "these: created in a state that allows writing %llu MiB in %llu, without any view %llu MiB in %llu) | named, but not in the last 120 s %llu MiB in %llu | never "
+                   "put in a state that allows writing, bound, cleared or copied into %llu MiB in %llu",
+                   part(use.all).first, part(use.all).second, part(use.neverNamed).first, part(use.neverNamed).second, part(use.neverNamedWritable).first,
+                   part(use.neverNamedWritable).second, part(use.neverNamedNoView).first, part(use.neverNamedNoView).second, part(use.idle).first, part(use.idle).second,
+                   part(use.neverWritten).first, part(use.neverWritten).second);
         }
         DiscordPresenceTick(presents - lastPresents);
         lastPresents = presents;
@@ -191,7 +282,9 @@ void Run() {
             window = FindProcessWindow();
             if (window != nullptr) {
                 wchar_t title[256] = {};
-                GetWindowTextW(window, title, 256);
+                DWORD_PTR copied = 0;
+                if (configuredTitle.empty()) SendMessageTimeoutW(window, WM_GETTEXT, 256, reinterpret_cast<LPARAM>(title), SMTO_ABORTIFHUNG | SMTO_BLOCK, 250, &copied);
+                title[255] = 0;
                 baseTitle = configuredTitle.empty() ? std::wstring(title) : configuredTitle;
                 if (FitWindowEnabled()) FitToPrimaryMonitor(window);
                 KeepConsoleAside();
@@ -200,11 +293,9 @@ void Run() {
         }
         if (window != nullptr) {
             const std::wstring text = showStats ? (baseTitle.empty() ? L"" : baseTitle + L" | ") + L"AnyBox " + Widen(line) : baseTitle;
-            wchar_t current[512] = {};
-            GetWindowTextW(window, current, 512);
-            if (!text.empty() && text != current) {
+            if (!text.empty() && text != shownTitle) {
                 DWORD_PTR result = 0;
-                SendMessageTimeoutW(window, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text.c_str()), SMTO_ABORTIFHUNG | SMTO_BLOCK, 250, &result);
+                if (SendMessageTimeoutW(window, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(text.c_str()), SMTO_ABORTIFHUNG | SMTO_BLOCK, 250, &result) != 0) shownTitle = text;
             }
         }
     }
@@ -217,14 +308,35 @@ LiveStats& Stats() {
     return *stats;
 }
 
+namespace {
+
+std::atomic<long long> g_traceFirst{-1};
+std::atomic<long long> g_traceCount{0};
+
+}
+
 bool TracingFrame() {
-    static const long long target = [] {
+    static const bool read = [] {
         char value[32] = {};
         GetEnvironmentVariableA("ANYBOX_TRACE_FRAME", value, sizeof(value));
-        return value[0] == 0 ? -1ll : std::atoll(value);
+        if (value[0] != 0) {
+            g_traceCount.store(3);
+            g_traceFirst.store(std::atoll(value));
+        }
+        return true;
     }();
+    static_cast<void>(read);
+    const long long first = g_traceFirst.load(std::memory_order_relaxed);
+    if (first < 0) return false;
     const long long frame = static_cast<long long>(Stats().presents.load());
-    return target >= 0 && frame >= target && frame < target + 3;
+    return frame >= first && frame < first + g_traceCount.load(std::memory_order_relaxed);
+}
+
+void TraceFrames(std::uint64_t first, std::uint32_t count) {
+    TracingFrame();
+    g_traceFirst.store(-1);
+    g_traceCount.store(static_cast<long long>(count));
+    g_traceFirst.store(static_cast<long long>(first));
 }
 
 std::uint32_t TextureBucket(bool written, std::uint64_t bytes) {

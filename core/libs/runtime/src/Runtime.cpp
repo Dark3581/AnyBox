@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -511,11 +512,108 @@ std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_previousFilter{};
 std::atomic<bool> g_inFilter{};
 std::atomic<DWORD> g_handledThread{};
 PVOID g_keepFilter = nullptr;
+HANDLE g_rawCrash = INVALID_HANDLE_VALUE;
+
+void RawHex(char*& out, const char* label, std::uint64_t value) {
+    while (*label != '\0') *out++ = *label++;
+    for (int shift = 60; shift >= 0; shift -= 4) *out++ = "0123456789abcdef"[(value >> shift) & 0xF];
+}
+
+void RawModuleOffset(char*& out, const char* end, std::uint64_t address) {
+    HMODULE module = nullptr;
+    if (address == 0 || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(address), &module) ||
+        module == nullptr) {
+        if (out + 20 < end) RawHex(out, " ", address);
+        return;
+    }
+    char name[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(module, name, MAX_PATH);
+    const char* base = name;
+    for (DWORD i = 0; i < length; ++i) {
+        if (name[i] == '\\' || name[i] == '/') base = name + i + 1;
+    }
+    if (out < end) *out++ = ' ';
+    for (const char* c = base; c < name + length && out < end; ++c) *out++ = *c;
+    if (out + 20 < end) RawHex(out, "+", address - reinterpret_cast<std::uint64_t>(module));
+}
+
+using ThreadQuery = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+void RawCrashLine(const EXCEPTION_POINTERS* pointers, const char* kind) {
+    if (g_rawCrash == INVALID_HANDLE_VALUE) return;
+    char line[2048];
+    char* out = line;
+    const EXCEPTION_RECORD* record = pointers != nullptr ? pointers->ExceptionRecord : nullptr;
+    RawHex(out, kind, record != nullptr ? record->ExceptionCode : 0);
+    RawHex(out, " at ", record != nullptr ? reinterpret_cast<std::uintptr_t>(record->ExceptionAddress) : 0);
+    RawHex(out, " info0 ", record != nullptr && record->NumberParameters >= 1 ? record->ExceptionInformation[0] : 0);
+    RawHex(out, " info1 ", record != nullptr && record->NumberParameters >= 2 ? record->ExceptionInformation[1] : 0);
+    RawHex(out, " rsp ", pointers != nullptr && pointers->ContextRecord != nullptr ? pointers->ContextRecord->Rsp : 0);
+    RawHex(out, " thread ", GetCurrentThreadId());
+    RawHex(out, " title ", reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)));
+    const char* const end = line + sizeof(line) - 2;
+    static const ThreadQuery query = reinterpret_cast<ThreadQuery>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+    void* start = nullptr;
+    if (query != nullptr && query(GetCurrentThread(), 9, &start, sizeof(start), nullptr) == 0) {
+        const char* label = " thread-start";
+        while (*label != '\0' && out < end) *out++ = *label++;
+        RawModuleOffset(out, end, reinterpret_cast<std::uint64_t>(start));
+    }
+    if (pointers != nullptr && pointers->ContextRecord != nullptr) {
+        std::uint64_t frames[MaxFrames]{};
+        const std::size_t count = UnwindFrames(*pointers->ContextRecord, frames);
+        const char* label = " frames";
+        while (*label != '\0' && out < end) *out++ = *label++;
+        for (std::size_t frame = 0; frame < count && frame < 16; ++frame) RawModuleOffset(out, end, frames[frame]);
+    }
+    *out++ = '\n';
+    DWORD written = 0;
+    WriteFile(g_rawCrash, line, static_cast<DWORD>(out - line), &written, nullptr);
+    FlushFileBuffers(g_rawCrash);
+}
+
+void EmitPointedMemory(const CONTEXT& c) {
+    struct Named {
+        const char* name;
+        std::uint64_t value;
+    };
+    const Named registers[] = {{"rax", c.Rax}, {"rbx", c.Rbx}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rsi", c.Rsi}, {"rdi", c.Rdi}, {"rbp", c.Rbp}, {"r8", c.R8},
+                               {"r9", c.R9},   {"r10", c.R10}, {"r11", c.R11}, {"r12", c.R12}, {"r13", c.R13}, {"r14", c.R14}, {"r15", c.R15}};
+    constexpr std::size_t kWordsBefore = 2;
+    constexpr std::size_t kWords = 8;
+    std::size_t index = 0;
+    for (const Named& one : registers) {
+        bool repeated = false;
+        for (std::size_t earlier = 0; earlier < index; ++earlier) repeated = repeated || registers[earlier].value == one.value;
+        ++index;
+        if (repeated || one.value < 0x10000) continue;
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(one.value), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
+            (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || region.Type == MEM_IMAGE) {
+            continue;
+        }
+        const std::uint64_t regionStart = reinterpret_cast<std::uint64_t>(region.BaseAddress);
+        const std::uint64_t regionEnd = regionStart + region.RegionSize;
+        std::uint64_t start = one.value & ~std::uint64_t{7};
+        for (std::size_t back = 0; back < kWordsBefore && start >= regionStart + 8; ++back) start -= 8;
+        std::uint64_t words[kWords]{};
+        const std::size_t count = static_cast<std::size_t>((std::min)(std::uint64_t{kWords}, (regionEnd - start) / 8));
+        SIZE_T read = 0;
+        if (count == 0 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(start), words, count * 8, &read) || read != count * 8) continue;
+        std::string line = std::format("[anybox]   {} points into {} memory (allocation {:x}, region {:x}..{:x}, protection 0x{:x}); from {:x}:", one.name,
+                                       region.Type == MEM_MAPPED ? "mapped" : "private", reinterpret_cast<std::uint64_t>(region.AllocationBase), regionStart, regionEnd,
+                                       static_cast<unsigned>(region.Protect), start);
+        for (std::size_t word = 0; word < count; ++word) line += std::format(" {:016x}", words[word]);
+        Emit(line + "\n");
+    }
+}
 
 LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
     if (g_inFilter.exchange(true)) {
+        RawCrashLine(pointers, "nested crash code ");
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    RawCrashLine(pointers, "crash code ");
     if (g_handledThread.load() == GetCurrentThreadId()) {
         g_inFilter.store(false);
         return EXCEPTION_CONTINUE_SEARCH;
@@ -543,6 +641,7 @@ LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
                          c.Rsi, c.Rdi, c.Rbp, c.Rsp));
         Emit(std::format("[anybox]   r8 {:016x} r9 {:016x} r10 {:016x} r11 {:016x} r12 {:016x} r13 {:016x} r14 {:016x} r15 {:016x}\n", c.R8, c.R9, c.R10, c.R11, c.R12,
                          c.R13, c.R14, c.R15));
+        EmitPointedMemory(c);
     }
     if (pointers != nullptr && pointers->ContextRecord != nullptr) {
         stop.frames = frames;
@@ -561,7 +660,13 @@ LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
     return result;
 }
 
-LONG WINAPI KeepFilter(EXCEPTION_POINTERS*) {
+std::atomic<int> g_firstChanceLogged{0};
+
+LONG WINAPI KeepFilter(EXCEPTION_POINTERS* pointers) {
+    const DWORD code = pointers != nullptr && pointers->ExceptionRecord != nullptr ? pointers->ExceptionRecord->ExceptionCode : 0;
+    if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_STACK_OVERFLOW || code == 0xC0000374u) && g_firstChanceLogged.fetch_add(1) < 64) {
+        RawCrashLine(pointers, "first-chance code ");
+    }
     if (!g_inFilter.load() && g_handledThread.load() == GetCurrentThreadId()) {
         g_handledThread.store(0);
     }
@@ -663,6 +768,7 @@ void Start() {
     if (!logPath.empty()) {
         g_logFile = std::fopen(logPath.c_str(), "a");
     }
+    g_rawCrash = CreateFileW((ExecutableDirectory() + L"\\anybox-crash-raw.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     SetUnhandledExceptionFilter(UnhandledException);
     g_keepFilter = AddVectoredExceptionHandler(0, KeepFilter);
     abx::InstallCpuFixups();

@@ -1,7 +1,9 @@
 #pragma once
 
+#include "BindlessSet.hpp"
 #include "BufferArena.hpp"
 #include "CommandRecorder.hpp"
+#include "DepthPlanePass.hpp"
 #include "ObjectBase.hpp"
 #include "TitleAddressSpace.hpp"
 #include "TitleBufferWindow.hpp"
@@ -17,13 +19,24 @@
 
 namespace abx::d3d12x {
 
-class BindlessSet;
-
 struct TitleAllocator {
     void* (*allocate)(std::size_t size, std::uint64_t attributes) = nullptr;
     void (*release)(void* address, std::uint64_t attributes) = nullptr;
     std::uint64_t descriptorHeapAttributes = 0;
     std::uint64_t committedTextureAttributes = 0;
+};
+
+struct WrittenUse {
+    struct Part {
+        std::uint64_t bytes = 0;
+        std::uint64_t count = 0;
+    };
+    Part all;
+    Part neverNamed;
+    Part neverNamedWritable;
+    Part neverNamedNoView;
+    Part idle;
+    Part neverWritten;
 };
 
 struct ResourceContext {
@@ -66,15 +79,38 @@ public:
     std::uint64_t Width() const { return desc_.Width; }
     void AttachTitleMemory(void* memory, std::uint64_t attributes);
     void RememberTitleAddress(std::uint64_t address) { textureAddress_ = address; }
+    std::uint64_t TextureAddress() const { return textureAddress_; }
     void SetSkippedMips(std::uint32_t skipped) { skippedMips_ = skipped; }
     std::uint32_t SkippedMips() const { return skippedMips_; }
-    void RegisterGpuWritten(std::uint64_t address);
+    void RegisterGpuWritten(std::uint64_t address, bool writableAtFirst);
+    void NoteListUse(bool writes);
+    void NoteUse();
+    static WrittenUse MeasureWrittenUse(std::uint32_t idleSeconds);
+    void SetReadBack(bool on) { readBack_.store(on); }
+    bool ReadBack() const { return readBack_.load(std::memory_order_relaxed); }
     static Resource* GpuWrittenSame(std::uint64_t address, const D3D12_RESOURCE_DESC& desc);
     std::uint64_t TextureBytes() const { return textureBytes_; }
     static Resource* GpuWrittenAt(std::uint64_t address, const D3D12_RESOURCE_DESC& desc);
     const TextureRef& Texture() const { return texture_; }
     UINT Maps() const { return maps_; }
     VkImageView View(const VkImageViewCreateInfo& info, std::string& error);
+    struct DepthShadow {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkImageViewCreateInfo info{};
+        DeviceBuffer staging;
+        VkExtent3D extent{};
+        VkImageView plane = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        DepthPlanePass::Source source;
+        const DepthPlanePass* pass = nullptr;
+        bool stencil = false;
+        std::atomic<bool> planeNewer{true};
+    };
+    static unsigned long DepthUnorderedAccess();
+    DepthShadow* EnsureDepthShadow(std::string& error);
+    DepthShadow* DepthShadowOf() { return depthShadowReady_.load(std::memory_order_acquire) ? &depthShadow_ : nullptr; }
     std::size_t Views() const;
 
 protected:
@@ -108,6 +144,15 @@ private:
     VkDeviceSize poolOffset_ = 0;
     VkDeviceSize poolSize_ = 0;
     std::atomic<UINT> maps_{0};
+    std::atomic<bool> readBack_{false};
+    std::atomic<std::uint32_t> listUse_{0};
+    std::atomic<std::uint32_t> listWrite_{0};
+    std::atomic<std::uint32_t> viewsMade_{0};
+    std::atomic<bool> unusedPriority_{false};
+    std::uint64_t initSerial_ = 0;
+    bool writableAtFirst_ = false;
+    DepthShadow depthShadow_;
+    std::atomic<bool> depthShadowReady_{false};
     mutable std::mutex viewLock_;
     std::vector<std::pair<VkImageViewCreateInfo, VkImageView>> views_;
 };

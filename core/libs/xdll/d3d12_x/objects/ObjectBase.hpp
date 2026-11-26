@@ -109,9 +109,13 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
     ULONG STDMETHODCALLTYPE Release() override {
         const ULONG left = --references_;
-        if (left == 0) delete this;
+        if (left == 0) {
+            BeforeDelete();
+            delete this;
+        }
         return left;
     }
+    virtual void BeforeDelete() {}
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override { return privateData_.Get(guid, size, data); }
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override { return privateData_.Set(guid, size, data); }
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* data) override { return privateData_.SetInterface(guid, data); }

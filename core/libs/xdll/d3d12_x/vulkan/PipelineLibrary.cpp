@@ -1,5 +1,6 @@
 #include "PipelineLibrary.hpp"
 #include "PipelineCompiler.hpp"
+#include "ThreadLimit.hpp"
 #include "UserDataRebase.hpp"
 
 #include <chrono>
@@ -40,7 +41,8 @@ PipelineEntry PipelineLibrary::Compute(const PipelineSource& source) {
         entry.error = "the pipeline has no key";
         return entry;
     }
-    return Obtain("cs:" + source.key, [this, &source] { return Create(source); });
+    const std::string variant = source.threadLimited ? ":threads" + std::to_string(source.limitRegister) : std::string();
+    return Obtain("cs:" + source.key + variant, [this, &source] { return Create(source); });
 }
 
 PipelineEntry PipelineLibrary::Graphics(const GraphicsRequest& request) {
@@ -119,7 +121,12 @@ PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) co
         }
     };
     for (const GraphicsShaderSource& shader : request.shaders) {
-        std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(shader.module, entry.usesCodeBase, entry.error);
+        bool stageUsesCodeBase = false;
+        std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(shader.module, stageUsesCodeBase, entry.error);
+        if (stageUsesCodeBase) {
+            entry.usesCodeBase = true;
+            entry.codeBaseModules.push_back(shader.module);
+        }
         if (!words) {
             release();
             return finish();
@@ -189,8 +196,13 @@ PipelineEntry PipelineLibrary::Create(const PipelineSource& source) const {
         entry.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         return entry;
     };
-    const std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(source.module, entry.usesCodeBase, entry.error);
+    std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(source.module, entry.usesCodeBase, entry.error);
+    if (entry.usesCodeBase) entry.codeBaseModules.push_back(source.module);
     if (!words) {
+        return finish();
+    }
+    if (source.threadLimited && !LimitThreads(*words, source.limitRegister, entry.error)) {
+        entry.error = "limiting the module to a thread count failed: " + entry.error;
         return finish();
     }
     entry.bytes = words->size() * sizeof(std::uint32_t);

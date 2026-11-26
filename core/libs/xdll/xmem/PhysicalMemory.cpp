@@ -7,9 +7,12 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -76,6 +79,59 @@ State& Physical() {
     return *state;
 }
 
+struct ViewRef {
+    std::uintptr_t address;
+    ULONG protection;
+};
+
+struct SourceRun {
+    std::uintptr_t firstFrame;
+    std::size_t count;
+};
+
+struct Tracking {
+    std::mutex lock;
+    bool on = false;
+    AbxPhysicalPageReturn returned = nullptr;
+    void* context = nullptr;
+    std::unordered_multimap<std::uintptr_t, ViewRef> views;
+    std::map<std::uint64_t, SourceRun> sources;
+    std::unordered_set<std::uintptr_t> guarded;
+};
+
+Tracking& Tracked() {
+    static Tracking* tracking = new Tracking();
+    return *tracking;
+}
+
+constexpr int kReturnAttempts = 3;
+
+void WaitUntilUnguarded(Tracking& tracking, std::unique_lock<std::mutex>& guard, std::uintptr_t frame, std::uint64_t source, const char* function) {
+    for (int attempt = 0; tracking.on && tracking.guarded.count(frame) != 0; ++attempt) {
+        if (attempt == kReturnAttempts || tracking.returned == nullptr || source == 0) {
+            AbxUnsupported(function, "a physical page whose views are guarded was not handed back by the graphics layer");
+        }
+        const AbxPhysicalPageReturn returned = tracking.returned;
+        void* const context = tracking.context;
+        guard.unlock();
+        returned(context, source);
+        guard.lock();
+    }
+}
+
+void ForgetView(std::uintptr_t frame, std::uintptr_t address) {
+    Tracking& tracking = Tracked();
+    const std::lock_guard guard(tracking.lock);
+    if (!tracking.on) return;
+    const auto [first, last] = tracking.views.equal_range(frame);
+    for (auto it = first; it != last; ++it) {
+        if (it->second.address == address) {
+            tracking.views.erase(it);
+            return;
+        }
+    }
+}
+
 const PageRun* FindRun(const State& state, std::uintptr_t frame) {
     for (const PageRun& run : state.runs) {
         if (frame >= run.firstFrame && (frame - run.firstFrame) % kFramesPerPage == 0 && (frame - run.firstFrame) / kFramesPerPage < run.count) return &run;
@@ -110,7 +166,10 @@ bool UnmapSlot(Window& window, std::size_t slot) {
         return false;
     }
     window.mapped[slot] = false;
-    if (slot < window.frames.size()) window.frames[slot] = 0;
+    if (slot < window.frames.size()) {
+        if (window.frames[slot] != 0) ForgetView(window.frames[slot], reinterpret_cast<std::uintptr_t>(address));
+        window.frames[slot] = 0;
+    }
     return true;
 }
 
@@ -118,11 +177,16 @@ bool MapSlot(Window& window, std::size_t slot, const PageRun& run, std::uintptr_
     if (!UnmapSlot(window, slot) || !IsolateSlot(window, slot)) return false;
     void* const address = reinterpret_cast<void*>(window.base + slot * kPhysicalPageSize);
     const ULONG64 offset = static_cast<ULONG64>((frame - run.firstFrame) / kFramesPerPage) * kPhysicalPageSize;
+    Tracking& tracking = Tracked();
+    std::unique_lock<std::mutex> tracked(tracking.lock);
+    WaitUntilUnguarded(tracking, tracked, frame, run.gpuView == 0 ? 0 : run.gpuView + offset, "XMemMapPhysicalPages");
     void* const view = Placeholders().mapViewOfFile3(run.section, GetCurrentProcess(), address, offset, kPhysicalPageSize, kReplacePlaceholder, window.viewProtection, nullptr, 0);
     if (view != address) {
         AbxTrace("mapping physical page frame %zu at %p failed with %lu", static_cast<std::size_t>(frame), address, GetLastError());
         return false;
     }
+    if (tracking.on) tracking.views.emplace(frame, ViewRef{reinterpret_cast<std::uintptr_t>(address), window.viewProtection});
+    tracked.unlock();
     window.mapped[slot] = true;
     if (window.frames.size() < window.slots) window.frames.resize(window.slots, 0);
     window.frames[slot] = frame;
@@ -153,9 +217,29 @@ std::uint64_t GpuSource(const PageRun& run, std::uintptr_t frame) {
             return 0;
         }
         run.gpuView = reinterpret_cast<std::uint64_t>(view);
+        {
+            Tracking& tracking = Tracked();
+            const std::lock_guard tracked(tracking.lock);
+            tracking.sources[run.gpuView] = SourceRun{run.firstFrame, run.count};
+        }
         AnnounceBacking(run.gpuView, bytes);
     }
     return run.gpuView + static_cast<std::uint64_t>((frame - run.firstFrame) / kFramesPerPage) * kPhysicalPageSize;
+}
+
+void ForgetSource(const PageRun& run) {
+    Tracking& tracking = Tracked();
+    const std::lock_guard guard(tracking.lock);
+    tracking.sources.erase(run.gpuView);
+    for (std::size_t index = 0; index < run.count && !tracking.guarded.empty(); ++index) {
+        const std::uintptr_t frame = run.firstFrame + index * kFramesPerPage;
+        if (tracking.guarded.erase(frame) == 0) continue;
+        const auto [first, last] = tracking.views.equal_range(frame);
+        for (auto it = first; it != last; ++it) {
+            DWORD previous = 0;
+            VirtualProtect(reinterpret_cast<void*>(it->second.address), kPhysicalPageSize, it->second.protection, &previous);
+        }
+    }
 }
 
 void AnnounceMapped(std::vector<std::pair<std::uintptr_t, std::uint64_t>>& pages) {
@@ -314,6 +398,99 @@ ABX_API void* AbxXMemPhysicalPageView(std::uintptr_t frame) {
     return reinterpret_cast<void*>(abx::xmem::GpuSource(*run, frame));
 }
 
+ABX_API void AbxXMemTrackPhysicalViews(AbxPhysicalPageReturn returned, void* context) {
+    auto& state = abx::xmem::Physical();
+    const std::lock_guard guard(state.lock);
+    abx::xmem::Tracking& tracking = abx::xmem::Tracked();
+    const std::lock_guard tracked(tracking.lock);
+    tracking.returned = returned;
+    tracking.context = context;
+    if (returned == nullptr) {
+        for (const std::uintptr_t frame : tracking.guarded) {
+            const auto [first, last] = tracking.views.equal_range(frame);
+            for (auto it = first; it != last; ++it) {
+                DWORD previous = 0;
+                VirtualProtect(reinterpret_cast<void*>(it->second.address), kPhysicalPageSize, it->second.protection, &previous);
+            }
+        }
+        tracking.guarded.clear();
+        tracking.views.clear();
+        tracking.on = false;
+        return;
+    }
+    if (tracking.on) return;
+    tracking.on = true;
+    std::size_t views = 0;
+    for (const abx::xmem::Window& window : state.windows) {
+        for (std::size_t slot = 0; slot < window.frames.size() && slot < window.slots; ++slot) {
+            if (!window.mapped[slot] || window.frames[slot] == 0) continue;
+            tracking.views.emplace(window.frames[slot], abx::xmem::ViewRef{window.base + slot * kPhysicalPageSize, window.viewProtection});
+            ++views;
+        }
+    }
+    AbxLog("xmem",
+           "every view of a physical page is tracked from now on (%zu so far), so the graphics layer can keep a page in video memory and take the CPU's access away from all of its "
+           "views until the first access",
+           views);
+}
+
+ABX_API std::uint32_t AbxXMemGuardPhysicalPage(std::uint64_t source, BOOL guard, std::uint64_t* views, std::uint32_t capacity) {
+    abx::xmem::Tracking& tracking = abx::xmem::Tracked();
+    const std::lock_guard tracked(tracking.lock);
+    if (!tracking.on) return kAbxPhysicalPageGuardRefused;
+    auto run = tracking.sources.upper_bound(source);
+    if (run == tracking.sources.begin()) return kAbxPhysicalPageGuardRefused;
+    --run;
+    const std::uint64_t offset = source - run->first;
+    if (offset % kPhysicalPageSize != 0 || offset / kPhysicalPageSize >= run->second.count) return kAbxPhysicalPageGuardRefused;
+    const std::uintptr_t frame = run->second.firstFrame + static_cast<std::uintptr_t>(offset / kPhysicalPageSize) * abx::xmem::kFramesPerPage;
+    const auto [first, last] = tracking.views.equal_range(frame);
+    std::uint32_t count = 0;
+    for (auto it = first; it != last; ++it) ++count;
+    if (guard == FALSE) {
+        if (tracking.guarded.erase(frame) == 0) return 0;
+        for (auto it = first; it != last; ++it) {
+            DWORD previous = 0;
+            VirtualProtect(reinterpret_cast<void*>(it->second.address), kPhysicalPageSize, it->second.protection, &previous);
+        }
+        return count;
+    }
+    if (count > capacity || (count != 0 && views == nullptr)) return kAbxPhysicalPageGuardRefused;
+    if (guard != kAbxPhysicalPageGuardAll && guard != kAbxPhysicalPageGuardWrites) return kAbxPhysicalPageGuardRefused;
+    if (tracking.guarded.count(frame) == 0) {
+        const DWORD taken = guard == kAbxPhysicalPageGuardWrites ? PAGE_READONLY : PAGE_NOACCESS;
+        for (auto it = first; it != last; ++it) {
+            DWORD previous = 0;
+            if (VirtualProtect(reinterpret_cast<void*>(it->second.address), kPhysicalPageSize, taken, &previous)) continue;
+            for (auto undo = first; undo != it; ++undo) VirtualProtect(reinterpret_cast<void*>(undo->second.address), kPhysicalPageSize, undo->second.protection, &previous);
+            return kAbxPhysicalPageGuardRefused;
+        }
+        tracking.guarded.insert(frame);
+    }
+    std::uint32_t index = 0;
+    for (auto it = first; it != last; ++it) views[index++] = it->second.address;
+    return count;
+}
+
+ABX_API BOOL AbxXMemCopyToPhysicalPage(std::uintptr_t frame, std::size_t offset, const void* data, std::size_t bytes) {
+    if (data == nullptr || offset > kPhysicalPageSize || bytes > kPhysicalPageSize - offset) return FALSE;
+    std::uint64_t page = 0;
+    {
+        auto& state = abx::xmem::Physical();
+        const std::lock_guard guard(state.lock);
+        const abx::xmem::PageRun* run = abx::xmem::FindRun(state, frame);
+        if (run == nullptr) return FALSE;
+        page = abx::xmem::GpuSource(*run, frame);
+    }
+    if (page == 0) return FALSE;
+    abx::xmem::Tracking& tracking = abx::xmem::Tracked();
+    std::unique_lock<std::mutex> tracked(tracking.lock);
+    if (!tracking.on) tracked.unlock();
+    if (tracked.owns_lock()) abx::xmem::WaitUntilUnguarded(tracking, tracked, frame, page, __func__);
+    std::memcpy(reinterpret_cast<std::uint8_t*>(page) + offset, data, bytes);
+    return TRUE;
+}
+
 ABX_API void* AbxXMemPhysicalViewAt(std::uintptr_t address) {
     auto& state = abx::xmem::Physical();
     const std::lock_guard guard(state.lock);
@@ -461,6 +638,7 @@ ABX_API BOOL XMemFreePhysicalPages(std::uintptr_t pageCount, const std::uintptr_
             if (++it->freed == it->count) {
                 if (it->gpuView != 0) {
                     abx::xmem::AnnounceBackingWithdrawn(it->gpuView, static_cast<std::uint64_t>(it->count) * kPhysicalPageSize);
+                    abx::xmem::ForgetSource(*it);
                     UnmapViewOfFile(reinterpret_cast<void*>(it->gpuView));
                 }
                 CloseHandle(it->section);

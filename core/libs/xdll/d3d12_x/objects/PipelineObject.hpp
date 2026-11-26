@@ -5,10 +5,14 @@
 #include "RootSignature.hpp"
 #include "ShaderStore.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,6 +38,7 @@ struct GraphicsDescription {
 class PipelineStateObject final : public DeviceChildBase<ID3D12PipelineState> {
 public:
     bool Alive() const { return alive_ == kAlive; }
+    void NoteBound();
     static HRESULT CreateCompute(const PipelineContext& context, IUnknown* parent, const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, REFIID riid, void** state, std::string& error);
     static HRESULT CreateGraphics(const PipelineContext& context, IUnknown* parent, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, REFIID riid, void** state,
                                   std::string& error);
@@ -54,9 +59,14 @@ public:
     std::string UnbuiltReason() const { return Pending() ? std::string("its pipeline is still being built in the background") : unbuilt_; }
     const std::vector<std::string>& Shaders() const { return shaders_; }
     bool UsesCodeBase() const { return usesCodeBase_; }
+    const std::vector<std::filesystem::path>& CodeBaseModules() const { return codeBaseModules_; }
+    std::uint64_t CodeBase() const { return codeBase_.load(std::memory_order_acquire); }
+    void SetCodeBase(std::uint64_t address) { codeBase_.store(address, std::memory_order_release); }
     VkPolygonMode PolygonMode() const { return polygonMode_; }
     bool HasStage(const char* stage) const;
     const GraphicsDescription* Description() const { return description_.get(); }
+    bool GroupSize(std::array<std::uint32_t, 3>& size, std::string& error);
+    VkPipeline ThreadLimited(std::uint32_t limitRegister, std::string& error);
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -76,6 +86,7 @@ private:
     std::atomic<bool> pending_{false};
     std::atomic<bool> started_{false};
     std::atomic<bool> prioritized_{false};
+    std::atomic<std::uint32_t> boundMinute_{0};
     bool heavy_ = false;
     std::uint64_t moduleBytes_ = 0;
     std::function<PipelineEntry()> build_;
@@ -84,8 +95,18 @@ private:
     std::string unbuilt_;
     std::vector<std::string> shaders_;
     bool usesCodeBase_ = false;
+    std::vector<std::filesystem::path> codeBaseModules_;
+    std::atomic<std::uint64_t> codeBase_{0};
     std::shared_ptr<const GraphicsDescription> description_;
     VkPolygonMode polygonMode_ = VK_POLYGON_MODE_FILL;
+    std::optional<PipelineSource> computeSource_;
+    PipelineLibrary* library_ = nullptr;
+    std::mutex threadLock_;
+    std::optional<std::array<std::uint32_t, 3>> groupSize_;
+    std::string groupSizeError_;
+    std::optional<std::uint32_t> limitRegister_;
+    VkPipeline threadLimited_ = VK_NULL_HANDLE;
+    std::string threadLimitedError_;
 };
 
 }

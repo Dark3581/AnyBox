@@ -12,6 +12,7 @@
 #include "DescriptorSizes.hpp"
 #include "DescriptorWriter.hpp"
 #include "Fence.hpp"
+#include "GpuProfile.hpp"
 #include "GraphicsState.hpp"
 #include "PipelineCompiler.hpp"
 #include "PipelineLibrary.hpp"
@@ -25,8 +26,12 @@
 #include "TextureDesc.hpp"
 #include "TitleBufferWindow.hpp"
 #include "TitleMemoryRange.hpp"
+#include "HangReport.hpp"
+#include "TitlePages.hpp"
 #include "Gfx10Tiling.hpp"
+#include "IndirectClamp.hpp"
 #include "TitleTextures.hpp"
+#include "TextureReadback.hpp"
 #include "VulkanDevice.hpp"
 
 #include <algorithm>
@@ -42,6 +47,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -98,6 +104,7 @@ struct ConsoleDevice {
     std::unique_ptr<abx::d3d12x::ResourceContext> resources;
     std::unique_ptr<abx::d3d12x::DescriptorWriter> descriptors;
     std::unique_ptr<abx::d3d12x::TitleTextures> titleTextures;
+    std::unique_ptr<abx::d3d12x::TextureReadback> textureReadback;
     std::unique_ptr<abx::d3d12x::PipelineCache> pipelineCache;
     std::unique_ptr<abx::d3d12x::PipelineLibrary> pipelines;
     std::unique_ptr<abx::d3d12x::PipelineContext> pipelineContext;
@@ -109,6 +116,8 @@ struct ConsoleDevice {
     std::array<std::atomic<std::int64_t>, kFrameEventKinds> frameEventOffsets{};
     std::mutex frameLock;
     LARGE_INTEGER frameOrigin{};
+    std::unique_ptr<abx::d3d12x::TitlePages> titlePages;
+    std::unique_ptr<abx::d3d12x::HangReport> hangReport;
 };
 
 static_assert(offsetof(ConsoleDevice, descriptorsThroughDevice) == 0x18);
@@ -308,6 +317,17 @@ HRESULT STDMETHODCALLTYPE DeviceCreateResourceAtAddress(ConsoleDevice* self, std
                 }
             }
             abx::d3d12x::Resource* texture = self->titleTextures->At(address, *desc, error);
+            if (texture == nullptr && error.find("no device memory") != std::string::npos) {
+                static std::atomic<std::uint64_t> refused{0};
+                const std::uint64_t count = ++refused;
+                if (count == 1 || (count & (count - 1)) == 0) {
+                    AbxLog("d3d12_x", "video memory is exhausted: device slot 133 answers E_OUTOFMEMORY and no resource for a texture at title address 0x%llx that the title "
+                                      "fills itself (%s), and the title decides what to do without it (%llu so far): %s",
+                           static_cast<unsigned long long>(address), ResourceDescText(*desc).c_str(), static_cast<unsigned long long>(count), error.c_str());
+                }
+                *resource = nullptr;
+                return E_OUTOFMEMORY;
+            }
             if (texture == nullptr) {
                 AbxUnsupported("D3D12 device slot 133", ("a texture at a title address that the title fills itself (" + ResourceDescText(*desc) + "): " + error).c_str());
             }
@@ -333,14 +353,43 @@ HRESULT STDMETHODCALLTYPE DeviceCreateResourceAtAddress(ConsoleDevice* self, std
             same->AddRef();
             return Deliver(Kind::Resource, same, riid, resource);
         }
+        if (abx::d3d12x::Resource* const other = abx::d3d12x::Resource::GpuWrittenAt(address, applied)) {
+            static std::mutex pairLock;
+            static std::set<std::pair<int, int>> pairs;
+            static std::uint64_t apart = 0;
+            const D3D12_RESOURCE_DESC& live = other->Texture().desc;
+            const std::lock_guard pairGuard(pairLock);
+            const std::uint64_t count = ++apart;
+            if (pairs.insert({static_cast<int>(applied.Format), static_cast<int>(live.Format)}).second || (count & (count - 1)) == 0) {
+                AbxLog("d3d12_x",
+                       "a GPU-written texture is placed at title address 0x%llx (%s) where a live one of the same size sits with another description (format %d, %u mips, flags 0x%x): "
+                       "it gets its own image and the two do not see each other's texels, though they are one memory on the console (%llu so far)",
+                       static_cast<unsigned long long>(address), ResourceDescText(*desc).c_str(), static_cast<int>(live.Format), live.MipLevels, static_cast<unsigned>(live.Flags),
+                       static_cast<unsigned long long>(count));
+            }
+        }
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
         const HRESULT made = abx::d3d12x::Resource::CreateCommitted(*self->resources, AsParent(self), heap, D3D12_HEAP_FLAG_NONE, applied, *initial, __uuidof(ID3D12Resource),
                                                                     reinterpret_cast<void**>(&inner), error);
+        if (FAILED(made) && error.find("no device memory") != std::string::npos) {
+            static std::atomic<std::uint64_t> refused{0};
+            const std::uint64_t count = ++refused;
+            if (count == 1 || (count & (count - 1)) == 0) {
+                AbxLog("d3d12_x", "video memory is exhausted: device slot 133 answers E_OUTOFMEMORY and no resource for a GPU-written texture at title address 0x%llx (%s), and "
+                                  "the title decides what to do without it (%llu so far): %s",
+                       static_cast<unsigned long long>(address), ResourceDescText(*desc).c_str(), static_cast<unsigned long long>(count), error.c_str());
+            }
+            *resource = nullptr;
+            return E_OUTOFMEMORY;
+        }
         if (FAILED(made)) {
             AbxUnsupported("D3D12 device slot 133", ("a GPU-written texture at a title address (" + ResourceDescText(*desc) + "): " + error).c_str());
         }
         static_cast<abx::d3d12x::Resource*>(inner)->RememberTitleAddress(address);
-        static_cast<abx::d3d12x::Resource*>(inner)->RegisterGpuWritten(address);
+        constexpr UINT kWritableStates = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                                         D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        static_cast<abx::d3d12x::Resource*>(inner)->RegisterGpuWritten(address, (static_cast<UINT>(*initial) & kWritableStates) != 0);
+        self->textureReadback->Consider(*static_cast<abx::d3d12x::Resource*>(inner), address, *desc);
         const std::uint64_t vulkanBytes = static_cast<abx::d3d12x::Resource*>(inner)->TextureBytes();
         if (vulkanBytes >= (4ull << 20)) {
             static std::atomic<int> logged{0};
@@ -427,6 +476,7 @@ void STDMETHODCALLTYPE DeviceCreateUnorderedAccessViewAtAddress(ConsoleDevice* s
     }
     if (counter != 0) AbxUnsupported(function, "a UAV counter given by address");
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (self->addresses) self->addresses->MarkGpuWritten(address, resource->Width);
         self->descriptors->CreateUnorderedAccessViewAt(address, resource->Width, desc, destination);
         return;
     }
@@ -460,6 +510,17 @@ void STDMETHODCALLTYPE DeviceCreateShaderResourceViewAtAddress(ConsoleDevice* se
             return;
         }
         abx::d3d12x::Resource* texture = self->titleTextures->At(address, *resource, error);
+        if (texture == nullptr && error.find("no device memory") != std::string::npos) {
+            static std::atomic<std::uint64_t> missing{0};
+            const std::uint64_t count = ++missing;
+            if (count == 1 || (count & (count - 1)) == 0) {
+                AbxLog("d3d12_x", "video memory is exhausted: a texture view at title address 0x%llx gets a null descriptor, so the texture is missing on screen until "
+                                  "memory is free and the title creates the view again (%llu so far): %s",
+                       static_cast<unsigned long long>(address), static_cast<unsigned long long>(count), error.c_str());
+            }
+            self->descriptors->CreateShaderResourceView(nullptr, &desc, destination);
+            return;
+        }
         if (texture == nullptr) {
             char text[48];
             std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
@@ -614,6 +675,46 @@ HRESULT STDMETHODCALLTYPE DeviceCreateComputePipeline(ConsoleDevice* self, const
         }
     }
     return Deliver(Kind::PipelineState, inner, riid, state);
+}
+
+void STDMETHODCALLTYPE DeviceGetCopyableFootprints(ConsoleDevice*, const D3D12_RESOURCE_DESC* desc, UINT first, UINT count, UINT64 baseOffset,
+                                                   D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows, UINT64* rowBytes, UINT64* totalBytes) {
+    const char* function = "ID3D12Device::GetCopyableFootprints";
+    if (desc == nullptr) AbxUnsupported(function, "no resource description");
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "device slot 38 is GetCopyableFootprints with the desktop arguments (first caller: a bundled module; %s, subresources %u..%u)",
+               ResourceDescText(*desc).c_str(), first, first + count);
+    }
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (first != 0 || count > 1) AbxUnsupported(function, "more than subresource 0 of a buffer");
+        if (count == 1) {
+            if (desc->Width > UINT32_MAX) AbxUnsupported(function, "a buffer of 4 GiB or more");
+            if (layouts != nullptr) {
+                layouts[0] = {};
+                layouts[0].Offset = baseOffset;
+                layouts[0].Footprint.Format = DXGI_FORMAT_UNKNOWN;
+                layouts[0].Footprint.Width = static_cast<UINT>(desc->Width);
+                layouts[0].Footprint.Height = 1;
+                layouts[0].Footprint.Depth = 1;
+                layouts[0].Footprint.RowPitch = static_cast<UINT>(desc->Width);
+            }
+            if (rows != nullptr) rows[0] = 1;
+            if (rowBytes != nullptr) rowBytes[0] = desc->Width;
+        }
+        if (totalBytes != nullptr) *totalBytes = count == 1 ? desc->Width : 0;
+        return;
+    }
+    if (desc->MipLevels == 0) AbxUnsupported(function, "a texture description with 0 mip levels (the full chain)");
+    std::string error;
+    const std::optional<abx::d3d12x::Footprints> footprints = abx::d3d12x::DesktopCopyableFootprints(*desc, desc->MipLevels, first, count, baseOffset, error);
+    if (!footprints) AbxUnsupported(function, ("(" + ResourceDescText(*desc) + "): " + error).c_str());
+    for (UINT index = 0; index < count && index < footprints->layouts.size(); ++index) {
+        if (layouts != nullptr) layouts[index] = footprints->layouts[index];
+        if (rows != nullptr) rows[index] = footprints->rows[index];
+        if (rowBytes != nullptr) rowBytes[index] = footprints->rowBytes[index];
+    }
+    if (totalBytes != nullptr) *totalBytes = footprints->totalBytes;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceCreateQueryHeap(ConsoleDevice* self, const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** heap) {
@@ -1108,6 +1209,15 @@ HRESULT STDMETHODCALLTYPE DeviceCreateCommittedResourceWithState(ConsoleDevice* 
     if (heap == nullptr || desc == nullptr || resource == nullptr) return E_INVALIDARG;
     D3D12_RESOURCE_DESC applied = *desc;
     applied.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<UINT>(applied.Flags) & kDesktopResourceFlags);
+    if (applied.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && applied.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "a committed texture that asks for texture layout %d is stored in the driver's own layout: its memory has no title address, so the layout "
+                              "cannot be seen through memory (first: %s)",
+                   static_cast<int>(applied.Layout), ResourceDescText(*desc).c_str());
+        }
+        applied.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
     std::string error;
     IUnknown* inner = nullptr;
     const HRESULT result = abx::d3d12x::Resource::CreateCommitted(*self->resources, AsParent(self), *heap, heapFlags, applied, initial, __uuidof(ID3D12Resource),
@@ -1212,6 +1322,7 @@ std::array<const void*, kDeviceSlots> DeviceTable() {
     table[26] = reinterpret_cast<const void*>(&DeviceGetCustomHeapProperties);
     table[27] = reinterpret_cast<const void*>(&DeviceCreateCommittedResourceWithState);
     table[36] = reinterpret_cast<const void*>(&DeviceCreateFence);
+    table[38] = reinterpret_cast<const void*>(&DeviceGetCopyableFootprints);
     table[39] = reinterpret_cast<const void*>(&DeviceCreateQueryHeap);
     table[41] = reinterpret_cast<const void*>(&DeviceCreateCommandSignature);
     table[48] = reinterpret_cast<const void*>(&DeviceCreateConsoleQueue);
@@ -1224,6 +1335,7 @@ std::array<const void*, kDeviceSlots> DeviceTable() {
     table[71] = reinterpret_cast<const void*>(&DeviceCreateUnorderedAccessViewAtAddress);
     table[73] = reinterpret_cast<const void*>(&DeviceCreateConsoleCommandList);
     table[74] = reinterpret_cast<const void*>(&DeviceRegisterTitleMemory);
+    table[76] = reinterpret_cast<const void*>(&DeviceCreateCommittedResourceWithState);
     table[78] = reinterpret_cast<const void*>(&DeviceSetFrameInterval);
     table[80] = reinterpret_cast<const void*>(&DeviceWaitFrameEvent);
     table[81] = reinterpret_cast<const void*>(&DeviceQueryEventRecords);
@@ -1306,6 +1418,28 @@ void TitleMemoryWatch::OnTitleGpuMemoryForward(void* context, std::uint32_t even
     OnTitleGpuMemory(context, event, start, bytes, source);
 }
 
+void ApplyGpuPriority() {
+    const char* value = AbxSetting("d3d12_x.gpu_priority");
+    if (value == nullptr || value[0] == 0) return;
+    const std::string asked(value);
+    const int priority = asked == "idle" ? 0 : asked == "below_normal" ? 1 : asked == "normal" ? 2 : -1;
+    if (priority < 0) {
+        AbxLog("d3d12_x", "d3d12_x.gpu_priority = %s is not idle, below_normal or normal; the GPU scheduling priority is left as it is", value);
+        return;
+    }
+    using SetPriorityClass = LONG(WINAPI*)(HANDLE, int);
+    const HMODULE gdi = LoadLibraryW(L"gdi32.dll");
+    const auto set = gdi != nullptr ? reinterpret_cast<SetPriorityClass>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass"))) : nullptr;
+    if (set == nullptr) {
+        AbxLog("d3d12_x", "d3d12_x.gpu_priority: gdi32.dll has no D3DKMTSetProcessSchedulingPriorityClass; the GPU scheduling priority is left as it is");
+        return;
+    }
+    const LONG status = set(GetCurrentProcess(), priority);
+    AbxLog("d3d12_x", "GPU scheduling priority class of this process: %s (d3d12_x.gpu_priority; the system answered 0x%08lx), so the desktop and other programs get the GPU before "
+                      "the title's work",
+           value, static_cast<unsigned long>(status));
+}
+
 std::mutex g_deviceLock;
 ConsoleDevice* g_device = nullptr;
 
@@ -1354,8 +1488,17 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
     const float period = created->vulkan->Properties().limits.timestampPeriod;
     if (period > 0.0f) abx::d3d12x::console::SetTimestampFrequency(static_cast<UINT64>(1.0e9 / period));
     abx::d3d12x::console::SetVulkanDevice(created->vulkan.get());
+    abx::d3d12x::GpuProfile::Start(*created->vulkan);
+    ApplyGpuPriority();
     AbxLog("d3d12_x", "D3D12XboxCreateDevice: Vulkan device %s (%s)", created->vulkan->Gpu().name.c_str(),
            abx::d3d12x::VersionText(created->vulkan->Properties().apiVersion).c_str());
+    AbxLog("d3d12_x",
+           created->vulkan->PageableMemory()
+               ? "video memory is pageable (VK_EXT_pageable_device_local_memory with VK_EXT_memory_priority): allocations past the card's own memory succeed and the system moves "
+                 "what is used least into system memory, so running out of video memory costs speed instead of failing (d3d12_x.pageable_video_memory: 0 turns it off, 2 also "
+                 "gives GPU-written textures priority 0.75 instead of 0.5)"
+               : "video memory is not pageable (d3d12_x.pageable_video_memory is 0, or the device lacks VK_EXT_pageable_device_local_memory or VK_EXT_memory_priority): allocations "
+                 "past the card's own memory fail");
     created->window = abx::d3d12x::TitleBufferWindow::Create(*created->vulkan, BufferWindowBytes(), error);
     if (!created->window) {
         AbxUnsupported(__func__, ("the GPU buffer window could not be created: " + error).c_str());
@@ -1367,12 +1510,15 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
     }
     abx::d3d12x::console::SetAddressSpace(created->addresses.get());
     created->vulkan->SetFaultAddressDescriber([space = created->addresses.get()](std::uint64_t device) { return space->DescribeDeviceAddress(device); });
+    created->vulkan->SetFaultExtraReport([] { return abx::d3d12x::IndirectClamp::RecentReport(); });
     {
         const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
         const auto watch = xmem != nullptr ? reinterpret_cast<WatchFunction>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemWatchGpuMemory"))) : nullptr;
         if (watch == nullptr) {
             AbxUnsupported(__func__, "ab_xmem.dll does not export AbxXMemWatchGpuMemory, so title memory cannot reach the GPU");
         }
+        created->titlePages = abx::d3d12x::TitlePages::Start(*created->addresses);
+        created->hangReport = abx::d3d12x::HangReport::Start(*created->vulkan, created->addresses.get());
         created->watch = std::make_unique<TitleMemoryWatch>(watch, created->addresses.get());
     }
     AbxLog("d3d12_x", "title memory reaches shaders through a page table at 0x%llx; %llu MiB of GPU-visible title memory imported so far",
@@ -1387,6 +1533,7 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
     created->descriptors = std::make_unique<abx::d3d12x::DescriptorWriter>(*created->resources);
     created->titleTextures = std::make_unique<abx::d3d12x::TitleTextures>(*created->resources, AsParent(created.get()));
     g_titleTextures.store(created->titleTextures.get());
+    created->textureReadback = std::make_unique<abx::d3d12x::TextureReadback>(*created->resources);
     const char* cacheFile = AbxSetting("d3d12_x.pipeline_cache");
     created->pipelineCache = std::make_unique<abx::d3d12x::PipelineCache>(*created->vulkan, cacheFile != nullptr ? std::filesystem::path(cacheFile) : std::filesystem::path());
     created->pipelines = std::make_unique<abx::d3d12x::PipelineLibrary>(*created->vulkan, created->pipelineCache->Handle(), 0);
@@ -1397,15 +1544,31 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
         const abx::d3d12x::PipelineCache* cache = created->pipelineCache.get();
         std::thread([cache] {
             constexpr std::uint64_t kNewPipelines = 50;
-            constexpr int kQuietChecks = 4;
+            constexpr int kQuietChecks = 20;
             constexpr ULONGLONG kFreeCommit = 4ull << 30;
+            constexpr ULONGLONG kSaveApartMs = 120000;
             std::uint64_t saved = abx::d3d12x::Stats().pipelinesBuilt.load();
+            std::uint64_t savedCompiled = saved - abx::d3d12x::Stats().pipelinesFromCache.load();
+            ULONGLONG savedAt = 0;
             bool first = true;
             int quiet = 0;
             for (;;) {
                 Sleep(15000);
                 const std::uint64_t built = abx::d3d12x::Stats().pipelinesBuilt.load();
                 if (built == saved) continue;
+                const std::uint64_t fromCache = abx::d3d12x::Stats().pipelinesFromCache.load();
+                const std::uint64_t compiled = built > fromCache ? built - fromCache : 0;
+                if (compiled == savedCompiled) {
+                    static std::atomic<bool> reported{false};
+                    if (!reported.exchange(true)) {
+                        AbxLog("d3d12_x", "the pipeline cache is not saved again while every pipeline built since the last save came out of it (first: %llu built, none compiled)",
+                               static_cast<unsigned long long>(built));
+                    }
+                    saved = built;
+                    quiet = 0;
+                    continue;
+                }
+                if (savedAt != 0 && GetTickCount64() - savedAt < kSaveApartMs) continue;
                 ++quiet;
                 const bool settled = abx::d3d12x::Stats().pipelinesQueued.load() == 0 && abx::d3d12x::Stats().pipelinesBuilding.load() == 0;
                 if (built - saved < kNewPipelines && quiet < kQuietChecks && !settled) continue;
@@ -1421,6 +1584,8 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
                     AbxLog("d3d12_x", "pipeline cache saved: %zu MiB for %llu pipelines in %lld ms (saved again as pipelines are built, so later runs do not compile them again)",
                            written >> 20, static_cast<unsigned long long>(built), static_cast<long long>(took));
                     saved = built;
+                    savedCompiled = compiled;
+                    savedAt = GetTickCount64();
                     first = false;
                     quiet = 0;
                 } else {

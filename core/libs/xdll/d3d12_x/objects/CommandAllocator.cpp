@@ -74,6 +74,14 @@ std::uintptr_t CommandAllocator::Transient(std::size_t bytes, std::size_t alignm
     }
     constexpr std::size_t kBlockBytes = 4u << 20;
     const std::size_t size = (std::max)(kBlockBytes, (bytes + 0xFFFFu) & ~std::size_t{0xFFFF});
+    const std::uintptr_t base = ReserveHigh(size, error);
+    if (base == 0) return 0;
+    transient_.insert(transient_.begin() + static_cast<std::ptrdiff_t>(transientNext_), TransientBlock{base, size, bytes});
+    created = &transient_[transientNext_];
+    return created->base;
+}
+
+std::uintptr_t CommandAllocator::ReserveHigh(std::size_t size, std::string& error) {
     using VirtualAlloc2Function = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
     static const VirtualAlloc2Function virtualAlloc2 = [] {
         const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
@@ -91,12 +99,10 @@ std::uintptr_t CommandAllocator::Transient(std::size_t bytes, std::size_t alignm
     parameter.Pointer = &requirements;
     void* const base = virtualAlloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &parameter, 1);
     if (base == nullptr) {
-        error = "no address range between 256 GiB and 1 TiB for " + std::to_string(size) + " bytes of transient command list memory (error " + std::to_string(GetLastError()) + ")";
+        error = "no address range between 256 GiB and 1 TiB for " + std::to_string(size) + " bytes (error " + std::to_string(GetLastError()) + ")";
         return 0;
     }
-    transient_.insert(transient_.begin() + static_cast<std::ptrdiff_t>(transientNext_), TransientBlock{reinterpret_cast<std::uintptr_t>(base), size, bytes});
-    created = &transient_[transientNext_];
-    return created->base;
+    return reinterpret_cast<std::uintptr_t>(base);
 }
 
 namespace {
@@ -149,13 +155,17 @@ bool CommandAllocator::Scratch(VkDeviceSize bytes, VkBuffer& buffer, std::string
     vk.getBufferMemoryRequirements(device_.Handle(), made.buffer, &needs);
     const std::optional<std::uint32_t> local = device_.MemoryType(needs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     const std::optional<std::uint32_t> system = device_.SystemMemoryType(needs.memoryTypeBits);
+    VkMemoryPriorityAllocateInfoEXT priority{VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT};
+    priority.priority = 0.75f;
     VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocate.allocationSize = needs.size;
     bool inSystemMemory = false;
     bool allocated = false;
     if (local) {
+        if (device_.PageableMemory()) allocate.pNext = &priority;
         allocate.memoryTypeIndex = *local;
         allocated = vk.allocateMemory(device_.Handle(), &allocate, nullptr, &made.memory) == VK_SUCCESS;
+        allocate.pNext = nullptr;
     }
     if (!allocated && system) {
         allocate.memoryTypeIndex = *system;

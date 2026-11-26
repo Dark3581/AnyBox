@@ -1,11 +1,14 @@
 #include "CommandList.hpp"
 #include "CommandSignature.hpp"
 #include "FrameDump.hpp"
+#include "FrameTiming.hpp"
+#include "GpuProfile.hpp"
 #include "IndirectClamp.hpp"
 #include "DescriptorWriter.hpp"
 #include "DescriptorHeap.hpp"
 #include "LiveStats.hpp"
 #include "QueryHeap.hpp"
+#include "TextureReadback.hpp"
 
 #include "AbxApi.hpp"
 #include "BindlessSet.hpp"
@@ -17,9 +20,13 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <vector>
@@ -29,12 +36,52 @@ namespace abx::d3d12x {
 namespace {
 
 constexpr UINT kAllSubresources = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+std::string TitleWordsText(const TitleAddressSpace* addresses, std::uint64_t address, std::uint64_t bytes) {
+    constexpr std::uint64_t kPage = 0x10000;
+    const std::uint64_t wanted = (std::min)((std::min)(bytes, std::uint64_t{32}), kPage - (address & (kPage - 1))) & ~std::uint64_t{3};
+    if (wanted == 0) return "";
+    const std::uint8_t* host = addresses != nullptr ? addresses->HostAt(address) : nullptr;
+    if (host == nullptr) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
+            (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize < address + wanted) {
+            return "; its first bytes are not readable from the CPU";
+        }
+        host = reinterpret_cast<const std::uint8_t*>(address);
+    }
+    std::string text = "; first words:";
+    for (std::uint64_t at = 0; at < wanted; at += 4) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, host + at, sizeof(word));
+        char piece[16];
+        std::snprintf(piece, sizeof(piece), " %08x", word);
+        text += piece;
+    }
+    return text;
+}
 constexpr std::uint32_t kGraphicsFirstRootSgpr = 8;
 constexpr std::uint32_t kComputeFirstRootSgpr = 4;
 constexpr std::uint32_t kUserSgprs = 32;
 constexpr std::uint32_t kPageTableWord = 32;
 constexpr std::uint32_t kPushWords = 36;
+constexpr std::uint32_t kThreadLimitSgpr = 31;
+constexpr UINT kDispatchCountsThreads = 0x20;
 constexpr float kDefaultBlendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+std::uint32_t HeapIndexing(const RootSignature* signature) {
+    if (signature == nullptr) return 0;
+    return (static_cast<std::uint32_t>(signature->Layout().flags) | signature->Layout().heapIndexing) & kHeapIndexingFlags;
+}
+
+std::uint32_t HeapBaseWord(const DescriptorHeap* heap, const char* function) {
+    if (heap == nullptr) return 0;
+    const std::uint64_t start = heap->GpuStart().ptr;
+    if (start > 0xFFFFFFFFull) {
+        AbxUnsupported(function, "a directly indexed descriptor heap above 4 GB, which a single user data word cannot hold");
+    }
+    return static_cast<std::uint32_t>(start);
+}
 
 [[noreturn]] void RootMappingUnknown(const char* function) {
     AbxUnsupported(function, "how root arguments, descriptor heaps and the heap base reach the translated shader's user data is unknown until a title's calls show it");
@@ -50,6 +97,7 @@ HRESULT CommandList::Create(const ResourceContext& context, IUnknown* parent, D3
     }
     *list = nullptr;
     CommandList* created = new CommandList(context, parent, type);
+    created->ProtectHead(true);
     if (!created->Begin(allocator, initial, error)) {
         created->Release();
         return E_INVALIDARG;
@@ -85,15 +133,20 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
         return false;
     }
     commands_ = commands;
+    profileGeneration_ = GpuProfile::BeginList(commands, profileList_);
     allocator_ = pool;
     closed_ = false;
     targetsSet_ = false;
     emptyTargets_ = 0;
     depthHandleGiven_ = false;
     states_.clear();
+    readbackWritten_.clear();
     copied_ = false;
     rendering_ = false;
     rectangles_ = false;
+    viewports_.clear();
+    scissors_.clear();
+    topology_.reset();
     graphicsSetBound_ = false;
     computeSetBound_ = false;
     ResetBindings();
@@ -122,7 +175,155 @@ void CommandList::BindTitleSet(VkPipelineBindPoint point) {
     bound = true;
 }
 
-void CommandList::PushUserData(RootArguments& arguments, std::uint32_t firstSgpr, const char* function) {
+namespace {
+
+constexpr std::uint32_t kCodeBaseWord = 34;
+constexpr std::size_t kCodeBlockBytes = 4u << 20;
+constexpr std::size_t kCodeAlignment = 256;
+
+std::filesystem::path CodeBlobPath(const std::filesystem::path& module) {
+    std::filesystem::path stem = module.stem();
+    return module.parent_path().parent_path() / L"dxbc" / L"fssm" / stem.concat(L".fssm");
+}
+
+std::uint64_t PlaceCodeBlob(const std::filesystem::path& module, TitleAddressSpace& addresses, std::string& error) {
+    static std::mutex lock;
+    static std::map<std::filesystem::path, std::uint64_t> placed;
+    static std::uintptr_t block = 0;
+    static std::size_t blockUsed = 0;
+    static std::size_t blockSize = 0;
+    static std::uint64_t totalBytes = 0;
+    const std::lock_guard guard(lock);
+    const auto found = placed.find(module);
+    if (found != placed.end()) return found->second;
+    const std::filesystem::path path = CodeBlobPath(module);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        error = "its code blob " + path.string() + " cannot be opened";
+        return 0;
+    }
+    const std::streamoff length = file.tellg();
+    if (length < 16 || static_cast<std::uint64_t>(length) > kCodeBlockBytes) {
+        error = "its code blob " + path.string() + " has an implausible size of " + std::to_string(length) + " bytes";
+        return 0;
+    }
+    std::vector<char> bytes(static_cast<std::size_t>(length));
+    file.seekg(0);
+    if (!file.read(bytes.data(), length) || file.gcount() != length) {
+        error = "its code blob " + path.string() + " could not be read in full";
+        return 0;
+    }
+    if (std::memcmp(bytes.data(), "FSSM", 4) != 0) {
+        error = "its code blob " + path.string() + " does not start with FSSM";
+        return 0;
+    }
+    const std::size_t start = (blockUsed + kCodeAlignment - 1) & ~(kCodeAlignment - 1);
+    if (block == 0 || start > blockSize || bytes.size() > blockSize - start) {
+        const std::uintptr_t fresh = CommandAllocator::ReserveHigh(kCodeBlockBytes, error);
+        if (fresh == 0) {
+            error = "no memory for code blobs: " + error;
+            return 0;
+        }
+        if (!addresses.Import(fresh, kCodeBlockBytes, error)) {
+            VirtualFree(reinterpret_cast<void*>(fresh), 0, MEM_RELEASE);
+            error = "importing code blob memory for the GPU failed: " + error;
+            return 0;
+        }
+        block = fresh;
+        blockSize = kCodeBlockBytes;
+        blockUsed = 0;
+    }
+    const std::size_t at = (blockUsed + kCodeAlignment - 1) & ~(kCodeAlignment - 1);
+    std::memcpy(reinterpret_cast<void*>(block + at), bytes.data(), bytes.size());
+    blockUsed = at + bytes.size();
+    const std::uint64_t address = block + at;
+    placed.emplace(module, address);
+    totalBytes += bytes.size();
+    const std::size_t count = placed.size();
+    if (count == 1 || (count & (count - 1)) == 0) {
+        AbxLog("d3d12_x", "shaders that read constants from their own code get their whole code blob (the store's .fssm file) in GPU-visible memory, its address as the code base in "
+                          "push words 34-35 (%zu blob(s) so far, %llu KiB; latest %s at 0x%llx)",
+               count, static_cast<unsigned long long>(totalBytes >> 10), path.filename().string().c_str(), static_cast<unsigned long long>(address));
+    }
+    return address;
+}
+
+}
+
+bool CommandList::ResolveCodeBase(const char* function, std::string& reason) {
+    if (pipeline_->CodeBase() != 0) return true;
+    const std::vector<std::filesystem::path>& modules = pipeline_->CodeBaseModules();
+    if (modules.size() != 1) {
+        reason = modules.empty() ? "its shaders read constants from their own code, but which stage does is not known"
+                                 : "two of its stages read constants from their own code, and one push block holds only one code base";
+        return false;
+    }
+    if (context_.addresses == nullptr) AbxUnsupported(function, "a code base on a device without a title address space");
+    std::string error;
+    const std::uint64_t address = PlaceCodeBlob(modules.front(), *context_.addresses, error);
+    if (address == 0) {
+        reason = "its shaders read constants from their own code, and " + error;
+        return false;
+    }
+    pipeline_->SetCodeBase(address);
+    return true;
+}
+
+namespace {
+
+constexpr std::size_t kTrapPage = 0x1000;
+std::size_t TrapBytes(std::size_t size) {
+    return kTrapPage + ((size - sizeof(void*) + kTrapPage - 1) & ~(kTrapPage - 1));
+}
+
+}
+
+void* CommandList::operator new(std::size_t size) {
+    static_assert(alignof(CommandList) <= sizeof(void*));
+    void* const base = VirtualAlloc(nullptr, TrapBytes(size), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (base == nullptr) throw std::bad_alloc();
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "DIAG command lists are placed with their vtable pointer as the last 8 bytes of a read-only page, so a stray write there faults in the writer "
+                          "(anybox-crash-raw.txt has its frames)");
+    }
+    return static_cast<unsigned char*>(base) + kTrapPage - sizeof(void*);
+}
+
+void CommandList::operator delete(void* object) {
+    if (object == nullptr) return;
+    VirtualFree(static_cast<unsigned char*>(object) - (kTrapPage - sizeof(void*)), 0, MEM_RELEASE);
+}
+
+void CommandList::ProtectHead(bool readOnly) {
+    void* const page = reinterpret_cast<unsigned char*>(this) - (kTrapPage - sizeof(void*));
+    DWORD previous = 0;
+    if (!VirtualProtect(page, kTrapPage, readOnly ? PAGE_READONLY : PAGE_READWRITE, &previous)) {
+        AbxLog("d3d12_x", "DIAG the command list write trap could not change protection (error %lu)", GetLastError());
+    }
+}
+
+void CommandList::BeforeDelete() {
+    ProtectHead(false);
+}
+
+void CommandList::ReportDamage(const char* function) const {
+    const auto* here = reinterpret_cast<const unsigned char*>(&context_);
+    std::string dump;
+    char text[96];
+    for (std::ptrdiff_t at = -0x40; at < static_cast<std::ptrdiff_t>(sizeof(context_)) + 0x40; at += 8) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, here + at, sizeof(word));
+        std::snprintf(text, sizeof(text), " %+td=%016llx", at, static_cast<unsigned long long>(word));
+        dump += text;
+    }
+    AbxLog("d3d12_x", "DIAG damaged command list %p in %s: alive tag 0x%08x (0x%08x when alive), context device %p window %p arena %p title memory %p bindless %p addresses %p; words around the context:%s",
+           static_cast<const void*>(this), function, alive_, kAlive, static_cast<const void*>(&context_.device), static_cast<const void*>(&context_.window),
+           static_cast<const void*>(&context_.arena), static_cast<const void*>(context_.titleMemory), static_cast<const void*>(context_.bindless),
+           static_cast<const void*>(context_.addresses), dump.c_str());
+}
+
+void CommandList::PushUserData(RootArguments& arguments, std::uint32_t firstSgpr, const char* function, std::uint32_t threadLimit) {
     if (!arguments.pending.empty() && pipeline_ != nullptr && pipeline_->Signature() != nullptr && pipeline_->Signature() != arguments.signature) {
         arguments.signature = pipeline_->Signature();
         ApplyPending(arguments);
@@ -140,16 +341,44 @@ void CommandList::PushUserData(RootArguments& arguments, std::uint32_t firstSgpr
     }
     std::array<std::uint32_t, kPushWords> block{};
     const std::uint32_t words = arguments.signature != nullptr ? arguments.signature->Layout().words : 0;
-    if (words > kUserSgprs - firstSgpr) {
+    const std::uint32_t indexing = HeapIndexing(arguments.signature);
+    const bool resourceIndexed = (indexing & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) != 0;
+    const bool samplerIndexed = (indexing & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) != 0;
+    if (words > kUserSgprs - firstSgpr || (resourceIndexed ? 1u : 0u) + (samplerIndexed ? 1u : 0u) > kUserSgprs - firstSgpr - words) {
         AbxUnsupported(function, "a root signature whose words do not fit in the user SGPRs after the driver's reserved ones; the console's spill layout is not measured");
     }
     std::copy_n(arguments.words.begin(), words, block.begin() + firstSgpr);
+    if (threadLimit != 0) {
+        if (firstSgpr + words + (resourceIndexed ? 1u : 0u) + (samplerIndexed ? 1u : 0u) > kThreadLimitSgpr) {
+            AbxUnsupported(function, "a thread-count dispatch whose root signature fills the user SGPR that carries the thread limit");
+        }
+        block[kThreadLimitSgpr] = threadLimit;
+    }
+    if (indexing != 0) {
+        std::uint32_t next = firstSgpr + words;
+        const std::uint32_t resourceAt = resourceIndexed ? next++ : 0;
+        const std::uint32_t samplerAt = samplerIndexed ? next++ : 0;
+        if (resourceIndexed) block[resourceAt] = HeapBaseWord(shaderResourceHeap_, function);
+        if (samplerIndexed) block[samplerAt] = HeapBaseWord(samplerHeap_, function);
+        static std::atomic<std::uint32_t> reported{0};
+        const std::uint32_t bit = 1u << (((indexing >> 10) & 3u) + (firstSgpr == kComputeFirstRootSgpr ? 4u : 0u));
+        if ((reported.fetch_or(bit) & bit) == 0) {
+            AbxLog("d3d12_x", "directly indexed descriptor heaps (root signature flags 0x%x, %u root words from s%u): resource heap base 0x%x %s%u, sampler heap base 0x%x %s%u, "
+                              "right after the root words in that order, as the title's shaders read them (first by %s)",
+                   indexing, words, firstSgpr, resourceIndexed ? block[resourceAt] : 0u, resourceIndexed ? "in s" : "not passed, s", resourceAt,
+                   samplerIndexed ? block[samplerAt] : 0u, samplerIndexed ? "in s" : "not passed, s", samplerAt, function);
+        }
+    }
     if (context_.addresses == nullptr) {
+        ReportDamage(function);
         AbxUnsupported(function, "a draw or dispatch on a device without a title address space");
     }
     const std::uint64_t table = context_.addresses->RootTable();
     block[kPageTableWord] = static_cast<std::uint32_t>(table);
     block[kPageTableWord + 1] = static_cast<std::uint32_t>(table >> 32);
+    const std::uint64_t codeBase = pipeline_ != nullptr ? pipeline_->CodeBase() : 0;
+    block[kCodeBaseWord] = static_cast<std::uint32_t>(codeBase);
+    block[kCodeBaseWord + 1] = static_cast<std::uint32_t>(codeBase >> 32);
     std::string error;
     Check(Recorder(function).SetPushConstants(block.data(), static_cast<std::uint32_t>(block.size() * sizeof(std::uint32_t)), error), function, error);
 }
@@ -169,6 +398,14 @@ void NoteComputeSkip(const PipelineStateObject& pipeline, const char* reason) {
     AbxLog("d3d12_x", "DIAG first skip of compute shader %s: %s", shader.substr(0, 22).c_str(), reason);
 }
 
+bool DrawsWaitForPipelines() {
+    static const bool enabled = [] {
+        const char* value = AbxSetting("d3d12_x.draws_wait_for_pipelines");
+        return value == nullptr || !(value[0] == '0' && value[1] == 0);
+    }();
+    return enabled;
+}
+
 bool IndirectDispatchGuarded() {
     static const bool enabled = [] {
         const char* value = AbxSetting("d3d12_x.indirect_dispatch_guard");
@@ -185,7 +422,7 @@ bool CommandList::SkippedWork(const char* function) {
     static const char* const kReasons[Count] = {
         "its pipeline is still being built in the background",
         "its pipeline has no Vulkan pipeline",
-        "its shaders read constants from their own code, and placing shader code in title memory is not implemented",
+        "its shaders read constants from their own code, and AnyBox cannot give them a code base",
     };
     static std::atomic<std::uint64_t> skipped[Count]{};
     Reason reason = Count;
@@ -197,13 +434,31 @@ bool CommandList::SkippedWork(const char* function) {
                    static_cast<unsigned long long>(count));
         }
         pipeline_->BuildNow();
+    } else if (pipeline_->Pending() && DrawsWaitForPipelines()) {
+        static std::atomic<std::uint64_t> waited{0};
+        const std::uint64_t count = ++waited;
+        if (count == 1 || (count & (count - 1)) == 0) {
+            AbxLog("d3d12_x", "a draw whose pipeline is still being built waits for that build instead of being skipped, as a title that draws something once (a lookup "
+                              "table it renders while it starts) never gets it otherwise (%llu so far; d3d12_x.draws_wait_for_pipelines = 0 skips such draws again)",
+                   static_cast<unsigned long long>(count));
+        }
+        pipeline_->BuildNow();
     }
     if (pipeline_->Pending()) {
         reason = Pending;
         pipeline_->Prioritize();
     }
     else if (pipeline_->Pipeline() == VK_NULL_HANDLE) reason = Unbuilt;
-    else if (pipeline_->UsesCodeBase()) reason = CodeBase;
+    else if (pipeline_->UsesCodeBase()) {
+        std::string why;
+        if (!ResolveCodeBase(function, why)) {
+            reason = CodeBase;
+            static std::mutex whyLock;
+            static std::set<std::string> told;
+            const std::lock_guard guard(whyLock);
+            if (told.size() < 64 && told.insert(why).second) AbxLog("d3d12_x", "DIAG no code base for %s: %s", pipeline_->Shaders().empty() ? "(no shader)" : pipeline_->Shaders().front().c_str(), why.c_str());
+        }
+    }
     static const int diagSkip = [] {
         char value[16] = {};
         GetEnvironmentVariableA("ANYBOX_DIAG_SKIP", value, sizeof(value));
@@ -216,10 +471,12 @@ bool CommandList::SkippedWork(const char* function) {
         std::string name;
         for (const std::string& shader : pipeline_->Shaders()) name += (name.empty() ? "" : " ") + shader.substr(0, 20);
         const std::lock_guard guard(markerLock);
+        if (checkpointDetail_ != nullptr && markers.size() < 200000) name += checkpointDetail_;
         Recorder(function).Checkpoint(markers.insert(std::string(function) + " " + name).first->c_str());
     }
     if (TracingFrame()) {
         for (Resource* target : targetResources_) NoteTracedTarget(target);
+        if (depthStencil_) NoteTracedDepth(depthResource_);
         std::string targets;
         for (const Resource* target : targetResources_) {
             char text[96];
@@ -234,22 +491,47 @@ bool CommandList::SkippedWork(const char* function) {
         }
         std::string shaders;
         for (const std::string& shader : pipeline_->Shaders()) shaders += " " + shader.substr(0, 19);
-        AbxLog("d3d12_x", "TRACE %s%s%s | targets%s%s%s", function, shaders.c_str(), reason == Count ? "" : (" SKIPPED: " + pipeline_->UnbuiltReason()).c_str(),
-               targets.c_str(), depthStencil_ ? " +depth" : "", rectangles_ ? " rects" : "");
-        const RootArguments& arguments = pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE ? compute_ : graphics_;
+        const unsigned list = static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu);
+        const bool computeTraced = pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE;
+        std::string everyShader;
+        for (const std::string& shader : pipeline_->Shaders()) everyShader += shader + " ";
+        const bool watched = WatchedShader(everyShader);
+        AbxLog("d3d12_x", "TRACE %s%s%s | targets%s%s%s | list %04x", function, shaders.c_str(), reason == Count ? "" : (" SKIPPED: " + pipeline_->UnbuiltReason()).c_str(),
+               targets.c_str(), depthStencil_ ? " +depth" : "", rectangles_ ? " rects" : "", list);
+        const RootArguments& arguments = computeTraced ? compute_ : graphics_;
+        {
+            const std::uint32_t rootWords = arguments.signature != nullptr ? arguments.signature->Layout().words : 0;
+            std::string user;
+            for (std::uint32_t word = 0; word < rootWords && word < arguments.words.size(); ++word) {
+                char piece[16];
+                std::snprintf(piece, sizeof(piece), " %08x", arguments.words[word]);
+                user += piece;
+            }
+            AbxLog("d3d12_x", "TRACE     user data, %u root words from s%u:%s; heap indexing flags 0x%x, resource heap 0x%llx, sampler heap 0x%llx | list %04x", rootWords,
+                   computeTraced ? kComputeFirstRootSgpr : kGraphicsFirstRootSgpr, user.c_str(), HeapIndexing(arguments.signature),
+                   static_cast<unsigned long long>(shaderResourceHeap_ != nullptr ? shaderResourceHeap_->GpuStart().ptr : 0),
+                   static_cast<unsigned long long>(samplerHeap_ != nullptr ? samplerHeap_->GpuStart().ptr : 0), list);
+            if (!pipeline_->Shaders().empty() && (computeTraced || watched)) {
+                DumpTracedBuffers(context_.addresses, computeTraced ? pipeline_->Shaders().front() : everyShader, list, arguments.words.data(),
+                                  (std::min)(static_cast<std::size_t>(rootWords), arguments.words.size()));
+            }
+        }
         {
             UINT increment = 0;
             const std::uint8_t* table = DescriptorHeap::AtGpuAddress(arguments.words[0], increment);
             if (table != nullptr) {
                 std::uint32_t slots[16] = {};
                 std::memcpy(slots, table, sizeof(slots));
-                AbxLog("d3d12_x", "TRACE     table 0x%x at record: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x", arguments.words[0], slots[0], slots[1],
-                       slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15]);
+                AbxLog("d3d12_x", "TRACE     table 0x%x at record: %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | list %04x", arguments.words[0],
+                       slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14],
+                       slots[15], list);
                 NoteTracedTable(arguments.words[0]);
                 const std::uint64_t base = (static_cast<std::uint64_t>(slots[0]) | (static_cast<std::uint64_t>(slots[1] & 0xFFFF) << 32));
                 if (context_.addresses != nullptr && base != 0) {
-                    AbxLog("d3d12_x", "TRACE     V# base 0x%llx (%u bytes) is %s the GPU page table: %s", static_cast<unsigned long long>(base), slots[2],
-                           context_.addresses->Contains(base, slots[2]) ? "in" : "NOT in", context_.addresses->DescribeTitleAddress(base).c_str());
+                    const std::uint64_t recordBytes = static_cast<std::uint64_t>((std::max)(slots[1] >> 16, 1u)) * slots[2];
+                    AbxLog("d3d12_x", "TRACE     V# base 0x%llx (%u bytes) is %s the GPU page table: %s%s | list %04x", static_cast<unsigned long long>(base), slots[2],
+                           context_.addresses->Contains(base, slots[2]) ? "in" : "NOT in", context_.addresses->DescribeTitleAddress(base).c_str(),
+                           TitleWordsText(context_.addresses, base, recordBytes).c_str(), list);
                 }
             }
         }
@@ -257,16 +539,30 @@ bool CommandList::SkippedWork(const char* function) {
             UINT increment = 0;
             const std::uint8_t* table = DescriptorHeap::AtGpuAddress(arguments.words[word], increment);
             if (table == nullptr || increment < 32) continue;
-            for (UINT slot = 0; slot < 6; ++slot) {
+            const UINT slotLimit = watched ? 192u : 12u;
+            for (UINT slot = 0; slot < slotLimit; ++slot) {
+                UINT slotIncrement = 0;
+                const std::uint8_t* at = DescriptorHeap::AtGpuAddress(static_cast<std::uint64_t>(arguments.words[word]) + static_cast<std::uint64_t>(slot) * increment, slotIncrement);
+                if (at == nullptr) break;
                 std::uint32_t descriptor[8] = {};
-                std::memcpy(descriptor, table + static_cast<std::size_t>(slot) * increment, sizeof(descriptor));
+                std::memcpy(descriptor, at, sizeof(descriptor));
                 if ((descriptor[3] >> 28) < 8) continue;
-                AbxLog("d3d12_x", "TRACE     root word %zu slot %u: %s", word, slot, DescriptorWriter::DescribeImageWords(descriptor).c_str());
+                Resource* read = nullptr;
+                int readFormat = 0;
+                const std::string described = DescriptorWriter::DescribeImageWords(descriptor, &read, &readFormat);
+                AbxLog("d3d12_x", "TRACE     root word %zu slot %u: %s | list %04x", word, slot, described.c_str(), list);
+                if (computeTraced && read != nullptr && (readFormat == static_cast<int>(DXGI_FORMAT_R32_FLOAT) || readFormat == static_cast<int>(DXGI_FORMAT_R32_TYPELESS))) {
+                    NoteTracedInput(read);
+                } else if (read != nullptr) {
+                    NoteTracedRead(read);
+                }
+                if (watched && read != nullptr) NoteWatchedRead(read);
             }
         }
     }
     if (reason == Count) {
         ++(pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE ? Stats().dispatches : Stats().draws);
+        if (profileGeneration_ != 0) GpuProfile::MarkWork(commands_, profileGeneration_, profileList_, function, pipeline_->Shaders());
         if (!pipelineBound_) {
             Recorder(function).BindPipeline(pipeline_->BindPoint(), pipeline_->Pipeline());
             pipelineBound_ = true;
@@ -295,6 +591,15 @@ bool CommandList::PrepareDraw(const char* function) {
         Recorder(function).SetPolygonMode(rectangles_ ? VK_POLYGON_MODE_FILL_RECTANGLE_NV : pipeline_->PolygonMode());
     } else if (rectangles_) {
         AbxUnsupported(function, "a rectangle list on a device without VK_NV_fill_rectangle and dynamic polygon mode");
+    }
+    if (depthStencil_ && depthResource_ != nullptr) {
+        if (Resource::DepthShadow* const shadow = depthResource_->DepthShadowOf()) {
+            const GraphicsDescription* const description = pipeline_->Description();
+            const bool readOnly = (static_cast<UINT>(depthStencil_->readOnly) & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
+            const bool writes = description == nullptr || (description->desc.DepthStencilState.DepthEnable != FALSE &&
+                                                           description->desc.DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL);
+            if (!readOnly && writes) shadow->planeNewer.store(true, std::memory_order_relaxed);
+        }
     }
     PushUserData(graphics_, kGraphicsFirstRootSgpr, function);
     BindTitleSet(VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -342,6 +647,11 @@ bool CommandList::PrepareDraw(const char* function) {
     std::string error;
     Check(Recorder(function).BeginRendering(padded.empty() ? renderTargets_ : padded, depthStencil_ ? &*depthStencil_ : nullptr, extent, layers, error), function, error);
     rendering_ = true;
+    for (Resource* const target : targetResources_) {
+        if (target != nullptr && target->ReadBack() && std::find(readbackWritten_.begin(), readbackWritten_.end(), target) == readbackWritten_.end()) {
+            readbackWritten_.push_back(target);
+        }
+    }
     return true;
 }
 
@@ -385,6 +695,7 @@ void CommandList::BindPipeline(ID3D12PipelineState* state, const char* function)
         AbxUnsupported(function, "a graphics pipeline state on a compute or copy command list");
     }
     pipelineBound_ = false;
+    ours->NoteBound();
     if (ours->Pipeline() != VK_NULL_HANDLE) {
         Recorder(function).BindPipeline(ours->BindPoint(), ours->Pipeline());
         pipelineBound_ = true;
@@ -513,7 +824,18 @@ HRESULT STDMETHODCALLTYPE CommandList::Close() {
     if (closed_) {
         return E_FAIL;
     }
+    const TimedScope timed(TimedPart::ListClose);
     EndPass();
+    std::vector<Resource*> closing;
+    closing.swap(readbackWritten_);
+    for (const auto& [key, state] : states_) {
+        if (state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS || (key.second != kAllSubresources && key.second != 0) || key.first->IsBuffer() || !key.first->ReadBack()) continue;
+        Resource* const texture = const_cast<Resource*>(key.first);
+        if (std::find(closing.begin(), closing.end(), texture) == closing.end()) closing.push_back(texture);
+    }
+    for (Resource* const target : closing) {
+        RecordReadback(target, StateOf(target, 0, D3D12_RESOURCE_STATE_RENDER_TARGET), "ID3D12GraphicsCommandList::Close");
+    }
     closed_ = true;
     VkMemoryBarrier2 host{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     host.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -524,6 +846,7 @@ HRESULT STDMETHODCALLTYPE CommandList::Close() {
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &host;
     context_.device.Vk().cmdPipelineBarrier2(commands_, &dependency);
+    if (profileGeneration_ != 0) GpuProfile::EndList(commands_, profileGeneration_, profileList_);
     return context_.device.Vk().endCommandBuffer(commands_) == VK_SUCCESS ? S_OK : E_FAIL;
 }
 
@@ -610,6 +933,7 @@ void CommandList::ReportRootState(const RootArguments& arguments, const char* fu
 
 void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT vertices, UINT instances, UINT firstVertex, UINT firstInstance) {
     const char* function = "ID3D12GraphicsCommandList::DrawInstanced";
+    const TimedScope timed(TimedPart::ListWork);
     if (!PrepareDraw(function)) return;
     Recorder(function).Draw(vertices, instances, firstVertex, firstInstance);
     if (TracingFrame()) {
@@ -641,6 +965,7 @@ void STDMETHODCALLTYPE CommandList::DrawInstanced(UINT vertices, UINT instances,
 
 void STDMETHODCALLTYPE CommandList::DrawIndexedInstanced(UINT indices, UINT instances, UINT firstIndex, INT baseVertex, UINT firstInstance) {
     const char* function = "ID3D12GraphicsCommandList::DrawIndexedInstanced";
+    const TimedScope timed(TimedPart::ListWork);
     if (!PrepareDraw(function)) return;
     Recorder(function).DrawIndexed(indices, instances, firstIndex, baseVertex, firstInstance);
     if (TracingFrame()) {
@@ -692,9 +1017,42 @@ void STDMETHODCALLTYPE CommandList::DrawIndexedInstanced(UINT indices, UINT inst
 
 void CommandList::DispatchMesh(UINT x, UINT y, UINT z) {
     const char* function = "D3D12 command list slot 129 (DispatchMesh)";
-    if (!PrepareDraw(function)) return;
+    const TimedScope timed(TimedPart::ListWork);
+    char groups[64];
+    std::snprintf(groups, sizeof(groups), ", %u x %u x %u groups", x, y, z);
+    checkpointDetail_ = groups;
+    const bool prepared = PrepareDraw(function);
+    checkpointDetail_ = nullptr;
+    if (!prepared) return;
     const std::uint32_t* limits = context_.device.MeshMaxGroups();
     const std::uint64_t total = std::uint64_t{x} * y * z;
+    const auto shaders = [this] {
+        std::string names;
+        for (const std::string& shader : pipeline_->Shaders()) names += (names.empty() ? "" : " ") + shader.substr(0, 20);
+        return names;
+    };
+    static std::atomic<std::uint64_t> largest{0};
+    std::uint64_t seen = largest.load();
+    while (total > seen && total >= 2 * seen) {
+        if (!largest.compare_exchange_weak(seen, total)) continue;
+        AbxLog("d3d12_x", "DIAG the largest direct mesh dispatch so far: %u x %u x %u = %llu groups, %s (logged each time the largest at least doubles)", x, y, z,
+               static_cast<unsigned long long>(total), shaders().c_str());
+        break;
+    }
+    static const std::uint64_t groupsMax = [] {
+        const char* value = AbxSetting("d3d12_x.mesh_groups_max");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    if (groupsMax != 0 && total > groupsMax) {
+        ++Stats().skippedOther;
+        static std::atomic<std::uint64_t> capped{0};
+        const std::uint64_t count = ++capped;
+        if (count == 1 || (count & (count - 1)) == 0) {
+            AbxLog("d3d12_x", "a mesh dispatch of %u x %u x %u = %llu groups is past d3d12_x.mesh_groups_max (%llu) and is skipped: %s (%llu so far)", x, y, z,
+                   static_cast<unsigned long long>(total), static_cast<unsigned long long>(groupsMax), shaders().c_str(), static_cast<unsigned long long>(count));
+        }
+        return;
+    }
     if (x > limits[0] || y > limits[1] || z > limits[2] || total > context_.device.MeshMaxTotal()) {
         ++Stats().skippedOther;
         static std::atomic<std::uint64_t> over{0};
@@ -707,6 +1065,7 @@ void CommandList::DispatchMesh(UINT x, UINT y, UINT z) {
     }
     std::string error;
     Check(Recorder(function).DrawMesh(x, y, z, error), function, error);
+    if (TracingFrame()) AbxLog("d3d12_x", "TRACE   DispatchMesh(%u x %u x %u groups) %s", x, y, z, shaders().c_str());
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true)) {
         AbxLog("d3d12_x", "mesh dispatches run as Vulkan mesh shader draws, with the mesh stage's root words moved from s16 to s8 where the pixel stage reads them (first: %u x %u x %u)", x,
@@ -717,12 +1076,17 @@ void CommandList::DispatchMesh(UINT x, UINT y, UINT z) {
 
 void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z) {
     const char* function = "ID3D12GraphicsCommandList::Dispatch";
+    const TimedScope timed(TimedPart::ListWork);
     EndPass();
     if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_COMPUTE) {
         AbxUnsupported(function, pipeline_ == nullptr ? "a dispatch with no pipeline state set on this command list since its last reset"
                                                       : ("a dispatch while a graphics pipeline state is set: " + std::string(pipeline_->Shaders().empty() ? pipeline_->UnbuiltReason() : pipeline_->Shaders().front())).c_str());
     }
     if (SkippedWork(function)) return;
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE     Dispatch(%u x %u x %u groups) %s | list %04x", x, y, z, pipeline_->Shaders().empty() ? "" : pipeline_->Shaders().front().substr(0, 19).c_str(),
+               static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+    }
     PushUserData(compute_, kComputeFirstRootSgpr, function);
     BindTitleSet(VK_PIPELINE_BIND_POINT_COMPUTE);
     Recorder(function).Dispatch(x, y, z);
@@ -730,7 +1094,54 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z) {
     if (!reported.exchange(true)) ReportRootState(compute_, "first Dispatch");
 }
 
+void CommandList::DispatchThreads(UINT x, UINT y, UINT z, UINT flags) {
+    const char* function = "D3D12 command list slot 80 (DispatchX)";
+    if ((flags & kDispatchCountsThreads) == 0) {
+        Dispatch(x, y, z);
+        return;
+    }
+    const TimedScope timed(TimedPart::ListWork);
+    EndPass();
+    if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_COMPUTE) {
+        AbxUnsupported(function, pipeline_ == nullptr ? "a dispatch with no pipeline state set on this command list since its last reset" : "a dispatch while a graphics pipeline state is set");
+    }
+    if (SkippedWork(function)) return;
+    std::array<std::uint32_t, 3> size{};
+    std::string error;
+    if (!pipeline_->GroupSize(size, error)) {
+        AbxUnsupported(function, ("a dispatch that counts threads for a compute shader whose thread group size is not known: " + error).c_str());
+    }
+    if (y % size[1] != 0 || z % size[2] != 0) {
+        AbxUnsupported(function, "a dispatch that counts threads and ends in a partial thread group in y or z; only a partial last group in x is limited");
+    }
+    const UINT groups = x / size[0] + (x % size[0] != 0 ? 1u : 0u);
+    const bool partial = x % size[0] != 0;
+    VkPipeline limited = VK_NULL_HANDLE;
+    if (partial) {
+        limited = pipeline_->ThreadLimited(kThreadLimitSgpr, error);
+        if (limited == VK_NULL_HANDLE) {
+            AbxUnsupported(function, ("a dispatch that counts threads and ends in a partial thread group, whose thread-limited pipeline was not built: " + error).c_str());
+        }
+    }
+    static std::atomic<std::uint32_t> reported{0};
+    if (reported.fetch_add(1) < 16) {
+        AbxLog("d3d12_x", "DispatchX with flags 0x%x counts threads: %u x %u x %u threads of %s (thread group %u x %u x %u) run as %u x %u x %u groups%s", flags, x, y, z,
+               pipeline_->Shaders().empty() ? "(no shader)" : pipeline_->Shaders().front().substr(0, 19).c_str(), size[0], size[1], size[2], groups, y / size[1], z / size[2],
+               partial ? ", the threads past the count returning at once" : "");
+    }
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE     DispatchX(%u x %u x %u threads, flags 0x%x) as %u x %u x %u groups %s", x, y, z, flags, groups, y / size[1], z / size[2],
+               pipeline_->Shaders().empty() ? "" : pipeline_->Shaders().front().substr(0, 19).c_str());
+    }
+    PushUserData(compute_, kComputeFirstRootSgpr, function, partial ? x : 0);
+    BindTitleSet(VK_PIPELINE_BIND_POINT_COMPUTE);
+    if (partial) Recorder(function).BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, limited);
+    Recorder(function).Dispatch(groups, y / size[1], z / size[2]);
+    if (partial) pipelineBound_ = false;
+}
+
 void CommandList::CopyMemoryToMemory(std::uint64_t destination, std::uint64_t source, std::uint64_t bytes, const char* function) {
+    const TimedScope timed(TimedPart::ListCopies);
     if (context_.addresses == nullptr) AbxUnsupported(function, "a memory copy on a device without a title address space");
     if (bytes == 0) return;
     if (destination < source + bytes && source < destination + bytes) AbxUnsupported(function, "a memory copy whose source and destination overlap");
@@ -760,7 +1171,7 @@ void CommandList::CopyMemoryToMemory(std::uint64_t destination, std::uint64_t so
 
 std::optional<TitleAddressSpace::Location> CommandList::LocateTitleMemory(std::uint64_t address, std::uint64_t wanted, bool write, std::uint64_t& available, std::uint64_t bytes,
                                                                          const char* function) {
-    std::optional<TitleAddressSpace::Location> found = context_.addresses->LocateRun(address, available);
+    std::optional<TitleAddressSpace::Location> found = context_.addresses->LocateRun(address, available, wanted);
     if (found && available != 0) return found;
     MEMORY_BASIC_INFORMATION region{};
     const bool queried = VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) == sizeof(region);
@@ -784,7 +1195,7 @@ std::optional<TitleAddressSpace::Location> CommandList::LocateTitleMemory(std::u
         AbxLog("d3d12_x", "CopyMemoryToMemoryX reaches title memory the GPU had not been given (first: 0x%llx, %llu bytes, protection 0x%lx); it is imported for the GPU, as all title memory is GPU-visible on the console",
                static_cast<unsigned long long>(address), static_cast<unsigned long long>(span), region.Protect);
     }
-    found = context_.addresses->LocateRun(address, available);
+    found = context_.addresses->LocateRun(address, available, wanted);
     if (!found || available == 0) AbxUnsupported(function, "title memory imported for a memory copy is still not located");
     return found;
 }
@@ -817,6 +1228,7 @@ void CommandList::FillTitleMemory(std::uint64_t destination, std::uint64_t bytes
 }
 
 void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* destination, UINT64 destinationOffset, ID3D12Resource* source, UINT64 sourceOffset, UINT64 bytes) {
+    const TimedScope timed(TimedPart::ListCopies);
     const char* function = "ID3D12GraphicsCommandList::CopyBufferRegion";
     Resource* to = Ours(destination, function);
     Resource* from = Ours(source, function);
@@ -856,6 +1268,11 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
     OrderCopy(function);
     const bool toTexture = destination->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     const bool fromTexture = source->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to->NoteListUse(true);
+    from->NoteListUse(false);
+    if (toTexture && !to->IsBuffer()) {
+        if (Resource::DepthShadow* const shadow = to->DepthShadowOf()) shadow->planeNewer.store(true, std::memory_order_relaxed);
+    }
     if (toTexture && !to->IsBuffer() && to->Texture().desc.Width >= 1024) {
         static std::atomic<int> diag{0};
         if (diag++ < 30) {
@@ -864,6 +1281,18 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
                    fromTexture ? "texture" : "buffer", static_cast<void*>(from), static_cast<int>(source->PlacedFootprint.Footprint.Format), source->PlacedFootprint.Footprint.Width,
                    source->PlacedFootprint.Footprint.Height, source->PlacedFootprint.Footprint.RowPitch, static_cast<unsigned long long>(source->PlacedFootprint.Offset));
         }
+    }
+    if (TracingFrame() && toTexture && !to->IsBuffer()) {
+        const D3D12_RESOURCE_DESC& into = to->Texture().desc;
+        char origin[96];
+        if (fromTexture && !from->IsBuffer()) {
+            std::snprintf(origin, sizeof(origin), "texture %p subresource %u", static_cast<void*>(from->Texture().image), source->SubresourceIndex);
+        } else {
+            std::snprintf(origin, sizeof(origin), "a buffer at title 0x%llx + %llu", static_cast<unsigned long long>(from->TitleAddress()),
+                          static_cast<unsigned long long>(source->PlacedFootprint.Offset));
+        }
+        AbxLog("d3d12_x", "TRACE %s into texture %p %llux%u f%d subresource %u from %s", function, static_cast<void*>(to->Texture().image), static_cast<unsigned long long>(into.Width),
+               into.Height, static_cast<int>(into.Format), destination->SubresourceIndex, origin);
     }
     if (toTexture != to->IsBuffer() && fromTexture != from->IsBuffer()) {
         if (toTexture && fromTexture) {
@@ -908,6 +1337,7 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
 }
 
 void STDMETHODCALLTYPE CommandList::CopyResource(ID3D12Resource* destination, ID3D12Resource* source) {
+    const TimedScope timed(TimedPart::ListCopies);
     const char* function = "ID3D12GraphicsCommandList::CopyResource";
     Resource* to = Ours(destination, function);
     Resource* from = Ours(source, function);
@@ -923,6 +1353,9 @@ void STDMETHODCALLTYPE CommandList::CopyResource(ID3D12Resource* destination, ID
     if (to->IsBuffer() || from->IsBuffer()) {
         AbxUnsupported(function, "a buffer and a texture");
     }
+    if (Resource::DepthShadow* const shadow = to->DepthShadowOf()) shadow->planeNewer.store(true, std::memory_order_relaxed);
+    to->NoteListUse(true);
+    from->NoteListUse(false);
     const TextureRef& target = to->Texture();
     const TextureRef& origin = from->Texture();
     if (target.layout.info.mipLevels != origin.layout.info.mipLevels || target.layout.info.arrayLayers != origin.layout.info.arrayLayers ||
@@ -966,12 +1399,19 @@ void STDMETHODCALLTYPE CommandList::IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOL
     std::string error;
     Check(Recorder(function).SetPrimitiveTopology(topology, false, error), function, error);
     rectangles_ = topology == kConsoleRectangleList;
+    topology_ = topology;
 }
 
 void STDMETHODCALLTYPE CommandList::RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) {
     const char* function = "ID3D12GraphicsCommandList::RSSetViewports";
     if (count != 0 && viewports == nullptr) {
         AbxUnsupported(function, "viewports without a viewport array");
+    }
+    if (count != 0 && TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE     viewport at %g %g, %g x %g, depth %g..%g (%u in all) | list %04x", static_cast<double>(viewports[0].TopLeftX),
+               static_cast<double>(viewports[0].TopLeftY), static_cast<double>(viewports[0].Width), static_cast<double>(viewports[0].Height),
+               static_cast<double>(viewports[0].MinDepth), static_cast<double>(viewports[0].MaxDepth), count,
+               static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
     }
     if (count == 0) {
         Recorder(function);
@@ -980,12 +1420,17 @@ void STDMETHODCALLTYPE CommandList::RSSetViewports(UINT count, const D3D12_VIEWP
     std::string error;
     const std::vector<D3D12_VIEWPORT> list = count != 0 ? std::vector<D3D12_VIEWPORT>(viewports, viewports + count) : std::vector<D3D12_VIEWPORT>{};
     Check(Recorder(function).SetViewports(list, error), function, error);
+    viewports_ = list;
 }
 
 void STDMETHODCALLTYPE CommandList::RSSetScissorRects(UINT count, const D3D12_RECT* rects) {
     const char* function = "ID3D12GraphicsCommandList::RSSetScissorRects";
     if (count != 0 && rects == nullptr) {
         AbxUnsupported(function, "scissor rectangles without a rectangle array");
+    }
+    if (count != 0 && TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE     scissor %ld %ld to %ld %ld (%u in all) | list %04x", static_cast<long>(rects[0].left), static_cast<long>(rects[0].top),
+               static_cast<long>(rects[0].right), static_cast<long>(rects[0].bottom), count, static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
     }
     if (count == 0) {
         Recorder(function);
@@ -994,6 +1439,7 @@ void STDMETHODCALLTYPE CommandList::RSSetScissorRects(UINT count, const D3D12_RE
     std::string error;
     const std::vector<D3D12_RECT> list = count != 0 ? std::vector<D3D12_RECT>(rects, rects + count) : std::vector<D3D12_RECT>{};
     Check(Recorder(function).SetScissors(list, error), function, error);
+    scissors_ = list;
 }
 
 void STDMETHODCALLTYPE CommandList::OMSetBlendFactor(const FLOAT factor[4]) {
@@ -1002,6 +1448,9 @@ void STDMETHODCALLTYPE CommandList::OMSetBlendFactor(const FLOAT factor[4]) {
 }
 
 void STDMETHODCALLTYPE CommandList::OMSetStencilRef(UINT reference) {
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE     stencil reference 0x%x | list %04x", reference, static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+    }
     Recorder("ID3D12GraphicsCommandList::OMSetStencilRef").SetStencilReference(reference);
 }
 
@@ -1027,6 +1476,7 @@ std::optional<UINT> StoredSubresource(const Resource& resource, UINT titleSubres
 }
 
 void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+    const TimedScope timed(TimedPart::ListBarriers);
     const char* function = "ID3D12GraphicsCommandList::ResourceBarrier";
     EndPass();
     if (count != 0 && barriers == nullptr) {
@@ -1059,6 +1509,9 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
             Check(buffer.has_value(), function, error);
             memory.push_back(*buffer);
         } else {
+            constexpr UINT kWritableStates = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                                             D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            resource->NoteListUse((static_cast<UINT>(barrier.Transition.StateAfter) & kWritableStates) != 0);
             const TextureRef& texture = resource->Texture();
             const bool depth = (texture.layout.format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
             std::optional<VkImageMemoryBarrier2> image = ImageTransition(barrier.Transition.StateBefore, barrier.Transition.StateAfter, depth, error);
@@ -1100,6 +1553,115 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
     dependency.pImageMemoryBarriers = images.empty() ? nullptr : images.data();
     context_.device.Vk().cmdPipelineBarrier2(commands_, &dependency);
     copied_ = false;
+    for (UINT index = 0; index < count; ++index) {
+        const D3D12_RESOURCE_BARRIER& barrier = barriers[index];
+        if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+        Resource* const resource = Ours(barrier.Transition.pResource, function);
+        if (resource->IsBuffer() || resource->DepthShadowOf() == nullptr) continue;
+        if (barrier.Transition.Subresource != kAllSubresources && barrier.Transition.Subresource != 0) continue;
+        const bool before = (static_cast<UINT>(barrier.Transition.StateBefore) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
+        const bool after = (static_cast<UINT>(barrier.Transition.StateAfter) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
+        if (before != after) RecordDepthShadow(resource, barrier.Transition.StateAfter, after, function);
+    }
+    for (UINT index = 0; index < count; ++index) {
+        const D3D12_RESOURCE_BARRIER& barrier = barriers[index];
+        if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) continue;
+        Resource* const resource = Ours(barrier.Transition.pResource, function);
+        if (resource->IsBuffer() || !resource->ReadBack()) continue;
+        if (barrier.Transition.Subresource != kAllSubresources && barrier.Transition.Subresource != 0) continue;
+        constexpr UINT kWriteStates = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        const auto drawn = std::find(readbackWritten_.begin(), readbackWritten_.end(), resource);
+        if (drawn == readbackWritten_.end() && (static_cast<UINT>(barrier.Transition.StateBefore) & kWriteStates) == 0) continue;
+        if (drawn != readbackWritten_.end()) readbackWritten_.erase(drawn);
+        RecordReadback(resource, barrier.Transition.StateAfter, function);
+    }
+}
+
+void CommandList::RecordDepthShadow(Resource* resource, D3D12_RESOURCE_STATES state, bool enters, const char* function) {
+    Resource::DepthShadow* const shadow = resource->DepthShadowOf();
+    if (shadow == nullptr) return;
+    if ((Resource::DepthUnorderedAccess() & 4ul) != 0) return;
+    if (enters && !shadow->planeNewer.exchange(false)) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            AbxLog("d3d12_x", "%s: the depth plane of the texture at title 0x%llx enters the unordered access state as its unordered access image left it (no draw, clear or copy "
+                              "wrote the plane since), so nothing is copied; later such barriers are not logged",
+                   function, static_cast<unsigned long long>(resource->TextureAddress()));
+        }
+        return;
+    }
+    EndPass();
+    const DeviceFunctions& vk = context_.device.Vk();
+    CommandRecorder recorder(context_.device, commands_);
+    const D3D12_RESOURCE_STATES workState = enters ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    std::string error;
+    static std::atomic<std::uint64_t> recorded{0};
+    const std::uint64_t number = ++recorded;
+    if (state != workState && !recorder.Transition(resource->Texture(), state, workState, error)) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1) < 8) {
+            AbxLog("d3d12_x", "%s: the depth plane of the texture at title 0x%llx was not brought in step with its unordered access image (state 0x%x): %s", function,
+                   static_cast<unsigned long long>(resource->TextureAddress()), static_cast<unsigned>(state), error.c_str());
+        }
+        if (enters) shadow->planeNewer.store(true, std::memory_order_relaxed);
+        return;
+    }
+    VkMemoryBarrier2 all{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    all.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    all.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    all.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    all.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo between{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    between.memoryBarrierCount = 1;
+    between.pMemoryBarriers = &all;
+    vk.cmdPipelineBarrier2(commands_, &between);
+    if (context_.device.Checkpoints()) {
+        recorder.Checkpoint(enters ? "ResourceBarrier: a depth plane copied into its unordered access image" : "ResourceBarrier: a depth plane drawn from its unordered access image");
+    }
+    if (enters) {
+        VkBufferImageCopy color{};
+        color.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        color.imageExtent = shadow->extent;
+        VkBufferImageCopy depth = color;
+        depth.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        vk.cmdCopyImageToBuffer(commands_, resource->Texture().image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shadow->staging.buffer, 1, &depth);
+        vk.cmdPipelineBarrier2(commands_, &between);
+        vk.cmdCopyBufferToImage(commands_, shadow->staging.buffer, shadow->image, VK_IMAGE_LAYOUT_GENERAL, 1, &color);
+    } else {
+        shadow->pass->Record(commands_, shadow->pipeline, shadow->source, shadow->plane, shadow->stencil, {shadow->extent.width, shadow->extent.height},
+                             type_ != D3D12_COMMAND_LIST_TYPE_DIRECT);
+        shadow->planeNewer.store(false, std::memory_order_relaxed);
+        pipelineBound_ = false;
+        graphicsSetBound_ = false;
+        if (!viewports_.empty()) Check(recorder.SetViewports(viewports_, error), function, error);
+        if (!scissors_.empty()) Check(recorder.SetScissors(scissors_, error), function, error);
+        if (topology_) Check(recorder.SetPrimitiveTopology(*topology_, false, error), function, error);
+    }
+    vk.cmdPipelineBarrier2(commands_, &between);
+    if (state != workState && !recorder.Transition(resource->Texture(), workState, state, error)) {
+        AbxUnsupported(function, ("a depth texture could not be returned to its state after its unordered access image was brought in step: " + error).c_str());
+    }
+    copied_ = false;
+    if (number <= 4 || (number & (number - 1)) == 0) {
+        AbxLog("d3d12_x", "%s: the depth plane of the texture at title 0x%llx %s its unordered access image (%ux%u, state after 0x%x, %llu such steps so far)", function,
+               static_cast<unsigned long long>(resource->TextureAddress()), enters ? "was copied into" : "was drawn from", shadow->extent.width, shadow->extent.height,
+               static_cast<unsigned>(state), static_cast<unsigned long long>(number));
+    }
+}
+
+void CommandList::RecordReadback(Resource* resource, D3D12_RESOURCE_STATES state, const char* function) {
+    TextureReadback* const readback = TextureReadback::Active();
+    if (readback == nullptr) return;
+    EndPass();
+    std::string error;
+    if (readback->Record(*resource, state, commands_, error)) return;
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1) < 8) {
+        const D3D12_RESOURCE_DESC& desc = resource->Texture().desc;
+        AbxLog("d3d12_x", "%s: the copy of a small GPU-written texture (%llux%u, format %d, title address 0x%llx, state 0x%x) back to title memory was not recorded: %s", function,
+               static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<int>(desc.Format), static_cast<unsigned long long>(resource->TextureAddress()),
+               static_cast<unsigned>(state), error.c_str());
+    }
 }
 
 void STDMETHODCALLTYPE CommandList::ExecuteBundle(ID3D12GraphicsCommandList*) { AbxUnsupported("ID3D12GraphicsCommandList::ExecuteBundle", "bundles"); }
@@ -1256,9 +1818,13 @@ void STDMETHODCALLTYPE CommandList::OMSetRenderTargets(UINT count, const D3D12_C
         targetResources.push_back(record.kind == HeapEntry::RenderTarget ? record.resource : nullptr);
     }
     std::optional<AttachmentRef> depth;
+    Resource* depthResource = nullptr;
     if (depthStencil != nullptr) {
         const DescriptorRecord& record = Attachment(*depthStencil, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, function);
-        if (record.kind == HeapEntry::DepthStencil) depth = record.attachment;
+        if (record.kind == HeapEntry::DepthStencil) {
+            depth = record.attachment;
+            depthResource = record.resource;
+        }
     }
     targetsSet_ = true;
     emptyTargets_ = 0;
@@ -1267,9 +1833,15 @@ void STDMETHODCALLTYPE CommandList::OMSetRenderTargets(UINT count, const D3D12_C
     renderTargets_ = std::move(colors);
     targetResources_ = std::move(targetResources);
     depthStencil_ = depth;
+    depthResource_ = depthResource;
+    for (Resource* const target : targetResources_) {
+        if (target != nullptr) target->NoteListUse(true);
+    }
+    if (depthResource_ != nullptr) depthResource_->NoteListUse(true);
 }
 
 void STDMETHODCALLTYPE CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT count, const D3D12_RECT* rects) {
+    const TimedScope timed(TimedPart::ListCopies);
     const char* function = "ID3D12GraphicsCommandList::ClearDepthStencilView";
     EndPass();
     if (count != 0 && rects == nullptr) {
@@ -1282,9 +1854,19 @@ void STDMETHODCALLTYPE CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_H
     std::string error;
     const std::vector<D3D12_RECT> list = count != 0 ? std::vector<D3D12_RECT>(rects, rects + count) : std::vector<D3D12_RECT>{};
     Check(Recorder(function).ClearDepthStencil(record.attachment, flags, depth, stencil, list, error), function, error);
+    if (record.resource != nullptr) record.resource->NoteListUse(true);
+    if ((static_cast<UINT>(flags) & D3D12_CLEAR_FLAG_DEPTH) != 0 && record.resource != nullptr && !record.resource->IsBuffer()) {
+        if (Resource::DepthShadow* const shadow = record.resource->DepthShadowOf()) shadow->planeNewer.store(true, std::memory_order_relaxed);
+    }
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE ClearDepthStencilView image %p flags 0x%x depth %g stencil %u (%u rects)",
+               record.resource != nullptr && !record.resource->IsBuffer() ? static_cast<void*>(record.resource->Texture().image) : nullptr, static_cast<unsigned>(flags),
+               static_cast<double>(depth), static_cast<unsigned>(stencil), count);
+    }
 }
 
 void STDMETHODCALLTYPE CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE view, const FLOAT color[4], UINT count, const D3D12_RECT* rects) {
+    const TimedScope timed(TimedPart::ListCopies);
     const char* function = "ID3D12GraphicsCommandList::ClearRenderTargetView";
     EndPass();
     if (color == nullptr || (count != 0 && rects == nullptr)) {
@@ -1297,12 +1879,58 @@ void STDMETHODCALLTYPE CommandList::ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_H
     std::string error;
     const std::vector<D3D12_RECT> list = count != 0 ? std::vector<D3D12_RECT>(rects, rects + count) : std::vector<D3D12_RECT>{};
     Check(Recorder(function).ClearRenderTarget(record.attachment, color, list, error), function, error);
+    if (record.resource != nullptr) record.resource->NoteListUse(true);
 }
-void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const UINT[4], UINT, const D3D12_RECT*) {
-    AbxUnsupported("ID3D12GraphicsCommandList::ClearUnorderedAccessViewUint", "unordered access view clears are not implemented yet");
+void CommandList::ClearUnorderedAccess(ID3D12Resource* resource, const VkClearColorValue& value, UINT count, const char* function) {
+    EndPass();
+    if (count != 0) AbxUnsupported(function, "an unordered access view clear with rectangles");
+    Resource* texture = Ours(resource, function);
+    if (texture == nullptr) AbxUnsupported(function, "an unordered access view clear of a resource AnyBox did not create");
+    texture->NoteListUse(true);
+    if (texture->IsBuffer()) {
+        if (value.uint32[1] != value.uint32[0] || value.uint32[2] != value.uint32[0] || value.uint32[3] != value.uint32[0]) {
+            AbxUnsupported(function, "a buffer clear whose four values differ: the view's format, which decides the pattern, is not read yet");
+        }
+        const UINT64 bytes = texture->Width() & ~UINT64{3};
+        const std::optional<BufferRef> range = texture->BufferSpan(0, bytes);
+        if (!range || range->size < bytes || (range->offset & 3) != 0) AbxUnsupported(function, "a buffer clear of a range that is not one GPU-visible, 4-byte aligned range");
+        if (bytes != 0) context_.device.Vk().cmdFillBuffer(commands_, range->buffer, range->offset, bytes, value.uint32[0]);
+        static std::atomic<bool> buffers{false};
+        if (!buffers.exchange(true)) {
+            AbxLog("d3d12_x", "unordered access view clears of buffers fill the whole buffer with the 32-bit value when all four values are equal (first: %llu bytes, value 0x%08x "
+                              "by %s); the view's own range and format are not read",
+                   static_cast<unsigned long long>(bytes), value.uint32[0], function);
+        }
+        return;
+    }
+    const D3D12_RESOURCE_DESC& desc = texture->Texture().desc;
+    if (desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        AbxUnsupported(function, "an unordered access view clear of a texture with several mips, layers or slices: which of them the view names is not read yet");
+    }
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    context_.device.Vk().cmdClearColorImage(commands_, texture->Texture().image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        AbxLog("d3d12_x", "unordered access view clears fill the whole texture when it has one mip and one layer (first: %llux%u format %d by %s); other textures stop",
+               static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<int>(desc.Format), function);
+    }
 }
-void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource*, const float[4], UINT, const D3D12_RECT*) {
-    AbxUnsupported("ID3D12GraphicsCommandList::ClearUnorderedAccessViewFloat", "unordered access view clears are not implemented yet");
+
+void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource* resource, const UINT values[4], UINT count,
+                                                                const D3D12_RECT*) {
+    const char* function = "ID3D12GraphicsCommandList::ClearUnorderedAccessViewUint";
+    if (values == nullptr) AbxUnsupported(function, "a clear without values");
+    VkClearColorValue value{};
+    for (int index = 0; index < 4; ++index) value.uint32[index] = values[index];
+    ClearUnorderedAccess(resource, value, count, function);
+}
+void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource* resource, const float values[4], UINT count,
+                                                                 const D3D12_RECT*) {
+    const char* function = "ID3D12GraphicsCommandList::ClearUnorderedAccessViewFloat";
+    if (values == nullptr) AbxUnsupported(function, "a clear without values");
+    VkClearColorValue value{};
+    for (int index = 0; index < 4; ++index) value.float32[index] = values[index];
+    ClearUnorderedAccess(resource, value, count, function);
 }
 namespace {
 
@@ -1382,6 +2010,7 @@ void STDMETHODCALLTYPE CommandList::SetPredication(ID3D12Resource* buffer, UINT6
 void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* signature, UINT maxCount, ID3D12Resource* arguments, UINT64 argumentOffset, ID3D12Resource* count,
                                                      UINT64 countOffset) {
     const char* function = "ID3D12GraphicsCommandList::ExecuteIndirect";
+    const TimedScope timed(TimedPart::ListWork);
     auto* ours = dynamic_cast<CommandSignature*>(signature);
     if (ours == nullptr) AbxUnsupported(function, "a command signature that AnyBox did not create");
     if (!ours->Signature()) AbxUnsupported(function, ("a command signature AnyBox cannot execute: " + ours->Unsupported()).c_str());
@@ -1393,13 +2022,22 @@ void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* sign
     const std::optional<BufferRef> argumentRef = argumentBuffer->BufferSpan(argumentOffset, span);
     if (!argumentRef || argumentRef->size < span) AbxUnsupported(function, "indirect arguments that are not one GPU-visible range");
     std::optional<BufferRef> countRef;
+    std::uint64_t countTitle = 0;
     if (count != nullptr) {
         Resource* countBuffer = Ours(count, function);
         if (countBuffer == nullptr || !countBuffer->IsBuffer()) AbxUnsupported(function, "an indirect count that is not in a buffer");
         countRef = countBuffer->BufferSpan(countOffset, 4);
         if (!countRef || countRef->size < 4) AbxUnsupported(function, "an indirect count that is not GPU-visible");
+        countTitle = countBuffer->TitleAddress() + countOffset;
     }
     std::optional<BufferRef> checkedArguments;
+    const auto traceArguments = [&](IndirectClamp& clamp, const ClampedArguments& checked, bool mesh) {
+        if (!TracingFrame()) return;
+        std::string label;
+        for (const std::string& shader : pipeline_->Shaders()) label += " " + shader.substr(0, 19);
+        clamp.Trace(commands_, checked, maxCount, indirect.stride, mesh, countRef ? countRef->buffer : VK_NULL_HANDLE, countRef ? countRef->offset : 0,
+                    argumentBuffer->TitleAddress() + argumentOffset, std::move(label));
+    };
     if (indirect.kind == IndirectKind::Dispatch) {
         EndPass();
         if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_COMPUTE) AbxUnsupported(function, "an indirect dispatch without a compute pipeline state set");
@@ -1420,6 +2058,7 @@ void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* sign
             const std::optional<ClampedArguments> checked = clamp->RecordDispatches(commands_, argumentRef->buffer, argumentRef->offset, maxCount, indirect.stride, false, clampError);
             Check(checked.has_value(), function, clampError);
             checkedArguments = BufferRef{checked->buffer, checked->offset, checked->size};
+            traceArguments(*clamp, *checked, false);
             Recorder(function).BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_->Pipeline());
             pipelineBound_ = true;
             computeSetBound_ = false;
@@ -1428,17 +2067,45 @@ void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* sign
         BindTitleSet(VK_PIPELINE_BIND_POINT_COMPUTE);
     } else if (indirect.kind == IndirectKind::DispatchMesh) {
         if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_GRAPHICS) AbxUnsupported(function, "an indirect mesh dispatch without a graphics pipeline state set");
+        if (!pipeline_->Shaders().empty() && !pipeline_->HasStage("ms")) AbxUnsupported(function, "an indirect mesh dispatch with a pipeline that has no mesh shader");
         if (IndirectClamp* clamp = IndirectClamp::For(context_.device)) {
             EndPass();
             std::string clampError;
             const std::optional<ClampedArguments> checked = clamp->RecordDispatches(commands_, argumentRef->buffer, argumentRef->offset, maxCount, indirect.stride, true, clampError);
             Check(checked.has_value(), function, clampError);
             checkedArguments = BufferRef{checked->buffer, checked->offset, checked->size};
+            traceArguments(*clamp, *checked, true);
             computeSetBound_ = false;
         }
         if (!PrepareDraw(function)) return;
-    } else if (!PrepareDraw(function)) {
-        return;
+    } else {
+        if (pipeline_ != nullptr && pipeline_->HasStage("ms")) AbxUnsupported(function, "an indirect draw with a mesh pipeline (its signature is not a mesh dispatch)");
+        if (!PrepareDraw(function)) return;
+        if (TracingFrame()) {
+            const std::uint64_t argumentTitle = argumentBuffer->TitleAddress() + argumentOffset;
+            const std::string countText = count != nullptr ? ", count at title memory" + TitleWordsText(context_.addresses, countTitle, 4) : std::string();
+            AbxLog("d3d12_x", "TRACE     indirect draw: up to %u record(s) of %u bytes at title 0x%llx%s%s (title memory as it is while the list is recorded: what the GPU writes there "
+                              "shows an earlier frame's values) | list %04x",
+                   maxCount, indirect.stride, static_cast<unsigned long long>(argumentTitle),
+                   TitleWordsText(context_.addresses, argumentTitle, IndirectArgumentBytes(indirect.kind)).c_str(), countText.c_str(),
+                   static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+            std::string everyShader;
+            for (const std::string& shader : pipeline_->Shaders()) everyShader += shader + " ";
+            const GraphicsDescription* description = pipeline_->Description();
+            if (description != nullptr && WatchedShader(everyShader)) {
+                const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d = description->desc;
+                const D3D12_DEPTH_STENCIL_DESC& z = d.DepthStencilState;
+                const D3D12_RENDER_TARGET_BLEND_DESC& b = d.BlendState.RenderTarget[0];
+                AbxLog("d3d12_x",
+                       "TRACE     state of the watched draw: depth %d write %d func %d | stencil %d read 0x%x write 0x%x front fail %d depthfail %d pass %d func %d back fail %d "
+                       "depthfail %d pass %d func %d | blend %d src %d dst %d op %d mask 0x%x | cull %d fill %d front counter-clockwise %d | rt f%d dsv f%d samples %u | list %04x",
+                       z.DepthEnable, z.DepthWriteMask, z.DepthFunc, z.StencilEnable, z.StencilReadMask, z.StencilWriteMask, z.FrontFace.StencilFailOp, z.FrontFace.StencilDepthFailOp,
+                       z.FrontFace.StencilPassOp, z.FrontFace.StencilFunc, z.BackFace.StencilFailOp, z.BackFace.StencilDepthFailOp, z.BackFace.StencilPassOp, z.BackFace.StencilFunc,
+                       b.BlendEnable, b.SrcBlend, b.DestBlend, b.BlendOp, b.RenderTargetWriteMask, d.RasterizerState.CullMode, d.RasterizerState.FillMode,
+                       d.RasterizerState.FrontCounterClockwise, d.RTVFormats[0], d.DSVFormat, d.SampleDesc.Count,
+                       static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+            }
+        }
     }
     std::string error;
     Check(Recorder(function).ExecuteIndirect(indirect, maxCount, checkedArguments ? *checkedArguments : *argumentRef, 0, countRef ? &*countRef : nullptr, 0, error), function, error);

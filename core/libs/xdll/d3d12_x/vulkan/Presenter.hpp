@@ -18,12 +18,22 @@ public:
     Presenter& operator=(const Presenter&) = delete;
 
     bool Present(VkImage source, VkExtent2D extent, VkImageLayout layout, std::string& error);
+    struct Plane {
+        VkImage image = VK_NULL_HANDLE;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+    };
+    bool PresentComposited(const Plane& scene, const Plane& overlay, VkImageLayout layout, bool premultiplied, std::string& error);
 
 private:
     explicit Presenter(const VulkanDevice& device, HWND window) : device_(device), window_(window) {}
     bool Initialize(std::string& error);
     bool CreateSwapchain(std::string& error);
     void DestroySwapchain();
+    bool CreateCompositor(std::string& error);
+    bool EnsureComposite(std::string& error);
+    void DestroyComposite();
+    bool Acquire(std::uint32_t& index, bool& skipped, std::string& error);
+    bool QueueImage(std::uint32_t index, std::string& error);
 
     const VulkanDevice& device_;
     HWND window_;
@@ -47,6 +57,16 @@ private:
     PFN_vkDestroyFence destroyFence_ = nullptr;
     PFN_vkWaitForFences waitForFences_ = nullptr;
     PFN_vkResetFences resetFences_ = nullptr;
+    VkSampler sampler_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet set_ = VK_NULL_HANDLE;
+    VkImage composite_ = VK_NULL_HANDLE;
+    VkDeviceMemory compositeMemory_ = VK_NULL_HANDLE;
+    VkImageView compositeView_ = VK_NULL_HANDLE;
+    VkExtent2D compositeExtent_{};
 };
 
 HWND FindProcessWindow();

@@ -193,6 +193,7 @@ struct ConsoleTexture {
 std::optional<ConsoleTexture> DescribeConsoleTexture(const D3D12_RESOURCE_DESC& desc, PipeConfig pipes, std::string& error);
 
 bool DetileSubresource(const ConsoleTexture& texture, const std::uint8_t* texels, std::size_t texelBytes, std::uint32_t mip, std::uint32_t slice, std::uint8_t* destination,
-                       std::size_t rowPitch, std::size_t rows, std::size_t rowBytes, std::string& error);
+                       std::size_t rowPitch, std::size_t rows, std::size_t rowBytes, std::string& error, std::size_t firstByte = 0);
+std::optional<std::pair<std::size_t, std::size_t>> SubresourceBytes(const ConsoleTexture& texture, std::uint32_t mip, std::uint32_t slice);
 
 }

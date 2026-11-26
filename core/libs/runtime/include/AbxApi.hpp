@@ -28,6 +28,10 @@ ABX_RUNTIME_API const char* AbxTitleDeviceFamily();
 ABX_RUNTIME_API const char* AbxSetting(const char* key);
 ABX_RUNTIME_API std::size_t AbxMapConsolePath(const wchar_t* path, bool write, wchar_t* buffer, std::size_t capacity);
 
+using AbxRefusedBuffer = bool (*)(void* context, std::uint64_t address, std::uint64_t bytes, bool write, std::uint64_t caller);
+
+ABX_RUNTIME_API bool AbxWatchRefusedBuffers(AbxRefusedBuffer handler, void* context);
+
 #define AbxNotImplemented(name) AbxNotImplementedAt(ABX_LIBRARY_NAME, name, __FILE__, __LINE__)
 #define AbxUnsupported(name, message) AbxUnsupportedAt(ABX_LIBRARY_NAME, name, message, __FILE__, __LINE__)
 #define AbxTrace(...)                                                      \

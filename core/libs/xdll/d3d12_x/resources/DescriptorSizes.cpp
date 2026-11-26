@@ -43,6 +43,8 @@ std::optional<DescriptorSizes> DescriptorSizesFromSettings(std::string& error) {
 DeviceRequirements DeviceRequirementsFromSettings(DeviceRequirements requirements) {
     const char* preferred = AbxSetting("d3d12_x.vulkan_device");
     if (preferred != nullptr) requirements.preferredDevice = preferred;
+    const char* pageable = AbxSetting("d3d12_x.pageable_video_memory");
+    requirements.pageableMemory = pageable == nullptr || std::strtoul(pageable, nullptr, 10) != 0;
     return requirements;
 }
 

@@ -3,7 +3,9 @@
 #include "VulkanBackend.hpp"
 #include "VulkanLoader.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -20,6 +22,7 @@ struct DeviceRequirements {
     bool validation = false;
     bool hostMemoryImport = false;
     bool presentation = false;
+    bool pageableMemory = false;
     std::string preferredDevice;
 };
 
@@ -148,7 +151,9 @@ public:
     std::string CheckpointReport() const;
     void Checkpoint(VkCommandBuffer commands, const char* marker) const;
     bool Checkpoints() const { return checkpoints_; }
+    bool PageableMemory() const { return pageableMemory_; }
     void SetFaultAddressDescriber(std::function<std::string(std::uint64_t)> describer) { faultDescriber_ = std::move(describer); }
+    void SetFaultExtraReport(std::function<std::string()> report) { faultExtra_ = std::move(report); }
     VkDeviceSize HostImportAlignment() const { return hostImportAlignment_; }
     PFN_vkGetMemoryHostPointerPropertiesEXT HostPointerProperties() const { return hostPointerProperties_; }
     std::optional<std::uint32_t> MemoryType(std::uint32_t typeBits, VkMemoryPropertyFlags required) const;
@@ -161,6 +166,8 @@ public:
     };
     std::optional<PendingSubmit> SubmitWithoutWaiting(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
     VkResult Finish(PendingSubmit& pending, bool wait) const;
+    std::uint64_t SubmitDetached(const std::function<void(VkCommandBuffer)>& record, std::string& error) const;
+    void WaitDetached(std::uint64_t serial) const;
     std::mutex& QueueLock() const { return queueLock_; }
     const std::vector<std::string>& EnabledFeatures() const { return enabled_; }
     bool PreferenceMissed() const { return preferenceMissed_; }
@@ -184,6 +191,10 @@ private:
     PFN_vkDestroyDebugUtilsMessengerEXT destroyMessenger_ = nullptr;
     mutable std::mutex messagesLock_;
     mutable std::mutex queueLock_;
+    mutable std::mutex detachedLock_;
+    mutable std::deque<PendingSubmit> detached_;
+    mutable std::uint64_t detachedSubmitted_ = 0;
+    mutable std::atomic<std::uint64_t> detachedFinished_{0};
     std::size_t validationErrors_ = 0;
     std::vector<std::string> validationMessages_;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
@@ -211,12 +222,14 @@ private:
     std::vector<std::string> enabled_;
     bool rectangleFill_ = false;
     bool deviceFault_ = false;
+    bool pageableMemory_ = false;
     bool conservative_ = false;
     PFN_vkGetDeviceFaultInfoEXT faultInfo_ = nullptr;
     bool checkpoints_ = false;
     PFN_vkCmdSetCheckpointNV setCheckpoint_ = nullptr;
     PFN_vkGetQueueCheckpointDataNV checkpointData_ = nullptr;
     std::function<std::string(std::uint64_t)> faultDescriber_;
+    std::function<std::string()> faultExtra_;
     std::vector<std::string> extensions_;
 };
 

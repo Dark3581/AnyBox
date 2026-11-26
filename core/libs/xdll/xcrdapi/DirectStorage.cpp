@@ -8,9 +8,13 @@
 #include <deque>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -98,6 +102,81 @@ constexpr GUID kFactoryInterface{0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 
 
 constexpr GUID kFileInterface{0x43704f9f, 0x27c6, 0x4a9f, {0x88, 0x15, 0xd1, 0x65, 0x27, 0x89, 0x4d, 0xf4}};
 
+bool OverlappedFiles() {
+    static const bool on = [] {
+        const char* value = AbxSetting("xcrdapi.overlapped_files");
+        return value == nullptr || std::strtoul(value, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+bool ReadAt(HANDLE file, std::uint64_t offset, void* data, DWORD bytes, DWORD& read, DWORD& code) {
+    thread_local const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    read = 0;
+    code = 0;
+    if (done == nullptr) {
+        code = ERROR_NOT_ENOUGH_MEMORY;
+        return false;
+    }
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(offset);
+    at.OffsetHigh = static_cast<DWORD>(offset >> 32);
+    at.hEvent = done;
+    if (ReadFile(file, data, bytes, &read, &at)) return true;
+    code = GetLastError();
+    if (code != ERROR_IO_PENDING) return false;
+    code = 0;
+    if (GetOverlappedResult(file, &at, &read, TRUE)) return true;
+    code = GetLastError();
+    return false;
+}
+
+struct StorageTotals {
+    std::atomic<std::uint64_t> requests{0};
+    std::atomic<std::uint64_t> sourceBytes{0};
+    std::atomic<std::uint64_t> outputBytes{0};
+    std::atomic<std::uint64_t> readNs{0};
+    std::atomic<std::uint64_t> workNs{0};
+    std::atomic<std::uint64_t> batches{0};
+    std::atomic<std::uint64_t> batchNs{0};
+    std::atomic<std::uint64_t> longestBatchNs{0};
+    std::atomic<std::uint64_t> sharedGroups{0};
+    std::atomic<std::uint64_t> orderedGroups{0};
+    std::atomic<long long> reportedAt{0};
+};
+
+StorageTotals& Totals() {
+    static StorageTotals* totals = new StorageTotals();
+    return *totals;
+}
+
+std::uint64_t Nanoseconds(std::chrono::steady_clock::duration spent) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(spent).count());
+}
+
+void ReportTotals() {
+    StorageTotals& totals = Totals();
+    const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long last = totals.reportedAt.load();
+    if (last == 0) {
+        totals.reportedAt.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 60 || !totals.reportedAt.compare_exchange_strong(last, now)) return;
+    const std::uint64_t requests = totals.requests.exchange(0);
+    const std::uint64_t batches = totals.batches.exchange(0);
+    const double seconds = static_cast<double>(now - last);
+    AbxLog("xcrdapi",
+           "DirectStorage in the last %.0f s: %llu requests in %llu submitted batches, %.1f MiB read or taken from memory, %.1f MiB written; reading %.2f s, the rest of the "
+           "requests' work (decoding and copying) %.2f s, both summed over threads; a batch took %.1f ms from Submit to its last status on average, %.1f ms at most; "
+           "request groups run on several threads %llu, in order on one thread %llu",
+           seconds, static_cast<unsigned long long>(requests), static_cast<unsigned long long>(batches), static_cast<double>(totals.sourceBytes.exchange(0)) / (1 << 20),
+           static_cast<double>(totals.outputBytes.exchange(0)) / (1 << 20), static_cast<double>(totals.readNs.exchange(0)) / 1.0e9,
+           static_cast<double>(totals.workNs.exchange(0)) / 1.0e9, batches != 0 ? static_cast<double>(totals.batchNs.exchange(0)) / 1.0e6 / static_cast<double>(batches) : 0.0,
+           static_cast<double>(totals.longestBatchNs.exchange(0)) / 1.0e6, static_cast<unsigned long long>(totals.sharedGroups.exchange(0)),
+           static_cast<unsigned long long>(totals.orderedGroups.exchange(0)));
+}
+
 struct StorageFile : StorageObject {
     HANDLE handle = INVALID_HANDLE_VALUE;
     std::wstring path;
@@ -126,7 +205,8 @@ HRESULT STDMETHODCALLTYPE FactoryOpenFile(StorageObject*, const wchar_t* path, R
     std::wstring mapped(length, L'\0');
     AbxMapConsolePath(path, false, mapped.data(), mapped.size());
     mapped.resize(length - 1);
-    const HANDLE handle = CreateFileW(mapped.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE handle = CreateFileW(mapped.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL | (OverlappedFiles() ? FILE_FLAG_OVERLAPPED : 0), nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
         AbxTrace("DirectStorage OpenFile(%ls) -> %ls failed with %lu", path, mapped.c_str(), error);
@@ -181,6 +261,7 @@ struct QueueEntry {
     std::vector<std::uintptr_t> destinationPages;
     StatusArray* status = nullptr;
     std::uint32_t statusIndex = 0;
+    std::chrono::steady_clock::time_point submitted{};
 };
 
 struct StorageQueue : StorageObject {
@@ -226,12 +307,29 @@ void AnnounceWritten(const void* destination, std::uint64_t bytes) {
     if (announce != nullptr) announce(reinterpret_cast<std::uint64_t>(destination), bytes);
 }
 
-bool ScatterToPages(const std::vector<std::uintptr_t>& pages, std::uint64_t pageOffset, const std::uint8_t* data, std::uint64_t bytes, std::string& error) {
-    using View = void* (*)(std::uintptr_t);
-    static const View view = [] {
+using PhysicalPageView = void* (*)(std::uintptr_t);
+
+PhysicalPageView PageView() {
+    static const PhysicalPageView view = [] {
         const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
-        return xmem != nullptr ? reinterpret_cast<View>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemPhysicalPageView"))) : nullptr;
+        return xmem != nullptr ? reinterpret_cast<PhysicalPageView>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemPhysicalPageView"))) : nullptr;
     }();
+    return view;
+}
+
+using PhysicalPageCopy = BOOL (*)(std::uintptr_t, std::size_t, const void*, std::size_t);
+
+PhysicalPageCopy PageCopy() {
+    static const PhysicalPageCopy copy = [] {
+        const HMODULE xmem = GetModuleHandleW(L"ab_xmem.dll");
+        return xmem != nullptr ? reinterpret_cast<PhysicalPageCopy>(reinterpret_cast<void*>(GetProcAddress(xmem, "AbxXMemCopyToPhysicalPage"))) : nullptr;
+    }();
+    return copy;
+}
+
+bool ScatterToPages(const std::vector<std::uintptr_t>& pages, std::uint64_t pageOffset, const std::uint8_t* data, std::uint64_t bytes, std::string& error) {
+    const PhysicalPageView view = PageView();
+    const PhysicalPageCopy copy = PageCopy();
     if (view == nullptr) {
         error = "ab_xmem.dll has no AbxXMemPhysicalPageView export for writing physical pages";
         return false;
@@ -253,14 +351,32 @@ bool ScatterToPages(const std::vector<std::uintptr_t>& pages, std::uint64_t page
         }
         const std::uint64_t within = at % kDestinationPageBytes;
         const std::uint64_t piece = (std::min)(kDestinationPageBytes - within, bytes - done);
-        std::memcpy(page + within, data + done, static_cast<std::size_t>(piece));
+        if (copy == nullptr || copy(pages[index], static_cast<std::size_t>(within), data + done, static_cast<std::size_t>(piece)) == FALSE) {
+            std::memcpy(page + within, data + done, static_cast<std::size_t>(piece));
+        }
         AnnounceWritten(page + within, piece);
         done += piece;
     }
     return true;
 }
 
+HRESULT ExecuteRequestTimed(const ConsoleRequest& request, const std::vector<std::uintptr_t>& destinationPages, std::string& error, std::uint64_t& readNs);
+
 HRESULT ExecuteRequest(const ConsoleRequest& request, const std::vector<std::uintptr_t>& destinationPages, std::string& error) {
+    const auto begin = std::chrono::steady_clock::now();
+    std::uint64_t readNs = 0;
+    const HRESULT result = ExecuteRequestTimed(request, destinationPages, error, readNs);
+    const std::uint64_t spent = Nanoseconds(std::chrono::steady_clock::now() - begin);
+    StorageTotals& totals = Totals();
+    ++totals.requests;
+    totals.sourceBytes += request.sourceSize;
+    totals.outputBytes += request.destinationSize;
+    totals.readNs += readNs;
+    totals.workNs += spent > readNs ? spent - readNs : 0;
+    return result;
+}
+
+HRESULT ExecuteRequestTimed(const ConsoleRequest& request, const std::vector<std::uintptr_t>& destinationPages, std::string& error, std::uint64_t& readNs) {
     std::vector<std::uint8_t> source(request.sourceSize);
     if ((request.options & kRequestMemorySource) != 0) {
         std::memcpy(source.data(), reinterpret_cast<const void*>(request.source), source.size());
@@ -270,12 +386,12 @@ HRESULT ExecuteRequest(const ConsoleRequest& request, const std::vector<std::uin
             error = "a request with no open file";
             return E_INVALIDARG;
         }
-        OVERLAPPED at{};
-        at.Offset = static_cast<DWORD>(request.sourceOffset);
-        at.OffsetHigh = static_cast<DWORD>(request.sourceOffset >> 32);
         DWORD read = 0;
-        if (!ReadFile(file->handle, source.data(), static_cast<DWORD>(source.size()), &read, &at) || read != source.size()) {
-            const DWORD code = GetLastError();
+        DWORD code = 0;
+        const auto readBegin = std::chrono::steady_clock::now();
+        const bool done = ReadAt(file->handle, request.sourceOffset, source.data(), static_cast<DWORD>(source.size()), read, code);
+        readNs = Nanoseconds(std::chrono::steady_clock::now() - readBegin);
+        if (!done || read != source.size()) {
             error = "reading " + std::to_string(source.size()) + " bytes failed with " + std::to_string(code);
             return HRESULT_FROM_WIN32(code != 0 ? code : ERROR_HANDLE_EOF);
         }
@@ -326,7 +442,7 @@ HRESULT ExecuteRequest(const ConsoleRequest& request, const std::vector<std::uin
         }
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true)) {
-            AbxLog("xcrdapi", "a physical-page request's page array changed between enqueue and submission (the title fills it after enqueueing); it is read again when the request runs");
+            AbxLog("xcrdapi", "a physical-page request's page array named pages AnyBox did not issue when its queue was submitted and other pages when the request ran; it is read again when the request runs");
         }
         return S_OK;
     }
@@ -383,11 +499,9 @@ HRESULT STDMETHODCALLTYPE QueueEnqueueRequest(StorageQueue* self, const ConsoleR
     if ((request->options & kRequestCompressed) != 0 && (request->options & kRequestMemorySource) == 0 && !reported.exchange(true)) {
         const auto* file = reinterpret_cast<const StorageFile*>(request->source);
         unsigned char head[16]{};
-        OVERLAPPED at{};
-        at.Offset = static_cast<DWORD>(request->sourceOffset);
-        at.OffsetHigh = static_cast<DWORD>(request->sourceOffset >> 32);
         DWORD read = 0;
-        ReadFile(file->handle, head, sizeof(head), &read, &at);
+        DWORD code = 0;
+        ReadAt(file->handle, request->sourceOffset, head, sizeof(head), read, code);
         AbxLog("xcrdapi", "first compressed request: %ls at 0x%llx, %u -> %u bytes, starts %02x %02x %02x %02x %02x %02x %02x %02x", file->path.c_str(),
                static_cast<unsigned long long>(request->sourceOffset), request->sourceSize, request->destinationSize, head[0], head[1], head[2], head[3], head[4], head[5],
                head[6], head[7]);
@@ -430,23 +544,151 @@ HRESULT STDMETHODCALLTYPE QueueEnqueueStatus(StorageQueue* self, StorageObject* 
     return S_OK;
 }
 
-void RunBatch(StorageQueue* self, const std::vector<QueueEntry>& entries) {
-    HRESULT since = S_OK;
-    for (const QueueEntry& entry : entries) {
-        if (entry.status != nullptr) {
-            entry.status->results[entry.statusIndex] = since;
-            entry.status->complete[entry.statusIndex] = true;
-            since = S_OK;
-            continue;
+class RequestThreads {
+public:
+    static RequestThreads& Instance() {
+        static RequestThreads* threads = new RequestThreads();
+        return *threads;
+    }
+
+    unsigned Count() const { return count_; }
+
+    void Run(std::size_t items, const std::function<void(std::size_t)>& work) {
+        const auto job = std::make_shared<Job>();
+        job->work = &work;
+        job->items = items;
+        {
+            const std::lock_guard guard(lock_);
+            for (std::size_t helper = 0; helper + 1 < (std::min)(items, static_cast<std::size_t>(count_)); ++helper) jobs_.push_back(job);
         }
-        std::string error;
-        const HRESULT result = ExecuteRequest(entry.request, entry.destinationPages, error);
-        if (FAILED(result)) {
-            AbxLog("xcrdapi", "DirectStorage request failed with 0x%08lx: %s", static_cast<unsigned long>(result), error.c_str());
-            if (SUCCEEDED(since)) since = result;
-            if (SUCCEEDED(self->failure)) self->failure = result;
+        ready_.notify_all();
+        Help(*job);
+        std::unique_lock guard(job->lock);
+        job->finished.wait(guard, [&] { return job->done == job->items; });
+    }
+
+private:
+    struct Job {
+        const std::function<void(std::size_t)>* work = nullptr;
+        std::size_t items = 0;
+        std::atomic<std::size_t> next{0};
+        std::mutex lock;
+        std::condition_variable finished;
+        std::size_t done = 0;
+    };
+
+    RequestThreads() {
+        const char* value = AbxSetting("xcrdapi.request_threads");
+        const unsigned long asked = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        count_ = asked >= 1 && asked <= 32 ? static_cast<unsigned>(asked) : (std::min)((std::max)(std::thread::hardware_concurrency() / 3, 1u), 4u);
+        for (unsigned index = 1; index < count_; ++index) std::thread([this] { Serve(); }).detach();
+        AbxLog("xcrdapi",
+               "DirectStorage requests between two status entries of a queue run on up to %u threads when they read files and no two of them write the same memory; a status "
+               "entry still completes only after every request before it (xcrdapi.request_threads, 1 runs them one by one); files are opened %s "
+               "(xcrdapi.overlapped_files)",
+               count_, OverlappedFiles() ? "for overlapped reads, so reads of one file do not wait for each other" : "for synchronous reads, one read of a file at a time");
+    }
+
+    static void Help(Job& job) {
+        std::size_t did = 0;
+        for (std::size_t index = job.next.fetch_add(1); index < job.items; index = job.next.fetch_add(1)) {
+            (*job.work)(index);
+            ++did;
+        }
+        if (did == 0) return;
+        {
+            const std::lock_guard guard(job.lock);
+            job.done += did;
+        }
+        job.finished.notify_all();
+    }
+
+    void Serve() {
+        for (;;) {
+            std::shared_ptr<Job> job;
+            {
+                std::unique_lock guard(lock_);
+                ready_.wait(guard, [this] { return !jobs_.empty(); });
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+            }
+            Help(*job);
         }
     }
+
+    unsigned count_ = 1;
+    std::mutex lock_;
+    std::condition_variable ready_;
+    std::deque<std::shared_ptr<Job>> jobs_;
+};
+
+bool WriteApart(const std::vector<QueueEntry>& entries, std::size_t first, std::size_t last) {
+    std::vector<std::uintptr_t> frames;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (std::size_t index = first; index < last; ++index) {
+        const ConsoleRequest& request = entries[index].request;
+        if ((request.options & kRequestMemorySource) != 0) return false;
+        if ((request.options & kRequestDestinationPages) != 0) {
+            frames.insert(frames.end(), entries[index].destinationPages.begin(), entries[index].destinationPages.end());
+        } else {
+            ranges.emplace_back(request.destination, request.destination + request.destinationSize);
+        }
+    }
+    if (!frames.empty() && !ranges.empty()) return false;
+    std::sort(frames.begin(), frames.end());
+    if (std::adjacent_find(frames.begin(), frames.end()) != frames.end()) return false;
+    std::sort(ranges.begin(), ranges.end());
+    for (std::size_t index = 1; index < ranges.size(); ++index) {
+        if (ranges[index].first < ranges[index - 1].second) return false;
+    }
+    return true;
+}
+
+void RunBatch(StorageQueue* self, const std::vector<QueueEntry>& entries) {
+    HRESULT since = S_OK;
+    std::size_t at = 0;
+    while (at < entries.size()) {
+        if (entries[at].status != nullptr) {
+            entries[at].status->results[entries[at].statusIndex] = since;
+            entries[at].status->complete[entries[at].statusIndex] = true;
+            since = S_OK;
+            ++at;
+            continue;
+        }
+        std::size_t end = at;
+        while (end < entries.size() && entries[end].status == nullptr) ++end;
+        const std::size_t count = end - at;
+        std::vector<HRESULT> results(count, S_OK);
+        std::vector<std::string> errors(count);
+        const std::function<void(std::size_t)> run = [&](std::size_t index) {
+            results[index] = ExecuteRequest(entries[at + index].request, entries[at + index].destinationPages, errors[index]);
+        };
+        RequestThreads& threads = RequestThreads::Instance();
+        if (count > 1 && threads.Count() > 1 && WriteApart(entries, at, end)) {
+            ++Totals().sharedGroups;
+            threads.Run(count, run);
+        } else {
+            ++Totals().orderedGroups;
+            for (std::size_t index = 0; index < count; ++index) run(index);
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (SUCCEEDED(results[index])) continue;
+            AbxLog("xcrdapi", "DirectStorage request failed with 0x%08lx: %s", static_cast<unsigned long>(results[index]), errors[index].c_str());
+            if (SUCCEEDED(since)) since = results[index];
+            if (SUCCEEDED(self->failure)) self->failure = results[index];
+        }
+        at = end;
+    }
+    if (!entries.empty() && entries.front().submitted != std::chrono::steady_clock::time_point{}) {
+        StorageTotals& totals = Totals();
+        const std::uint64_t took = Nanoseconds(std::chrono::steady_clock::now() - entries.front().submitted);
+        ++totals.batches;
+        totals.batchNs += took;
+        std::uint64_t longest = totals.longestBatchNs.load();
+        while (took > longest && !totals.longestBatchNs.compare_exchange_weak(longest, took)) {
+        }
+    }
+    ReportTotals();
     AbxTrace("DirectStorage queue \"%s\": ran %zu entries", self->label.c_str(), entries.size());
 }
 
@@ -464,6 +706,38 @@ void RunQueue(StorageQueue* self) {
     }
 }
 
+void TakePageArrays(std::vector<QueueEntry>& entries) {
+    static std::atomic<std::uint64_t> requests{0};
+    static std::atomic<std::uint64_t> filledLater{0};
+    static std::atomic<std::uint64_t> otherPages{0};
+    const PhysicalPageView view = PageView();
+    for (QueueEntry& entry : entries) {
+        if (entry.status != nullptr || entry.destinationPages.empty()) continue;
+        const std::uint64_t seen = ++requests;
+        const auto* current = reinterpret_cast<const std::uintptr_t*>(entry.request.destination);
+        std::vector<std::uintptr_t> submitted(current, current + entry.destinationPages.size());
+        if (submitted == entry.destinationPages) continue;
+        const std::uintptr_t before = entry.destinationPages.front();
+        const std::uintptr_t now = submitted.front();
+        const bool issued = view != nullptr && view(before) != nullptr;
+        if (++filledLater == 1) {
+            AbxLog("xcrdapi",
+                   "a physical-page request's page array is taken when its queue is submitted, not when the request is enqueued, as a title fills it in between (first: frame %llu at enqueue, %llu at submission, %u bytes)",
+                   static_cast<unsigned long long>(before), static_cast<unsigned long long>(now), entry.request.destinationSize);
+        }
+        if (issued) {
+            const std::uint64_t count = ++otherPages;
+            if ((count & (count - 1)) == 0) {
+                AbxLog("xcrdapi",
+                       "%llu of %llu physical-page requests so far named other issued pages at enqueue than at submission (latest: frame %llu then, %llu at submission, %zu pages, %u bytes): the title uses the address again with other pages, and the data goes to the pages named at submission",
+                       static_cast<unsigned long long>(count), static_cast<unsigned long long>(seen), static_cast<unsigned long long>(before), static_cast<unsigned long long>(now),
+                       submitted.size(), entry.request.destinationSize);
+            }
+        }
+        entry.destinationPages = std::move(submitted);
+    }
+}
+
 HRESULT STDMETHODCALLTYPE QueueSubmit(StorageQueue* self) {
     std::vector<QueueEntry> entries;
     {
@@ -471,6 +745,8 @@ HRESULT STDMETHODCALLTYPE QueueSubmit(StorageQueue* self) {
         entries.swap(self->pending);
     }
     if (entries.empty()) return S_OK;
+    TakePageArrays(entries);
+    entries.front().submitted = std::chrono::steady_clock::now();
     {
         const std::lock_guard guard(self->workLock);
         if (!self->worker.joinable()) {

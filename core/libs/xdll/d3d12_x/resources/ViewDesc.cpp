@@ -261,6 +261,17 @@ std::optional<ImageView> ShaderResourceView(const D3D12_RESOURCE_DESC& resource,
         return std::nullopt;
     }
     info.components = *components;
+    if (format->aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
+        for (VkComponentSwizzle* const swizzle : {&info.components.r, &info.components.g, &info.components.b, &info.components.a}) {
+            if (*swizzle == VK_COMPONENT_SWIZZLE_G) {
+                *swizzle = VK_COMPONENT_SWIZZLE_R;
+            } else if (*swizzle == VK_COMPONENT_SWIZZLE_R || *swizzle == VK_COMPONENT_SWIZZLE_B) {
+                *swizzle = VK_COMPONENT_SWIZZLE_ZERO;
+            } else if (*swizzle == VK_COMPONENT_SWIZZLE_A) {
+                *swizzle = VK_COMPONENT_SWIZZLE_ONE;
+            }
+        }
+    }
     const auto clamp = [&error](FLOAT value) {
         if (value != 0.0f) {
             error = "a minimum LOD clamp is not supported";

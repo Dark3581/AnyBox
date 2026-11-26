@@ -3,11 +3,13 @@
 #include "AbxApi.hpp"
 #include "CommandList.hpp"
 #include "Fence.hpp"
+#include "FrameTiming.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <thread>
@@ -18,7 +20,14 @@ namespace abx::d3d12x {
 
 namespace {
 
-constexpr auto kMemoryWaitLimit = std::chrono::milliseconds(200);
+std::chrono::milliseconds MemoryWaitLimit() {
+    static const std::chrono::milliseconds limit = [] {
+        const char* value = AbxSetting("d3d12_x.memory_wait_ms");
+        const unsigned long asked = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        return std::chrono::milliseconds(asked >= 1 && asked <= 60000 ? asked : 200);
+    }();
+    return limit;
+}
 
 struct LabelBatch {
     std::uint64_t point = 0;
@@ -127,8 +136,8 @@ void StartWriterLocked(const VulkanDevice& device) {
     g_writerStarted = true;
     std::thread(RunLabelWriter, &device).detach();
     AbxLog("d3d12_x", "memory labels and waits order work across the title's command queues: a list that waits for a value is held, with what follows on its queue, until a submitted "
-                      "list's label promises it (at most %lld ms); label values reach title memory when the GPU has finished that list",
-           static_cast<long long>(kMemoryWaitLimit.count()));
+                      "list's label promises it (at most %lld ms, d3d12_x.memory_wait_ms); label values reach title memory when the GPU has finished that list",
+           static_cast<long long>(MemoryWaitLimit().count()));
 }
 
 bool SubmitLabels(const VulkanDevice& device, const std::vector<CommandQueue::MemoryLabel>& labels) {
@@ -171,7 +180,7 @@ void ReportTimeout(const CommandQueue::MemoryWait& wait) {
         if (known) promised = found->second;
     }
     AbxLog("d3d12_x", "a memory wait was given up after %lld ms and its list runs anyway: 0x%llx holds %llu (%s%llu), comparison %u with %llu (%llu so far)",
-           static_cast<long long>(kMemoryWaitLimit.count()), static_cast<unsigned long long>(wait.titleAddress), static_cast<unsigned long long>(Current(wait)),
+           static_cast<long long>(MemoryWaitLimit().count()), static_cast<unsigned long long>(wait.titleAddress), static_cast<unsigned long long>(Current(wait)),
            known ? "last label submitted for it: " : "no label was ever submitted for it: ", static_cast<unsigned long long>(promised), wait.comparison,
            static_cast<unsigned long long>(wait.value), static_cast<unsigned long long>(count));
 }
@@ -250,6 +259,7 @@ bool CommandQueue::Drain(std::chrono::milliseconds limit) {
 void CommandQueue::ExecuteOrdered(UINT count, ID3D12CommandList* const* lists, std::vector<MemoryWait> waits, std::vector<MemoryLabel> labels) {
     const char* function = "ID3D12CommandQueue::ExecuteCommandLists";
     if (count == 0) return;
+    const TimedScope timed(TimedPart::Execute);
     if (lists == nullptr) AbxUnsupported(function, "command lists without a list array");
     Operation operation;
     operation.waits = std::move(waits);
@@ -315,10 +325,27 @@ bool CommandQueue::Submit(const Operation& operation) {
             info.commandBuffer = commands;
             buffers.push_back(info);
         }
-        submit.commandBufferInfoCount = static_cast<std::uint32_t>(buffers.size());
-        submit.pCommandBufferInfos = buffers.data();
+        static const bool perList = [] {
+            const char* value = AbxSetting("d3d12_x.submit_per_list");
+            const bool on = value == nullptr || std::strtoul(value, nullptr, 10) != 0;
+            AbxLog("d3d12_x", "command lists of one ExecuteCommandLists call are submitted %s (d3d12_x.submit_per_list), so the system's GPU watchdog times %s",
+                   on ? "one by one" : "together", on ? "each list on its own" : "the whole call");
+            return on;
+        }();
+        const TimedScope timed(TimedPart::QueueSubmit);
         std::lock_guard<std::mutex> guard(device_.QueueLock());
-        if (device_.Vk().queueSubmit2(device_.Queue(), 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+        if (perList) {
+            for (const VkCommandBufferSubmitInfo& info : buffers) {
+                VkSubmitInfo2 one{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+                one.commandBufferInfoCount = 1;
+                one.pCommandBufferInfos = &info;
+                if (device_.Vk().queueSubmit2(device_.Queue(), 1, &one, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+            }
+        } else {
+            submit.commandBufferInfoCount = static_cast<std::uint32_t>(buffers.size());
+            submit.pCommandBufferInfos = buffers.data();
+            if (device_.Vk().queueSubmit2(device_.Queue(), 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+        }
         return operation.labels.empty() || SubmitLabels(device_, operation.labels);
     }
     VkSemaphoreSubmitInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -361,13 +388,14 @@ void CommandQueue::Flush() {
                     if (const MemoryWait* unmet = FirstUnmet(front.waits)) {
                         const auto now = std::chrono::steady_clock::now();
                         if (front.blockedSince == std::chrono::steady_clock::time_point{}) front.blockedSince = now;
-                        if (now - front.blockedSince < kMemoryWaitLimit) {
+                        if (now - front.blockedSince < MemoryWaitLimit()) {
                             blocked = true;
                             break;
                         }
                         ReportTimeout(*unmet);
                     }
                 }
+                if (front.blockedSince != std::chrono::steady_clock::time_point{}) AddTime(TimedPart::MemoryWaitHeld, std::chrono::steady_clock::now() - front.blockedSince);
                 const Operation operation = std::move(pending_.front());
                 pending_.pop_front();
                 if (!Submit(operation)) {

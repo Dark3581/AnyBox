@@ -1,6 +1,7 @@
 #include "LoaderRedirect.hpp"
 
 #include "AbxApi.hpp"
+#include "BufferRedirect.hpp"
 #include "PathRedirect.hpp"
 
 #include <windows.h>
@@ -10,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cwctype>
+#include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <set>
 #include <string>
@@ -202,6 +205,97 @@ struct Replacement {
     void* replacement;
 };
 
+using RegOpenKeyWFunction = LSTATUS(WINAPI*)(HKEY, LPCWSTR, PHKEY);
+using RegQueryValueExWFunction = LSTATUS(WINAPI*)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+using RegCloseKeyFunction = LSTATUS(WINAPI*)(HKEY);
+
+RegOpenKeyWFunction g_regOpenKeyW = nullptr;
+RegQueryValueExWFunction g_regQueryValueExW = nullptr;
+RegCloseKeyFunction g_regCloseKey = nullptr;
+const HKEY kSettingsKey = reinterpret_cast<HKEY>(static_cast<ULONG_PTR>(0xAB0C5E77u));
+
+bool SettingsOpenMissingKeys() {
+    const char* value = AbxSetting("runtime.registry_open_missing");
+    return value != nullptr && value[0] == '1';
+}
+
+LSTATUS WINAPI RedirectRegOpenKeyW(HKEY key, LPCWSTR subKey, PHKEY result) {
+    const LSTATUS status = g_regOpenKeyW(key, subKey, result);
+    if (status != ERROR_FILE_NOT_FOUND || result == nullptr || !SettingsOpenMissingKeys()) return status;
+    *result = kSettingsKey;
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        AbxLog("runtime", "a registry key this PC does not have (%ls) opens as an empty key whose values come from runtime.registry_dword.<value name> settings "
+                          "(runtime.registry_open_missing = 1 asked for this)",
+               subKey != nullptr ? subKey : L"(null)");
+    });
+    return ERROR_SUCCESS;
+}
+
+LSTATUS WINAPI RedirectRegQueryValueExW(HKEY key, LPCWSTR name, LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD size) {
+    const LSTATUS status = key == kSettingsKey ? ERROR_FILE_NOT_FOUND : g_regQueryValueExW(key, name, reserved, type, data, size);
+    if (status != ERROR_FILE_NOT_FOUND || name == nullptr) return status;
+    std::string setting = "runtime.registry_dword.";
+    for (const wchar_t* c = name; *c != 0; ++c) {
+        if (*c > 0x7f || *c == L' ' || *c == L'=') return status;
+        setting.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*c))));
+    }
+    const char* value = AbxSetting(setting.c_str());
+    if (value == nullptr || value[0] == 0) return status;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 0);
+    if (end == value || *end != 0) return status;
+    const DWORD number = static_cast<DWORD>(parsed);
+    if (type != nullptr) *type = REG_DWORD;
+    if (data != nullptr) {
+        if (size == nullptr) return ERROR_INVALID_PARAMETER;
+        if (*size < sizeof(number)) {
+            *size = sizeof(number);
+            return ERROR_MORE_DATA;
+        }
+        std::memcpy(data, &number, sizeof(number));
+    }
+    if (size != nullptr) *size = sizeof(number);
+    AbxLog("runtime", "registry value %ls is not on this PC; the setting %s answers it with the DWORD %lu", name, setting.c_str(), static_cast<unsigned long>(number));
+    return ERROR_SUCCESS;
+}
+
+using SetThreadPriorityFunction = BOOL(WINAPI*)(HANDLE, int);
+SetThreadPriorityFunction g_setThreadPriority = nullptr;
+
+int ThreadPriorityFloor() {
+    static const int floor = [] {
+        const char* value = AbxSetting("runtime.title_thread_priority_floor");
+        if (value == nullptr || value[0] == 0) return static_cast<int>(THREAD_PRIORITY_IDLE);
+        char* end = nullptr;
+        const long asked = std::strtol(value, &end, 10);
+        if (end == value || *end != 0 || asked < THREAD_PRIORITY_LOWEST || asked > THREAD_PRIORITY_NORMAL) {
+            AbxLog("runtime", "runtime.title_thread_priority_floor = %s is not -2 (lowest), -1 (below normal) or 0 (normal); title thread priorities are left as asked", value);
+            return static_cast<int>(THREAD_PRIORITY_IDLE);
+        }
+        return static_cast<int>(asked);
+    }();
+    return floor;
+}
+
+BOOL WINAPI RedirectSetThreadPriority(HANDLE thread, int priority) {
+    const int floor = ThreadPriorityFloor();
+    if (priority >= THREAD_PRIORITY_IDLE && priority < floor) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            AbxLog("runtime", "a title thread that asks for priority %d gets %d, as every later one below that does (runtime.title_thread_priority_floor): AnyBox's own "
+                              "background threads run at the lowest priority and would otherwise keep the title's idle-priority threads off the CPU",
+                   priority, floor);
+        });
+        priority = floor;
+    }
+    return g_setThreadPriority(thread, priority);
+}
+
+LSTATUS WINAPI RedirectRegCloseKey(HKEY key) {
+    return key == kSettingsKey ? ERROR_SUCCESS : g_regCloseKey(key);
+}
+
 std::vector<Replacement>& Replacements() {
     static std::vector<Replacement> replacements;
     return replacements;
@@ -307,6 +401,19 @@ void InstallLoaderRedirect() {
     Add(kernel32, kernelbase, "GetModuleHandleExW", reinterpret_cast<void*>(&RedirectGetModuleHandleExW));
     Add(kernel32, kernelbase, "GetModuleHandleExA", reinterpret_cast<void*>(&RedirectGetModuleHandleExA));
     AddPathRedirects([&](const char* name, void* replacement) { Add(kernel32, kernelbase, name, replacement); });
+    AddBufferRedirects([&](const char* name, void* replacement) { Add(kernel32, kernelbase, name, replacement); });
+    g_setThreadPriority = reinterpret_cast<SetThreadPriorityFunction>(reinterpret_cast<void*>(GetProcAddress(kernel32, "SetThreadPriority")));
+    if (g_setThreadPriority != nullptr) Add(kernel32, kernelbase, "SetThreadPriority", reinterpret_cast<void*>(&RedirectSetThreadPriority));
+    if (const HMODULE advapi32 = LoadLibraryW(L"advapi32.dll")) {
+        g_regOpenKeyW = reinterpret_cast<RegOpenKeyWFunction>(reinterpret_cast<void*>(GetProcAddress(advapi32, "RegOpenKeyW")));
+        g_regQueryValueExW = reinterpret_cast<RegQueryValueExWFunction>(reinterpret_cast<void*>(GetProcAddress(advapi32, "RegQueryValueExW")));
+        g_regCloseKey = reinterpret_cast<RegCloseKeyFunction>(reinterpret_cast<void*>(GetProcAddress(advapi32, "RegCloseKey")));
+        if (g_regOpenKeyW != nullptr && g_regQueryValueExW != nullptr && g_regCloseKey != nullptr) {
+            Replacements().push_back({reinterpret_cast<void*>(g_regOpenKeyW), reinterpret_cast<void*>(&RedirectRegOpenKeyW)});
+            Replacements().push_back({reinterpret_cast<void*>(g_regQueryValueExW), reinterpret_cast<void*>(&RedirectRegQueryValueExW)});
+            Replacements().push_back({reinterpret_cast<void*>(g_regCloseKey), reinterpret_cast<void*>(&RedirectRegCloseKey)});
+        }
+    }
 
     const PEB* peb = reinterpret_cast<const PEB*>(reinterpret_cast<const TEB*>(NtCurrentTeb())->ProcessEnvironmentBlock);
     const LIST_ENTRY* head = &peb->Ldr->InMemoryOrderModuleList;

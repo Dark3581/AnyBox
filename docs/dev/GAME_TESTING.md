@@ -203,10 +203,10 @@ Tested on 2026-11-25 with an 8 GB desktop GPU (NVIDIA driver, PCIe 4.0 x16), 12 
 |---|---|
 | Boot, first-run setup, legal screens | passed |
 | Start screen and intro video | renders |
-| Loading screen | renders at 28 to 32 fps; the first in-world frame comes about 13 minutes after start (longer right after a reboot, when the title's files are not cached) |
+| Loading screen | renders at 28 to 32 fps; the first in-world frame comes about 15 minutes after start (longer right after a reboot, when the title's files are not cached) |
 | Into the game | reached; the opening sequence with its credits plays for 35 minutes and more |
 | Game world | drawn and lit: geometry, materials, sky and lighting render. Directly indexed descriptor heaps, the stencil plane, the title's one-time lookup tables and textures shared between two formats were the missing pieces |
-| Frame rate in game | 1 to 2 fps: each frame keeps the GPU busy for 1 to 2 seconds, most of it on title buffers in system memory that shaders reach over the bus (26 to 1,100 times slower than video memory, measured offline) |
+| Frame rate in game | 1 to 2 fps, not playable yet: each frame keeps the GPU busy for 1 to 2 seconds. Title buffers in system memory that shaders reach over the bus cost most of it (26 to 1,100 times slower than video memory, measured offline); GPU-written title pages can now be kept in video memory (`d3d12_x.title_pages_in_vram_mib`), which did not raise the frame rate on its own. Performance and loading are the open work |
 | Video memory | over an 8 GB card's budget in the world; allocations past it succeed as pageable memory instead of stopping the title |
 | Known artifacts | a grid of black squares (the material mask written through a depth view is not applied yet), banding in the sky |
 | Audio | silent: the DSP connection is accepted, its commands are dropped |

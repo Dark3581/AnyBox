@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace abx::d3d12x {
 
@@ -19,6 +20,8 @@ struct PipelineSource {
     std::string key;
     std::filesystem::path module;
     std::uint32_t subgroupSize = 0;
+    bool threadLimited = false;
+    std::uint32_t limitRegister = 0;
 };
 
 struct GraphicsShaderSource {
@@ -45,6 +48,7 @@ struct PipelineEntry {
     bool driverCacheHit = false;
     bool subgroupForced = false;
     bool usesCodeBase = false;
+    std::vector<std::filesystem::path> codeBaseModules;
     std::uintmax_t bytes = 0;
     double seconds = 0.0;
     std::string error;

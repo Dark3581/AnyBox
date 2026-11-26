@@ -1011,8 +1011,43 @@ std::optional<ConsoleTexture> DescribeConsoleTexture(const D3D12_RESOURCE_DESC& 
     return texture;
 }
 
+namespace {
+
+template <std::size_t Element>
+void DetileRow(const std::uint8_t* texels, std::size_t firstByte, std::size_t texelBytes, std::size_t rowBase, std::size_t rowBits, const std::size_t* columnBase,
+               const std::uint32_t* columnBits, std::size_t width, std::uint8_t* out) {
+    for (std::size_t x = 0; x < width; ++x) {
+        const std::size_t at = rowBase + columnBase[x] + (rowBits ^ columnBits[x]);
+        if (at >= firstByte && at - firstByte + Element <= texelBytes) std::memcpy(out + x * Element, texels + (at - firstByte), Element);
+        else std::memset(out + x * Element, 0, Element);
+    }
+}
+
+}
+
+std::optional<std::pair<std::size_t, std::size_t>> SubresourceBytes(const ConsoleTexture& texture, std::uint32_t mip, std::uint32_t slice) {
+    const Chain& chain = texture.chain;
+    if (mip >= chain.levels.size()) return std::nullopt;
+    const MipLevel& level = chain.levels[mip];
+    const Layout& layout = *chain.layout;
+    const bool volume = texture.depth > 0;
+    const std::size_t depth = volume ? level.depth : 1;
+    if (level.width == 0 || level.height == 0 || depth == 0 || (!volume && slice >= texture.array)) return std::nullopt;
+    std::size_t bits = layout.baseXor;
+    for (const std::vector<std::uint32_t>* table : {&layout.ox, &layout.oy, &layout.oz, &layout.hx, &layout.hy, &layout.hz}) {
+        for (const std::uint32_t value : *table) bits |= value;
+    }
+    const std::size_t rowBlockBytes = DivCeil(level.pitch, layout.blockWidth) * layout.blockBytes;
+    const std::size_t firstSlice = volume ? 0 : static_cast<std::size_t>(slice) * chain.sliceBytes;
+    const std::size_t lastSlice = volume ? ((depth - 1) / layout.blockDepth) * chain.sliceBytes : firstSlice;
+    const std::size_t first = firstSlice + level.offset + (level.originY / layout.blockHeight) * rowBlockBytes + (level.originX / layout.blockWidth) * layout.blockBytes;
+    const std::size_t last = lastSlice + level.offset + ((level.originY + level.height - 1) / layout.blockHeight) * rowBlockBytes +
+                             ((level.originX + level.width - 1) / layout.blockWidth) * layout.blockBytes + bits;
+    return std::make_pair(first, last + (std::size_t{1} << layout.elementLog2));
+}
+
 bool DetileSubresource(const ConsoleTexture& texture, const std::uint8_t* texels, std::size_t texelBytes, std::uint32_t mip, std::uint32_t slice, std::uint8_t* destination,
-                       std::size_t rowPitch, std::size_t rows, std::size_t rowBytes, std::string& error) {
+                       std::size_t rowPitch, std::size_t rows, std::size_t rowBytes, std::string& error, std::size_t firstByte) {
     const Chain& chain = texture.chain;
     if (mip >= chain.levels.size()) {
         error = "mip " + std::to_string(mip) + " is past the console texture's " + std::to_string(chain.levels.size());
@@ -1033,6 +1068,16 @@ bool DetileSubresource(const ConsoleTexture& texture, const std::uint8_t* texels
         return false;
     }
     const std::size_t pitchBlocks = DivCeil(level.pitch, layout.blockWidth);
+    static thread_local std::vector<std::size_t> columnBase;
+    static thread_local std::vector<std::uint32_t> columnBits;
+    columnBase.resize(level.width);
+    columnBits.resize(level.width);
+    for (std::size_t x = 0; x < level.width; ++x) {
+        const std::size_t tx = x + level.originX;
+        const std::size_t block = tx / layout.blockWidth;
+        columnBase[x] = block * layout.blockBytes;
+        columnBits[x] = layout.ox[tx % layout.blockWidth] ^ layout.hx[block % layout.hx.size()];
+    }
     for (std::size_t z = 0; z < depth; ++z) {
         const std::size_t zPattern = volume ? z : slice;
         const std::size_t sliceBase = volume ? (z / layout.blockDepth) * chain.sliceBytes : static_cast<std::size_t>(slice) * chain.sliceBytes;
@@ -1042,13 +1087,31 @@ bool DetileSubresource(const ConsoleTexture& texture, const std::uint8_t* texels
             const std::size_t ty = y + level.originY;
             const std::size_t rowBase = sliceBase + level.offset + (ty / layout.blockHeight) * pitchBlocks * layout.blockBytes;
             const std::uint32_t yBits = zBits ^ layout.oy[ty % layout.blockHeight] ^ layout.hy[(ty / layout.blockHeight) % layout.hy.size()];
+            const std::size_t rowBits = static_cast<std::size_t>(yBits) ^ layout.baseXor;
             std::uint8_t* out = plane + y * rowPitch;
-            for (std::size_t x = 0; x < level.width; ++x) {
-                const std::size_t tx = x + level.originX;
-                const std::size_t at = rowBase + (tx / layout.blockWidth) * layout.blockBytes +
-                                       ((yBits ^ layout.ox[tx % layout.blockWidth] ^ layout.hx[(tx / layout.blockWidth) % layout.hx.size()]) ^ layout.baseXor);
-                if (at + element <= texelBytes) std::memcpy(out + x * element, texels + at, element);
-                else std::memset(out + x * element, 0, element);
+            switch (element) {
+            case 1:
+                DetileRow<1>(texels, firstByte, texelBytes, rowBase, rowBits, columnBase.data(), columnBits.data(), level.width, out);
+                break;
+            case 2:
+                DetileRow<2>(texels, firstByte, texelBytes, rowBase, rowBits, columnBase.data(), columnBits.data(), level.width, out);
+                break;
+            case 4:
+                DetileRow<4>(texels, firstByte, texelBytes, rowBase, rowBits, columnBase.data(), columnBits.data(), level.width, out);
+                break;
+            case 8:
+                DetileRow<8>(texels, firstByte, texelBytes, rowBase, rowBits, columnBase.data(), columnBits.data(), level.width, out);
+                break;
+            case 16:
+                DetileRow<16>(texels, firstByte, texelBytes, rowBase, rowBits, columnBase.data(), columnBits.data(), level.width, out);
+                break;
+            default:
+                for (std::size_t x = 0; x < level.width; ++x) {
+                    const std::size_t at = rowBase + columnBase[x] + (rowBits ^ columnBits[x]);
+                    if (at >= firstByte && at - firstByte + element <= texelBytes) std::memcpy(out + x * element, texels + (at - firstByte), element);
+                    else std::memset(out + x * element, 0, element);
+                }
+                break;
             }
         }
     }

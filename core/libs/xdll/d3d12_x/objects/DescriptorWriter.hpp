@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -19,7 +20,8 @@ namespace abx::d3d12x {
 
 class DescriptorWriter {
 public:
-    static std::string DescribeImageWords(const std::uint32_t* words);
+    static std::string DescribeImageWords(const std::uint32_t* words, Resource** resource = nullptr, int* format = nullptr);
+    static bool WhileBound(const Resource* resource, const std::function<void()>& work);
     static void ForgetResource(const Resource* resource);
     explicit DescriptorWriter(const ResourceContext& context) : context_(context) {}
     ~DescriptorWriter();

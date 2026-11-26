@@ -26,6 +26,7 @@ public:
         std::size_t used = 0;
     };
     std::uintptr_t Transient(std::size_t bytes, std::size_t alignment, TransientBlock*& created, std::string& error);
+    static std::uintptr_t ReserveHigh(std::size_t size, std::string& error);
 
 protected:
     bool Implements(REFIID riid) const override;

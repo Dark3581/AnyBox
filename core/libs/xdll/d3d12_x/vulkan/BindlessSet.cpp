@@ -174,7 +174,10 @@ BindlessSet::Fallback* BindlessSet::FallbackFor(const BindingSpec& spec, std::st
     VkMemoryRequirements requirements{};
     vk.getImageMemoryRequirements(device_.Handle(), stored.image, &requirements);
     const std::optional<std::uint32_t> type = device_.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryPriorityAllocateInfoEXT priority{VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT};
+    priority.priority = 0.75f;
     VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    if (device_.PageableMemory()) allocate.pNext = &priority;
     allocate.allocationSize = requirements.size;
     allocate.memoryTypeIndex = type.value_or(0);
     if (!type || vk.allocateMemory(device_.Handle(), &allocate, nullptr, &stored.memory) != VK_SUCCESS ||
