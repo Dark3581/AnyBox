@@ -123,6 +123,13 @@ struct DeviceFunctions {
 
 const std::vector<std::string>& KnownShaderFeatures();
 
+struct RecordedCommandCounts {
+    std::atomic<std::uint64_t> renderPasses{0};
+    std::atomic<std::uint64_t> pipelineBarriers{0};
+};
+
+RecordedCommandCounts& RecordedCommands();
+
 class VulkanDevice {
 public:
     static std::unique_ptr<VulkanDevice> Create(const DeviceRequirements& requirements, std::string& error);
@@ -147,6 +154,7 @@ public:
     bool ConservativeRasterization() const { return conservative_; }
     const std::uint32_t* MeshMaxGroups() const { return meshMaxGroups_; }
     std::uint32_t MeshMaxTotal() const { return meshMaxTotal_; }
+    std::uint32_t MeshPreferredLanes() const { return meshPreferredLanes_; }
     std::string FaultReport() const;
     std::string CheckpointReport() const;
     void Checkpoint(VkCommandBuffer commands, const char* marker) const;
@@ -212,6 +220,7 @@ private:
     bool bufferDeviceAddress_ = false;
     VkDeviceSize hostImportAlignment_ = 0;
     std::uint32_t meshMaxGroups_[3] = {};
+    std::uint32_t meshPreferredLanes_ = 0;
     std::uint32_t meshMaxTotal_ = 0;
     PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties_ = nullptr;
     PFN_vkGetPhysicalDeviceFormatProperties formatProperties_ = nullptr;

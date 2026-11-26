@@ -1537,6 +1537,18 @@ ABX_API HRESULT D3D12XboxCreateDevice(IUnknown* adapter, const void* parameters,
     const char* cacheFile = AbxSetting("d3d12_x.pipeline_cache");
     created->pipelineCache = std::make_unique<abx::d3d12x::PipelineCache>(*created->vulkan, cacheFile != nullptr ? std::filesystem::path(cacheFile) : std::filesystem::path());
     created->pipelines = std::make_unique<abx::d3d12x::PipelineLibrary>(*created->vulkan, created->pipelineCache->Handle(), 0);
+    {
+        const char* const value = AbxSetting("d3d12_x.mesh_registers_in_memory");
+        const bool turns = value != nullptr && std::strtoul(value, nullptr, 10) != 0;
+        created->pipelines->RunMeshGroupsInTurns(turns);
+        AbxLog("d3d12_x",
+               turns ? "mesh shaders whose group is wider than the %u lanes this device prefers are built to run the group in turns of that many lanes "
+                       "(d3d12_x.mesh_registers_in_memory = 1): every lane's registers and variables are kept once for each turn, and the code between two barriers runs for one "
+                       "turn after the other. Each such mesh pipeline is compiled once more"
+                     : "mesh shaders are built as the store has them (d3d12_x.mesh_registers_in_memory = 1 runs a mesh group wider than the %u lanes this device prefers in turns "
+                       "of that many lanes)",
+               created->vulkan->MeshPreferredLanes());
+    }
     created->pipelineContext =
         std::make_unique<abx::d3d12x::PipelineContext>(abx::d3d12x::PipelineContext{abx::d3d12x::TitleShaderStore(), *created->pipelines});
     AbxLog("d3d12_x", "D3D12XboxCreateDevice: pipeline cache %s (%zu bytes seeded)", created->pipelineCache->Note().c_str(), created->pipelineCache->SeedBytes());

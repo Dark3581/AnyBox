@@ -2,7 +2,7 @@
 
 ## Status
 
-Title 7952987A (version 1.0.2.1) boots through its first-run legal screens, plays its loading screen and loads into the game world in about 15 minutes. The world is drawn and lit, and the opening sequence plays for 35 minutes and more, but at 1 to 2 fps on an 8 GB desktop GPU, so it is not playable yet: performance and loading time are the work now. Details: [Bring-up status](docs/dev/GAME_TESTING.md#bring-up-status).
+Title 7952987A (version 1.0.2.1) boots through its first-run legal screens, plays its loading screen and loads into the game world in about 15 minutes. The world is drawn and lit, and the opening sequence plays for 35 minutes and more, but at 3 to 4 fps on an 8 GB desktop GPU, so it is not playable yet: performance and loading time are the work now. Details: [Bring-up status](docs/dev/GAME_TESTING.md#bring-up-status).
 
 <!-- docs:start -->
 <details>
@@ -450,7 +450,7 @@ Tested on 2026-11-25 with an 8 GB desktop GPU (NVIDIA driver, PCIe 4.0 x16), 12 
 | Loading screen | renders at 28 to 32 fps; the first in-world frame comes about 15 minutes after start (longer right after a reboot, when the title's files are not cached) |
 | Into the game | reached; the opening sequence with its credits plays for 35 minutes and more |
 | Game world | drawn and lit: geometry, materials, sky and lighting render. Directly indexed descriptor heaps, the stencil plane, the title's one-time lookup tables and textures shared between two formats were the missing pieces |
-| Frame rate in game | 1 to 2 fps, not playable yet: each frame keeps the GPU busy for 1 to 2 seconds. Title buffers in system memory that shaders reach over the bus cost most of it (26 to 1,100 times slower than video memory, measured offline); GPU-written title pages can now be kept in video memory (`d3d12_x.title_pages_in_vram_mib`), which did not raise the frame rate on its own. Performance and loading are the open work |
+| Frame rate in game | 3 to 4 fps (run 76, 2026-11-26), not playable yet: the GPU spends about 457 ms on a frame (814 ms in run 72). Title buffers in system memory that shaders reach over the bus cost most of it (26 to 1,100 times slower than video memory, measured offline). GPU-written title pages can be kept in video memory (`d3d12_x.title_pages_in_vram_mib`); with `d3d12_x.title_pages_partial` and `d3d12_x.title_pages_table_commands` small atomic counters stay there too, which took the screen-probe binning shader from 33.7 ms to under 6 ms a call. Since run 73, `d3d12_x.indirect_groups_max = 200000` skips the screen-probe ray trace, which runs on unwritten data. Performance and loading are the open work |
 | Video memory | over an 8 GB card's budget in the world; allocations past it succeed as pageable memory instead of stopping the title |
 | Known artifacts | a grid of black squares (the material mask written through a depth view is not applied yet), banding in the sky |
 | Audio | silent: the DSP connection is accepted, its commands are dropped |
@@ -685,17 +685,20 @@ Tool for porting GDK console executables to Windows PCs, by relinking them again
 
 No emulation and no separate runtime process. A GDK title is already an x86-64 PE program. The [relinker](core/relinker) points its imports at AnyBox's own DLLs ([core/libs/xdll](core/libs/xdll)) and switches the console subsystem to a Windows one. The converted program then runs as an ordinary Windows process.
 
-## Status
+## Stats
 
-Early. The relinker, the library build, the run reports and the progress tracking work end to end on a test title. Most system functions are still stubs that stop the title with a report naming the function.
+Measured on one desktop PC with an 8 GB GPU, title 7952987A version 1.0.2.1, short runs stopped at 16:30 after start.
 
-[![libraries](https://dark3581.github.io/AnyBox/badge-libraries.svg)](https://dark3581.github.io/AnyBox/progress.html)
+| | Value | Run, date |
+|---|---|---|
+| Start to game world | about 15 minutes | runs 64 to 76 |
+| Frame rate in the world | 3 to 4 fps | run 76, 2026-11-26 |
+| GPU time a frame (mean of 29 profiled frames) | 457 ms (lowest 252 ms) | run 76, 2026-11-26 |
+| GPU time a frame before the speed work of 2026-11-26 | 814 ms, 1 to 2 fps | run 72, 2026-11-26 |
 
-[![progress map](https://dark3581.github.io/AnyBox/progress.svg)](https://dark3581.github.io/AnyBox/progress.html)
+The runs since run 73 set `d3d12_x.indirect_groups_max = 200000`, which skips indirect dispatches asking for more groups than that. In this title that skips the screen-probe ray trace, which runs on data nothing has written yet.
 
-<sub>Each tile is a library, sized by its number of functions, and each square in it is one function: implemented (green), forwarded to Windows (blue), stub (grey) or known but not declared yet (dark). A dashed red tile is a DLL that titles import and no AnyBox library serves yet. `*` marks a library whose full export list is not known yet, so its total grows as titles are audited. Known functions come from the [export inventories](docs/inventory) and [title needs records](docs/needs).</sub>
-
-The [progress page](https://dark3581.github.io/AnyBox/progress.html) lists every function as implemented, forwarded, stub or not declared, and every DLL with no library. It is regenerated on each push to `main` by [`tools/progress.py`](tools/progress.py); the [history](https://dark3581.github.io/AnyBox/history.html) shows how it grows.
+## Libraries
 
 | Library | Serves | State |
 |---|---|---|

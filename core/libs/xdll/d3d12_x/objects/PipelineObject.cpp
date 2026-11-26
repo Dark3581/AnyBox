@@ -20,6 +20,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -283,6 +284,41 @@ bool ComputeOnFirstUse() {
     return enabled;
 }
 constexpr std::uint64_t kRefusedBytes = 16ull << 20;
+constexpr std::size_t kFormatVariants = 4;
+constexpr std::size_t kModuleHeadBytes = 256u << 10;
+
+bool SpecializeBufferFormats() {
+    static const bool enabled = [] {
+        const char* value = AbxSetting("d3d12_x.specialize_buffer_formats");
+        const bool on = value != nullptr && value[0] == '1' && value[1] == 0;
+        if (on) {
+            AbxLog("d3d12_x", "compute modules over %llu MiB of SPIR-V that name buffer format sources are built for the word 3 their dispatch reads from title memory "
+                              "(d3d12_x.specialize_buffer_formats = 1; off unless set): up to %zu builds a pipeline, one for each set of words, in the background; a dispatch "
+                              "waits for none of them and is skipped until its build is done; more sets, or a word that cannot be read, use the module as stored",
+                   static_cast<unsigned long long>(kHeavyBytes >> 20), kFormatVariants);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+std::vector<BufferFormatSource> ModuleFormatSources(const std::filesystem::path& module, std::string& why) {
+    std::ifstream in(module, std::ios::binary);
+    std::vector<std::uint32_t> words(kModuleHeadBytes / sizeof(std::uint32_t));
+    in.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(kModuleHeadBytes));
+    const std::size_t count = static_cast<std::size_t>(in.gcount()) / sizeof(std::uint32_t);
+    return ReadBufferFormatSources(words.data(), count, why);
+}
+
+std::string FormatWordsText(const std::vector<std::uint32_t>& words) {
+    std::string text;
+    for (const std::uint32_t word : words) {
+        char piece[16];
+        std::snprintf(piece, sizeof(piece), "%s%08x", text.empty() ? "" : " ", word);
+        text += piece;
+    }
+    return text;
+}
 
 std::uint64_t ModuleBytes(const std::filesystem::path& module) {
     std::error_code error;
@@ -366,6 +402,89 @@ void PipelineStateObject::BuildInBackground(std::function<PipelineEntry()> build
         false, heavy_);
 }
 
+void PipelineStateObject::StartGenericBuild() {
+    if (genericStarted_.exchange(true) || !genericBuild_) return;
+    unbuilt_.clear();
+    BuildInBackground(std::move(genericBuild_), genericBytes_);
+}
+
+VkPipeline PipelineStateObject::FormatVariant(const std::vector<std::uint32_t>& words, bool& pending, bool& generic, std::string& why) {
+    pending = false;
+    generic = false;
+    why.clear();
+    FormatVariantBuild* build = nullptr;
+    {
+        const std::lock_guard guard(variantLock_);
+        const auto found = variants_.find(words);
+        if (found != variants_.end()) {
+            build = found->second.get();
+        } else {
+            if (variants_.size() >= kFormatVariants) {
+                generic = true;
+                why = "its dispatches read more than " + std::to_string(kFormatVariants) + " sets of buffer format words";
+                return VK_NULL_HANDLE;
+            }
+            if (moduleBytes_ > kRefusedBytes) {
+                why = "its shaders hold " + std::to_string(moduleBytes_ >> 20) + " MiB of SPIR-V, more than the " + std::to_string(kRefusedBytes >> 20) + " MiB AnyBox hands the driver";
+                return VK_NULL_HANDLE;
+            }
+            const std::string key = PipelineKey(shaders_) + "|formats " + FormatWordsText(words);
+            if (BadPipelines().count(key) != 0) {
+                why = "this pipeline crashed the driver's shader compiler in an earlier run";
+                return VK_NULL_HANDLE;
+            }
+            if (!computeSource_ || library_ == nullptr) {
+                why = "the pipeline has no compute module";
+                return VK_NULL_HANDLE;
+            }
+            build = variants_.emplace(words, std::make_unique<FormatVariantBuild>()).first->second.get();
+            PipelineSource source = *computeSource_;
+            source.constants = BufferFormatConstants(formatSources_, words);
+            const std::size_t number = variants_.size();
+            AbxLog("d3d12_x", "compute pipeline %s is built for buffer format words %s (build %zu of at most %zu, %llu KiB of SPIR-V, in the background)",
+                   shaders_.empty() ? "(no shader)" : shaders_.front().c_str(), FormatWordsText(words).c_str(), number, kFormatVariants,
+                   static_cast<unsigned long long>(moduleBytes_ >> 10));
+            AddRef();
+            BuildQueue::Instance().Push(
+                [this, build, source, key] {
+                    const std::size_t length = (std::min)(key.size(), sizeof(t_building) - 1);
+                    std::memcpy(t_building, key.data(), length);
+                    t_building[length] = 0;
+                    const PipelineEntry entry = library_->Compute(source);
+                    t_building[0] = 0;
+                    if (entry.pipeline == VK_NULL_HANDLE) {
+                        ++Stats().pipelinesFailed;
+                        build->error = std::string("the pipeline for its buffer formats was ") + PipelineOriginName(entry.origin) + (entry.error.empty() ? "" : ": " + entry.error);
+                        AbxLog("d3d12_x", "compute pipeline %s for buffer format words was not built: %s", shaders_.empty() ? "(no shader)" : shaders_.front().c_str(),
+                               build->error.c_str());
+                    } else {
+                        ++Stats().pipelinesBuilt;
+                        if (entry.origin == PipelineOrigin::Ready) ++Stats().pipelinesFromCache;
+                        else Stats().pipelineCompileMs += static_cast<std::uint64_t>(entry.seconds * 1000.0);
+                        {
+                            const std::lock_guard guard(variantLock_);
+                            if (!codeBaseNoted_.exchange(true)) {
+                                usesCodeBase_ = entry.usesCodeBase;
+                                codeBaseModules_ = entry.codeBaseModules;
+                            }
+                        }
+                        AbxLog("d3d12_x", "compute pipeline %s for buffer format words is %s in %.1f s", shaders_.empty() ? "(no shader)" : shaders_.front().c_str(),
+                               PipelineOriginName(entry.origin), entry.seconds);
+                        build->pipeline.store(entry.pipeline, std::memory_order_release);
+                    }
+                    build->pending.store(false, std::memory_order_release);
+                    Release();
+                },
+                true, heavy_);
+        }
+    }
+    pending = build->pending.load(std::memory_order_acquire);
+    if (pending) return VK_NULL_HANDLE;
+    const VkPipeline pipeline = build->pipeline.load(std::memory_order_acquire);
+    if (pipeline == VK_NULL_HANDLE) why = build->error;
+    return pipeline;
+}
+
 void PipelineStateObject::Prioritize() {
     if (!Alive()) AbxUnsupported("ID3D12PipelineState", "a pipeline state used after its last reference was released");
     if (!Pending() || started_.load(std::memory_order_acquire) || prioritized_.exchange(true)) return;
@@ -436,8 +555,30 @@ void PipelineStateObject::RunBuild() {
             if (entry.origin == PipelineOrigin::Ready) ++Stats().pipelinesFromCache;
             else Stats().pipelineCompileMs += static_cast<std::uint64_t>(entry.seconds * 1000.0);
             usesCodeBase_ = entry.usesCodeBase;
+            writesMemory_.store(entry.writesMemory, std::memory_order_relaxed);
             codeBaseModules_ = entry.codeBaseModules;
             origin_ = entry.origin;
+            if (entry.laneTurns != 0 || !entry.laneNote.empty()) {
+                static std::atomic<std::uint64_t> split{0};
+                static std::atomic<std::uint64_t> compiled{0};
+                static std::atomic<std::uint64_t> left{0};
+                if (!entry.laneNote.empty()) {
+                    const std::uint64_t count = ++left;
+                    if (count <= 8 || (count & (count - 1)) == 0) {
+                        AbxLog("d3d12_x", "mesh shader %s runs its group as the store has it (d3d12_x.mesh_registers_in_memory could not split it into turns: %s; %llu so far)",
+                               shaders_.empty() ? "(none)" : shaders_.front().substr(0, 16).c_str(), entry.laneNote.c_str(), static_cast<unsigned long long>(count));
+                    }
+                } else {
+                    const std::uint64_t count = ++split;
+                    const std::uint64_t built = entry.origin == PipelineOrigin::Ready ? compiled.load() : ++compiled;
+                    if (count == 1 || (count & (count - 1)) == 0) {
+                        AbxLog("d3d12_x", "mesh pipelines whose groups run in turns (d3d12_x.mesh_registers_in_memory): %llu so far, %llu of them compiled in this run and the rest from "
+                                          "the pipeline cache (latest %s: %u turns, %zu regions between barriers, %s in %.1f s)",
+                               static_cast<unsigned long long>(count), static_cast<unsigned long long>(built), shaders_.empty() ? "(none)" : shaders_.front().substr(0, 16).c_str(),
+                               entry.laneTurns, entry.laneRegions, PipelineOriginName(entry.origin), entry.seconds);
+                    }
+                }
+            }
             pipeline_.store(entry.pipeline, std::memory_order_release);
         }
         build_ = nullptr;
@@ -618,7 +759,31 @@ HRESULT PipelineStateObject::CreateCompute(const PipelineContext& context, IUnkn
     created->shaders_.push_back("cs " + source->key);
     created->computeSource_ = *source;
     created->library_ = &context.library;
-    created->BuildInBackground([&library = context.library, source = *source] { return library.Compute(source); }, ModuleBytes(source->module));
+    std::function<PipelineEntry()> build = [&library = context.library, source = *source] { return library.Compute(source); };
+    const std::uint64_t moduleBytes = ModuleBytes(source->module);
+    if (SpecializeBufferFormats() && moduleBytes > kHeavyBytes) {
+        std::string why;
+        std::vector<BufferFormatSource> sources = ModuleFormatSources(source->module, why);
+        if (!why.empty()) {
+            static std::atomic<int> reported{0};
+            if (reported++ < 10) AbxLog("d3d12_x", "compute module %s is built as stored: %s", source->key.c_str(), why.c_str());
+        }
+        if (!sources.empty()) {
+            static std::atomic<int> reported{0};
+            if (reported++ < 20) {
+                AbxLog("d3d12_x", "compute pipeline cs %s (%llu KiB of SPIR-V) waits for its first dispatch, which reads word 3 of %zu buffer descriptors for it", source->key.c_str(),
+                       static_cast<unsigned long long>(moduleBytes >> 10), sources.size());
+            }
+            created->formatSources_ = std::move(sources);
+            created->genericBuild_ = std::move(build);
+            created->genericBytes_ = moduleBytes;
+            created->moduleBytes_ = moduleBytes;
+            created->heavy_ = moduleBytes > kHeavyBytes;
+            created->unbuilt_ = "its pipeline is built for the buffer formats its dispatch reads";
+            return Finish(created, riid, state, error);
+        }
+    }
+    created->BuildInBackground(std::move(build), moduleBytes);
     return Finish(created, riid, state, error);
 }
 

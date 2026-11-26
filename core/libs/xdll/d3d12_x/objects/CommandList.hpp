@@ -95,6 +95,7 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature*, UINT, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64) override;
 
     VkCommandBuffer Commands() const { return commands_; }
+    std::vector<VkCommandBuffer> CommandBuffers() const;
     bool Closed() const { return closed_; }
     bool CopyPending() const { return copied_; }
     DescriptorHeap* ShaderResourceHeap() const { return shaderResourceHeap_; }
@@ -140,15 +141,22 @@ private:
     const DescriptorRecord& Attachment(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_DESCRIPTOR_HEAP_TYPE type, const char* function) const;
     void ResetBindings();
     void OrderCopy(const char* function);
+    bool CopyThroughTable(std::uint64_t destination, std::uint64_t source, std::uint64_t bytes, const char* function);
+    bool FillThroughTable(std::uint64_t destination, std::uint64_t bytes, std::uint32_t value, const char* function);
     std::optional<TitleAddressSpace::Location> LocateTitleMemory(std::uint64_t address, std::uint64_t wanted, bool write, std::uint64_t& available, std::uint64_t bytes, const char* function);
     void BindPipeline(ID3D12PipelineState* state, const char* function);
     void SetSignature(RootArguments& arguments, ID3D12RootSignature* signature, const char* function);
     void ReportRootState(const RootArguments& arguments, const char* function) const;
     void EndPass();
+    bool OpenChecksAhead(const char* function);
+    void CloseChecksAhead();
+    void ReplayState(const char* function);
     bool PrepareDraw(const char* function);
     bool SkippedWork(const char* function);
     bool ResolveCodeBase(const char* function, std::string& reason);
     void PushUserData(RootArguments& arguments, std::uint32_t firstSgpr, const char* function, std::uint32_t threadLimit = 0);
+    void UserDataBlock(RootArguments& arguments, std::uint32_t firstSgpr, const char* function, std::uint32_t threadLimit, std::uint32_t* block);
+    int ChooseFormatVariant(const char* function, VkPipeline& variant, std::string& why);
     void BindTitleSet(VkPipelineBindPoint point);
     const RootParameterLayout& Parameter(const RootArguments& arguments, UINT index, D3D12_ROOT_PARAMETER_TYPE type, const char* function) const;
     void SetConstants(RootArguments& arguments, UINT index, UINT count, const void* data, UINT offset, const char* function);
@@ -216,8 +224,17 @@ private:
     std::optional<D3D12_PRIMITIVE_TOPOLOGY> topology_;
     const char* checkpointDetail_ = nullptr;
     bool pipelineBound_ = false;
+    VkPipeline workPipeline_ = VK_NULL_HANDLE;
     bool graphicsSetBound_ = false;
     bool computeSetBound_ = false;
+    std::vector<VkCommandBuffer> finished_;
+    VkCommandBuffer checkCopies_ = VK_NULL_HANDLE;
+    VkCommandBuffer checks_ = VK_NULL_HANDLE;
+    bool checksWritten_ = false;
+    std::array<float, 4> blendFactor_{};
+    UINT stencilReference_ = 0;
+    std::optional<std::pair<BufferRef, DXGI_FORMAT>> indexBuffer_;
+    std::array<std::optional<VertexBufferRef>, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexBuffers_{};
 };
 
 }

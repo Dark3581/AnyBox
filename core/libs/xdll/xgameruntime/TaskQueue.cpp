@@ -59,16 +59,24 @@ struct Waiter : std::enable_shared_from_this<Waiter> {
     bool owed = false;
 };
 
-thread_local std::vector<const Queue*> t_runningQueues;
-thread_local std::vector<const Monitor*> t_monitors;
+std::vector<const Queue*>& RunningQueues() {
+    thread_local std::vector<const Queue*>* const queues = new std::vector<const Queue*>();
+    return *queues;
+}
+
+std::vector<const Monitor*>& ActiveMonitors() {
+    thread_local std::vector<const Monitor*>* const monitors = new std::vector<const Monitor*>();
+    return *monitors;
+}
+
 thread_local const Waiter* t_signaledWaiter = nullptr;
 
 void CALLBACK WaitSignaled(PTP_CALLBACK_INSTANCE, void* context, PTP_WAIT, TP_WAIT_RESULT result);
 
 class Running {
 public:
-    explicit Running(const Queue* queue) { t_runningQueues.push_back(queue); }
-    ~Running() { t_runningQueues.pop_back(); }
+    explicit Running(const Queue* queue) { RunningQueues().push_back(queue); }
+    ~Running() { RunningQueues().pop_back(); }
     Running(const Running&) = delete;
     Running& operator=(const Running&) = delete;
 };
@@ -265,7 +273,7 @@ public:
         const std::shared_ptr<Monitor> monitor = *it;
         monitors_.erase(it);
         monitor->removed = true;
-        if (std::find(t_monitors.begin(), t_monitors.end(), monitor.get()) != t_monitors.end()) {
+        if (std::find(ActiveMonitors().begin(), ActiveMonitors().end(), monitor.get()) != ActiveMonitors().end()) {
             lock.unlock();
             AbxUnsupported(function, "unregistering a monitor from inside its own callback");
         }
@@ -286,9 +294,9 @@ public:
                 }
                 ++monitor->active;
             }
-            t_monitors.push_back(monitor.get());
+            ActiveMonitors().push_back(monitor.get());
             monitor->callback(monitor->context, &self_, role);
-            t_monitors.pop_back();
+            ActiveMonitors().pop_back();
             {
                 std::lock_guard lock(monitorMutex_);
                 --monitor->active;
@@ -768,7 +776,7 @@ ABX_API bool XTaskQueueIsEmpty(XTaskQueueHandle queue, XTaskQueuePort port) {
 
 ABX_API HRESULT XTaskQueueTerminate(XTaskQueueHandle queue, bool wait, void* context, XTaskQueueTerminatedCallback* callback) {
     std::shared_ptr<Queue> target = Resolve(queue, __func__);
-    if (wait && std::find(t_runningQueues.begin(), t_runningQueues.end(), target.get()) != t_runningQueues.end()) {
+    if (wait && std::find(RunningQueues().begin(), RunningQueues().end(), target.get()) != RunningQueues().end()) {
         AbxUnsupported(__func__, "waiting termination from one of the queue's own callbacks");
     }
     std::vector<Item> canceled = target->BeginTerminate();

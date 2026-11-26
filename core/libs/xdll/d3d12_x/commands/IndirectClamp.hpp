@@ -19,13 +19,22 @@ struct ClampedArguments {
     VkDeviceSize size = 0;
 };
 
+struct TableArguments {
+    std::uint64_t root = 0;
+    std::uint64_t title = 0;
+};
+
 class IndirectClamp {
 public:
     static IndirectClamp* For(const VulkanDevice& device);
     static std::string RecentReport();
 
     std::optional<ClampedArguments> RecordDispatches(VkCommandBuffer commands, VkBuffer arguments, VkDeviceSize offset, std::uint32_t records, std::uint32_t stride, bool mesh,
-                                                     std::string& error);
+                                                     std::string& error, const TableArguments* table = nullptr);
+    void BeginBatch(VkCommandBuffer copies, VkCommandBuffer checks);
+    std::optional<ClampedArguments> RecordBatched(VkCommandBuffer copies, VkCommandBuffer checks, VkBuffer arguments, VkDeviceSize offset, std::uint32_t records,
+                                                  std::uint32_t stride, bool mesh, std::string& error, const TableArguments* table = nullptr);
+    void EndBatch(VkCommandBuffer checks);
     void Trace(VkCommandBuffer commands, const ClampedArguments& checked, std::uint32_t records, std::uint32_t stride, bool mesh, VkBuffer count, VkDeviceSize countOffset,
                std::uint64_t titleAddress, std::string label);
     static void ReportTraced(std::uint64_t present);
@@ -35,6 +44,12 @@ private:
     bool Create(std::string& error);
     void Report();
     VkDeviceSize Reserve(VkDeviceSize room);
+    struct Prepared {
+        VkDeviceSize at = 0;
+        VkDeviceSize span = 0;
+    };
+    std::optional<Prepared> Prepare(std::uint32_t records, std::uint32_t stride, bool mesh, std::string& error);
+    void PushAndDispatch(VkCommandBuffer commands, const Prepared& prepared, std::uint32_t records, std::uint32_t stride, bool mesh);
 
     static constexpr std::uint32_t kNotRun = 0xAB0D15EDu;
     static constexpr VkDeviceSize kHeaderBytes = 64;

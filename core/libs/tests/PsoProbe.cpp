@@ -11,7 +11,10 @@
 #include "DescriptorSizes.hpp"
 #include "DescriptorWriter.hpp"
 #include "Fence.hpp"
+#include "IndirectClamp.hpp"
+#include "LiveStats.hpp"
 #include "GraphicsPipeline.hpp"
+#include "MemoryWrites.hpp"
 #include "GraphicsState.hpp"
 #include "PipelineCompiler.hpp"
 #include "PipelineLibrary.hpp"
@@ -32,6 +35,7 @@
 #include <d3d12.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -40,6 +44,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <optional>
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
@@ -1966,6 +1972,36 @@ int IndirectSelfTest() {
         error.clear();
         if (TranslateCommandSignature(desc, error) || error.find(expected) == std::string::npos) return Fail(std::string("refusal '") + expected + "' gave '" + error + "'");
     }
+    const auto module = [](std::initializer_list<std::vector<std::uint32_t>> instructions) {
+        std::vector<std::uint32_t> words{0x07230203u, 0x00010600u, 0, 64, 0};
+        for (const std::vector<std::uint32_t>& instruction : instructions) {
+            words.push_back(static_cast<std::uint32_t>(instruction.size() << 16) | instruction.front());
+            words.insert(words.end(), instruction.begin() + 1, instruction.end());
+        }
+        return words;
+    };
+    const std::vector<std::uint32_t> integer{21, 1, 32, 0};
+    const std::pair<std::vector<std::uint32_t>, bool> writes[] = {
+        {module({integer, {32, 2, 7, 1}, {59, 2, 3, 7}, {62, 3, 4}}), false},
+        {module({integer, {32, 2, 3, 1}, {59, 2, 3, 3}, {62, 3, 4}}), false},
+        {module({integer, {32, 2, 4, 1}, {59, 2, 3, 4}, {234, 1, 5, 3, 6, 7, 8}}), false},
+        {module({integer, {32, 2, 5349, 1}, {120, 2, 3, 4}, {62, 3, 5}}), true},
+        {module({integer, {32, 2, 12, 1}, {59, 2, 3, 12}, {65, 2, 4, 3, 5}, {234, 1, 6, 4, 7, 8, 9}}), true},
+        {module({integer, {32, 2, 12, 1}, {59, 2, 3, 12}, {228, 3, 5, 6, 7}}), true},
+        {module({integer, {32, 2, 7, 1}, {59, 2, 3, 7}, {245, 2, 4, 3, 10, 5, 11}, {62, 4, 6}, {32, 7, 5349, 1}, {120, 7, 5, 8}}), false},
+        {module({integer, {32, 2, 5349, 1}, {39, 2, 5349}, {124, 2, 3, 4}, {63, 3, 5}}), true},
+        {module({{99, 1, 2, 3}}), true},
+        {module({integer, {62, 9, 4}}), true},
+        {{0x07230203u, 0x00010600u, 0, 64, 0, (5u << 16) | 62u, 1}, true},
+        {{0x12345678u, 0, 0, 0, 0}, true},
+        {std::vector<std::uint32_t>(std::begin(kDispatchFill), std::end(kDispatchFill)), true},
+        {std::vector<std::uint32_t>(std::begin(kGraphicsFloat), std::end(kGraphicsFloat)), false},
+        {std::vector<std::uint32_t>(std::begin(kQuadrantVertex), std::end(kQuadrantVertex)), false},
+        {std::vector<std::uint32_t>(std::begin(kGraphicsVertex), std::end(kGraphicsVertex)), false},
+    };
+    for (std::size_t index = 0; index < std::size(writes); ++index) {
+        if (MayWriteMemory(writes[index].first) != writes[index].second) return Fail("memory write scan case " + std::to_string(index));
+    }
     std::puts("PASS indirect selftest");
     return 0;
 }
@@ -3099,6 +3135,185 @@ int CommandListGpu(bool validate) {
     return status;
 }
 
+int ClampBatchGpu(bool validate) {
+    DeviceRequirements requirements;
+    requirements.features = {"bufferDeviceAddress", "shaderInt64", "meshShader"};
+    requirements.validation = validate;
+    std::string error;
+    const std::unique_ptr<VulkanDevice> device = VulkanDevice::Create(requirements, error);
+    if (!device) {
+        std::printf("SKIP no usable Vulkan device: %s\n", error.c_str());
+        return validate && error == "the Khronos validation layer is not installed" ? kNoValidation : kNoDevice;
+    }
+    IndirectClamp* clamp = IndirectClamp::For(*device);
+    if (clamp == nullptr) {
+        std::puts("SKIP indirect argument checks are not available on this device");
+        return kNoDevice;
+    }
+    const DeviceFunctions& vk = device->Vk();
+    int status = 0;
+    std::size_t checks = 0;
+    const auto expect = [&](bool ok, const std::string& what) {
+        ++checks;
+        if (!ok && status == 0) status = Fail(what);
+    };
+    DeviceBuffer arguments;
+    DeviceBuffer results;
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (!CreateHostBuffer(*device, 4096, usage, arguments, error) || !CreateHostBuffer(*device, 4096, usage, results, error)) return Fail("buffers: " + error);
+    if (arguments.address == 0) return Fail("the argument buffer has no device address");
+    const std::uint32_t records[] = {2, 3, 1, 9, 0xFFFFFFFFu, 1, 1, 9, 5, 1, 1, 9, 1, 1, 1, 9};
+    std::memcpy(arguments.mapped, records, sizeof(records));
+    constexpr VkDeviceSize kDispatchWritten = 128;
+    constexpr VkDeviceSize kEarlierWritten = 256;
+    const std::uint32_t stale[3] = {9, 9, 9};
+    std::memcpy(static_cast<std::uint8_t*>(arguments.mapped) + kDispatchWritten, stale, sizeof(stale));
+    std::memcpy(static_cast<std::uint8_t*>(arguments.mapped) + kEarlierWritten, stale, sizeof(stale));
+    std::memset(results.mapped, 0xAB, 4096);
+    VkShaderModuleCreateInfo fillInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    fillInfo.codeSize = sizeof(kDispatchFill);
+    fillInfo.pCode = kDispatchFill;
+    VkShaderModule fillModule = VK_NULL_HANDLE;
+    if (vk.createShaderModule(device->Handle(), &fillInfo, nullptr, &fillModule) != VK_SUCCESS) return Fail("fill shader module");
+    VkComputePipelineCreateInfo fillPipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    fillPipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, fillModule, "main", nullptr};
+    fillPipelineInfo.layout = device->TitlePipelineLayout();
+    VkPipeline fill = VK_NULL_HANDLE;
+    const VkResult fillResult = vk.createComputePipelines(device->Handle(), VK_NULL_HANDLE, 1, &fillPipelineInfo, nullptr, &fill);
+    vk.destroyShaderModule(device->Handle(), fillModule, nullptr);
+    if (fillResult != VK_SUCCESS) return Fail("fill pipeline");
+    const auto dispatchFill = [&](VkCommandBuffer commands, VkDeviceSize at, std::uint32_t base) {
+        struct {
+            std::uint64_t address;
+            std::uint32_t base;
+            std::uint32_t count;
+        } constants{arguments.address + at, base, 3};
+        vk.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, fill);
+        vk.cmdPushConstants(commands, device->TitlePipelineLayout(), VK_SHADER_STAGE_ALL, 0, sizeof(constants), &constants);
+        vk.cmdDispatch(commands, 1, 1, 1);
+    };
+    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.queueFamilyIndex = device->QueueFamily();
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (vk.createCommandPool(device->Handle(), &poolInfo, nullptr, &pool) != VK_SUCCESS) return Fail("command pool");
+    std::array<VkCommandBuffer, 5> buffers{};
+    VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocate.commandPool = pool;
+    allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocate.commandBufferCount = static_cast<std::uint32_t>(buffers.size());
+    if (vk.allocateCommandBuffers(device->Handle(), &allocate, buffers.data()) != VK_SUCCESS) return Fail("command buffers");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    for (VkCommandBuffer buffer : buffers) vk.beginCommandBuffer(buffer, &begin);
+    const VkCommandBuffer before = buffers[0];
+    const VkCommandBuffer copies = buffers[1];
+    const VkCommandBuffer checked = buffers[2];
+    const VkCommandBuffer after = buffers[3];
+    const VkCommandBuffer earlier = buffers[4];
+    vk.cmdFillBuffer(before, arguments.buffer, 48, 4, 0x7FFFFFFFu);
+    dispatchFill(before, kDispatchWritten, 1);
+    dispatchFill(earlier, kEarlierWritten, 2);
+    clamp->BeginBatch(copies, checked);
+    const std::uint64_t ahead = Stats().clampsAhead.load();
+    const std::optional<ClampedArguments> three = clamp->RecordBatched(copies, checked, arguments.buffer, 0, 3, 16, false, error);
+    expect(three.has_value() && three->size == 44, "three records checked in a batch: " + error);
+    const std::optional<ClampedArguments> one = clamp->RecordBatched(copies, checked, arguments.buffer, 48, 1, 16, true, error);
+    expect(one.has_value() && one->size == 12, "one mesh record checked in the same batch: " + error);
+    const std::optional<ClampedArguments> dispatched = clamp->RecordBatched(copies, checked, arguments.buffer, kDispatchWritten, 1, 12, true, error);
+    expect(dispatched.has_value(), "a mesh record a dispatch before the batch writes: " + error);
+    const std::optional<ClampedArguments> submittedBefore = clamp->RecordBatched(copies, checked, arguments.buffer, kEarlierWritten, 1, 12, true, error);
+    expect(submittedBefore.has_value(), "a mesh record an earlier submission writes: " + error);
+    expect(Stats().clampsAhead.load() == ahead + 4, "checks ahead are counted");
+    clamp->EndBatch(checked);
+    const std::string unrun = IndirectClamp::RecentReport();
+    expect(unrun.find("[mesh, 1 record(s), not run by the GPU yet]") != std::string::npos && unrun.find(" 1:- 1:- 1:-") != std::string::npos,
+           "checks the GPU has not run yet are reported as not run: " + unrun.substr(0, 400));
+    expect(!clamp->RecordBatched(copies, checked, arguments.buffer, 0, 1, 10, true, error).has_value(), "a stride below 12 bytes is refused");
+    if (status != 0) return status;
+    vk.cmdFillBuffer(after, arguments.buffer, 0, 64, 0xFFFFFFFFu);
+    VkMemoryBarrier2 toCopy{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    toCopy.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    toCopy.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    toCopy.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toCopy.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &toCopy;
+    vk.cmdPipelineBarrier2(after, &dependency);
+    const VkBufferCopy fromThree{three->offset, 0, three->size};
+    const VkBufferCopy fromOne{one->offset, 64, one->size};
+    const VkBufferCopy fromDispatched{dispatched->offset, 128, dispatched->size};
+    const VkBufferCopy fromEarlier{submittedBefore->offset, 192, submittedBefore->size};
+    vk.cmdCopyBuffer(after, three->buffer, results.buffer, 1, &fromThree);
+    vk.cmdCopyBuffer(after, one->buffer, results.buffer, 1, &fromOne);
+    vk.cmdCopyBuffer(after, dispatched->buffer, results.buffer, 1, &fromDispatched);
+    vk.cmdCopyBuffer(after, submittedBefore->buffer, results.buffer, 1, &fromEarlier);
+    toCopy.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toCopy.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toCopy.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    toCopy.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    vk.cmdPipelineBarrier2(after, &dependency);
+    for (VkCommandBuffer buffer : buffers) vk.endCommandBuffer(buffer);
+    std::vector<VkCommandBufferSubmitInfo> infos;
+    for (VkCommandBuffer buffer : {before, copies, checked, after}) {
+        VkCommandBufferSubmitInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        info.commandBuffer = buffer;
+        infos.push_back(info);
+    }
+    VkCommandBufferSubmitInfo earlierInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    earlierInfo.commandBuffer = earlier;
+    VkSubmitInfo2 earlierSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    earlierSubmit.commandBufferInfoCount = 1;
+    earlierSubmit.pCommandBufferInfos = &earlierInfo;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = static_cast<std::uint32_t>(infos.size());
+    submit.pCommandBufferInfos = infos.data();
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    vk.createFence(device->Handle(), &fenceInfo, nullptr, &fence);
+    {
+        const std::lock_guard guard(device->QueueLock());
+        expect(vk.queueSubmit2(device->Queue(), 1, &earlierSubmit, VK_NULL_HANDLE) == VK_SUCCESS, "submit the command buffer that writes arguments first");
+        expect(vk.queueSubmit2(device->Queue(), 1, &submit, fence) == VK_SUCCESS, "submit the four command buffers");
+    }
+    expect(vk.waitForFences(device->Handle(), 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000) == VK_SUCCESS, "the batch completes");
+    if (status == 0) {
+        std::uint32_t words[19] = {};
+        std::memcpy(words, results.mapped, 44);
+        std::memcpy(words + 16, static_cast<const std::uint8_t*>(results.mapped) + 64, 12);
+        expect(words[0] == 2 && words[1] == 3 && words[2] == 1, "a sane record is kept");
+        expect(words[4] == 0 && words[5] == 0 && words[6] == 0, "a record past the device's limits runs empty");
+        expect(words[8] == 5 && words[9] == 1 && words[10] == 1, "the record after it is kept");
+        expect(words[16] == 0 && words[17] == 0 && words[18] == 0, "a mesh record made impossible by the command buffer before the batch runs empty");
+        expect(words[3] == 9 && words[7] == 9, "words between records are copied unchanged");
+        std::uint32_t written[6] = {};
+        std::memcpy(written, static_cast<const std::uint8_t*>(results.mapped) + 128, 12);
+        std::memcpy(written + 3, static_cast<const std::uint8_t*>(results.mapped) + 192, 12);
+        expect(written[0] == 1 && written[1] == 4 && written[2] == 7, "a dispatch in the command buffer before the batch writes the arguments it checks");
+        expect(written[3] == 2 && written[4] == 5 && written[5] == 8, "an earlier submission writes the arguments the batch checks");
+        const std::string ran = IndirectClamp::RecentReport();
+        expect(ran.find("not run by the GPU yet]") == std::string::npos && ran.find(", 0 of them not run by the GPU yet") != std::string::npos,
+               "checks the GPU ran are reported with their values: " + ran.substr(0, 400));
+        std::uint32_t overwritten[16] = {};
+        std::memcpy(overwritten, arguments.mapped, sizeof(overwritten));
+        expect(overwritten[0] == 0xFFFFFFFFu, "the list after the batch did overwrite the arguments");
+    }
+    vk.destroyFence(device->Handle(), fence, nullptr);
+    vk.destroyCommandPool(device->Handle(), pool, nullptr);
+    vk.destroyPipeline(device->Handle(), fill, nullptr);
+    DestroyBuffer(*device, arguments);
+    DestroyBuffer(*device, results);
+    std::printf("indirect argument checks ahead of a render pass: %zu checks\n", checks);
+    if (validate) {
+        std::printf("validation errors=%zu\n", device->ValidationErrors());
+        for (const std::string& message : device->ValidationMessages()) std::printf("  %.600s\n", message.c_str());
+        if (device->ValidationErrors() != 0) status = 1;
+    }
+    if (status == 0) std::puts("PASS clamp batch gpu");
+    return status;
+}
+
 int DescriptorsGpu(bool validate) {
     DeviceRequirements requirements;
     requirements.features = {"bufferDeviceAddress"};
@@ -3644,6 +3859,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "arena-selftest") == 0) return ArenaSelfTest();
     if (argc >= 2 && std::strcmp(argv[1], "resources-gpu") == 0) return ResourcesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "commandlist-gpu") == 0) return CommandListGpu(HasFlag(argc, argv, "--validate"));
+    if (argc >= 2 && std::strcmp(argv[1], "clamp-batch-gpu") == 0) return ClampBatchGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 2 && std::strcmp(argv[1], "descriptors-gpu") == 0) return DescriptorsGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "pso-objects") == 0) return PipelineObjects(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "planes-gpu") == 0) return PlanesGpu(HasFlag(argc, argv, "--validate"));
@@ -3655,6 +3871,6 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "states-gpu") == 0) return StatesGpu(HasFlag(argc, argv, "--validate"));
     if (argc >= 5 && std::strcmp(argv[1], "graphics") == 0) return GraphicsRequests(argc, argv);
     if (argc >= 2 && std::strcmp(argv[1], "graphics-gpu") == 0) return GraphicsGpu(HasFlag(argc, argv, "--validate"));
-    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | settings-selftest | device-selection | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate] | descriptors-gpu [--validate] | pso-objects <store> compute <cs container> | graphics <vs container> <ps container> [--validate]");
+    std::puts("usage: resolve <store> <container|none> [--flags N] [--node N] [--cached N] | compute <store> <containers file> [--cache F] [--limit BYTES] [--threads N] [--features a,b] [--maintenance8] [--save] | graphics-selftest | graphics-gpu [--validate] | input-selftest | graphics-title <store> <vertex shader container> [--features a,b] [--maintenance8] | dump-test-shaders <folder> | graphics <store> <vertex container> <pixel container> [--layout] [--cache F] [--limit BYTES] [--save] | states-selftest | states-gpu [--validate] | textures-selftest | textures-gpu [--validate] | views-selftest | views-gpu [--validate] | commands-selftest | commands-gpu [--validate] | draw-selftest | draw-gpu [--validate] | indirect-selftest | indirect-gpu [--validate] | planes-gpu [--validate] | buffers-selftest | rootsig-selftest | settings-selftest | device-selection | fence-gpu [--validate] | arena-selftest | resources-gpu [--validate] | commandlist-gpu [--validate] | clamp-batch-gpu [--validate] | descriptors-gpu [--validate] | pso-objects <store> compute <cs container> | graphics <vs container> <ps container> [--validate]");
     return 2;
 }

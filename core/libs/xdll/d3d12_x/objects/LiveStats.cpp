@@ -5,6 +5,7 @@
 #include "FrameTiming.hpp"
 #include "Presenter.hpp"
 #include "Resource.hpp"
+#include "VulkanDevice.hpp"
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -133,6 +134,12 @@ struct TimingSnapshot {
     std::uint64_t presents = 0;
     std::uint64_t nanoseconds[kTimedParts] = {};
     std::uint64_t calls[kTimedParts] = {};
+    std::uint64_t renderPasses = 0;
+    std::uint64_t barriers = 0;
+    std::uint64_t checks = 0;
+    std::uint64_t checksAhead = 0;
+    std::uint64_t checkBatches = 0;
+    std::uint64_t checkBatchesRestarted = 0;
     std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
 };
 
@@ -143,6 +150,12 @@ void ReportFrameTiming(TimingSnapshot& last, std::uint64_t presents) {
         now.nanoseconds[index] = g_frameTiming.nanoseconds[index].load(std::memory_order_relaxed);
         now.calls[index] = g_frameTiming.calls[index].load(std::memory_order_relaxed);
     }
+    now.renderPasses = RecordedCommands().renderPasses.load(std::memory_order_relaxed);
+    now.barriers = RecordedCommands().pipelineBarriers.load(std::memory_order_relaxed);
+    now.checks = Stats().clampDispatches.load(std::memory_order_relaxed);
+    now.checksAhead = Stats().clampsAhead.load(std::memory_order_relaxed);
+    now.checkBatches = Stats().clampBatches.load(std::memory_order_relaxed);
+    now.checkBatchesRestarted = Stats().clampBatchesRestarted.load(std::memory_order_relaxed);
     const std::uint64_t frames = now.presents - last.presents;
     if (frames != 0) {
         const double share = 1.0 / static_cast<double>(frames);
@@ -156,20 +169,32 @@ void ReportFrameTiming(TimingSnapshot& last, std::uint64_t presents) {
         };
         const double frameMs = std::chrono::duration<double, std::milli>(now.at - last.at).count() * share;
         AbxLog("d3d12_x",
-               "frame time 1/2: %llu frames of %.1f ms each; wall-clock ms a frame by part, summed over all threads (parts can overlap; brackets are inside the part before "
-               "them): present %.1f [waiting for the window's next image %.1f, the frame's blit submitted, waited for and queued %.1f, resting for the desktop %.1f] | "
-               "ExecuteCommandLists %.1f in %.1f calls [vkQueueSubmit2 with its lock %.1f] | recording draws and dispatches %.1f [waiting for pipelines %.1f in %.2f "
+               "frame time 1/3: %llu frames of %.1f ms each; wall-clock ms a frame by part, summed over all threads (parts can overlap; brackets are inside the part before "
+               "them): present %.1f [waiting for lists its queue still held %.1f, waiting for the window's next image %.1f, the frame's blit submitted, waited for and queued "
+               "%.1f, resting for the desktop %.1f] | presents shown later in their queue's order %.1f (%.2f a frame) | ExecuteCommandLists %.1f in %.1f calls "
+               "[vkQueueSubmit2 with its lock %.1f, of it waiting for the lock %.1f] | recording draws and dispatches %.1f [waiting for pipelines %.1f in %.2f "
                "waits], barriers %.1f, copies and clears %.1f, list close %.1f in %.1f lists",
-               static_cast<unsigned long long>(frames), frameMs, ms(TimedPart::Present), ms(TimedPart::PresentAcquire), ms(TimedPart::PresentSync), ms(TimedPart::DesktopRest),
-               ms(TimedPart::Execute), calls(TimedPart::Execute), ms(TimedPart::QueueSubmit), ms(TimedPart::ListWork), ms(TimedPart::PipelineWait), calls(TimedPart::PipelineWait),
+               static_cast<unsigned long long>(frames), frameMs, ms(TimedPart::Present), ms(TimedPart::PresentHeld), ms(TimedPart::PresentAcquire), ms(TimedPart::PresentSync),
+               ms(TimedPart::DesktopRest), ms(TimedPart::PresentLater), calls(TimedPart::PresentLater), ms(TimedPart::Execute), calls(TimedPart::Execute),
+               ms(TimedPart::QueueSubmit), ms(TimedPart::QueueLockWait), ms(TimedPart::ListWork), ms(TimedPart::PipelineWait), calls(TimedPart::PipelineWait),
                ms(TimedPart::ListBarriers), ms(TimedPart::ListCopies), ms(TimedPart::ListClose), calls(TimedPart::ListClose));
         AbxLog("d3d12_x",
-               "frame time 2/2: title textures made %.1f (%.2f a frame), refreshed %.1f, flushed %.1f | readback %.1f | GPU page mapping %.1f (%.2f calls a frame) | waits "
+               "frame time 2/3: title textures made %.1f (%.2f a frame), refreshed %.1f [waiting for the texture lock %.1f, upload batches submitted and waited for %.1f, "
+               "replaced textures released %.1f], flushed %.1f | readback %.1f in %.2f passes [writing title memory %.1f in %.2f writes] | GPU page mapping %.1f (%.2f calls a "
+               "frame) | waits "
                "for the GPU to finish what it has: one-shot submits, the present's among them, %.1f (%.2f a frame), address space changes %.1f (%.2f a frame) | lists "
                "held back by memory waits %.1f (%.2f a frame)",
-               ms(TimedPart::TextureMake), calls(TimedPart::TextureMake), ms(TimedPart::TextureRefresh), ms(TimedPart::TextureFlush), ms(TimedPart::Readback),
-               ms(TimedPart::GpuPages), calls(TimedPart::GpuPages), ms(TimedPart::SyncSubmit), calls(TimedPart::SyncSubmit), ms(TimedPart::AddressIdleWait),
+               ms(TimedPart::TextureMake), calls(TimedPart::TextureMake), ms(TimedPart::TextureRefresh), ms(TimedPart::RefreshLock), ms(TimedPart::RefreshSubmit),
+               ms(TimedPart::RefreshRelease), ms(TimedPart::TextureFlush), ms(TimedPart::Readback), calls(TimedPart::Readback), ms(TimedPart::ReadbackWrite),
+               calls(TimedPart::ReadbackWrite), ms(TimedPart::GpuPages), calls(TimedPart::GpuPages), ms(TimedPart::SyncSubmit), calls(TimedPart::SyncSubmit), ms(TimedPart::AddressIdleWait),
                calls(TimedPart::AddressIdleWait), ms(TimedPart::MemoryWaitHeld), calls(TimedPart::MemoryWaitHeld));
+        const auto perFrame = [&](std::uint64_t TimingSnapshot::*field) { return static_cast<double>(now.*field - last.*field) * share; };
+        AbxLog("d3d12_x",
+               "frame time 3/3: commands recorded a frame: render passes begun %.1f, pipeline barriers %.1f (both counted in every command buffer AnyBox records) | indirect "
+               "argument checks %.1f, %.1f of them ahead of their render pass in %.1f groups (d3d12_x.indirect_checks_ahead; %.1f of the groups begun inside a pass because a draw "
+               "before them in it may write memory), the rest recorded in place, where a mesh draw's render pass is ended and begun again around it",
+               perFrame(&TimingSnapshot::renderPasses), perFrame(&TimingSnapshot::barriers), perFrame(&TimingSnapshot::checks), perFrame(&TimingSnapshot::checksAhead),
+               perFrame(&TimingSnapshot::checkBatches), perFrame(&TimingSnapshot::checkBatchesRestarted));
     }
     last = now;
 }

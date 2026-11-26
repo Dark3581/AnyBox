@@ -2,6 +2,7 @@
 
 #include "AbxApi.hpp"
 #include "BufferRedirect.hpp"
+#include "ExitWatch.hpp"
 #include "PathRedirect.hpp"
 
 #include <windows.h>
@@ -301,7 +302,14 @@ std::vector<Replacement>& Replacements() {
     return replacements;
 }
 
-bool TitleSide(const wchar_t* fullName, std::size_t length) {
+std::vector<Replacement>& ExitReplacements() {
+    static std::vector<Replacement> replacements;
+    return replacements;
+}
+
+enum class Side { System, Title, AnyBox };
+
+Side ModuleSide(const wchar_t* fullName, std::size_t length) {
     static const std::wstring windows = [] {
         wchar_t path[MAX_PATH];
         const UINT size = GetSystemWindowsDirectoryW(path, MAX_PATH);
@@ -312,14 +320,26 @@ bool TitleSide(const wchar_t* fullName, std::size_t length) {
     const std::wstring path(fullName, length);
     if (!windows.empty() && path.size() >= windows.size() &&
         CompareStringOrdinal(path.c_str(), static_cast<int>(windows.size()), windows.c_str(), static_cast<int>(windows.size()), TRUE) == CSTR_EQUAL) {
-        return false;
+        return Side::System;
     }
     const std::size_t slash = path.find_last_of(L"\\/");
     const std::wstring base = slash == std::wstring::npos ? path : path.substr(slash + 1);
-    return !(base.size() > 3 && std::towlower(base[0]) == L'a' && std::towlower(base[1]) == L'b' && base[2] == L'_');
+    return base.size() > 3 && std::towlower(base[0]) == L'a' && std::towlower(base[1]) == L'b' && base[2] == L'_' ? Side::AnyBox : Side::Title;
 }
 
-void PatchModule(void* base) {
+void* ReplacementFor(ULONGLONG value, Side side) {
+    if (side == Side::Title) {
+        for (const Replacement& entry : Replacements()) {
+            if (value == reinterpret_cast<ULONGLONG>(entry.original)) return entry.replacement;
+        }
+    }
+    for (const Replacement& entry : ExitReplacements()) {
+        if (value == reinterpret_cast<ULONGLONG>(entry.original)) return entry.replacement;
+    }
+    return nullptr;
+}
+
+void PatchModule(void* base, Side side) {
     auto* bytes = static_cast<std::uint8_t*>(base);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
@@ -329,14 +349,12 @@ void PatchModule(void* base) {
     if (directory.VirtualAddress == 0 || directory.Size == 0) return;
     for (auto* descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(bytes + directory.VirtualAddress); descriptor->Name != 0; ++descriptor) {
         for (auto* slot = reinterpret_cast<ULONGLONG*>(bytes + descriptor->FirstThunk); *slot != 0; ++slot) {
-            for (const Replacement& entry : Replacements()) {
-                if (*slot != reinterpret_cast<ULONGLONG>(entry.original)) continue;
-                DWORD old = 0;
-                if (VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old)) {
-                    *slot = reinterpret_cast<ULONGLONG>(entry.replacement);
-                    VirtualProtect(slot, sizeof(*slot), old, &old);
-                }
-                break;
+            void* const replacement = ReplacementFor(*slot, side);
+            if (replacement == nullptr) continue;
+            DWORD old = 0;
+            if (VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old)) {
+                *slot = reinterpret_cast<ULONGLONG>(replacement);
+                VirtualProtect(slot, sizeof(*slot), old, &old);
             }
         }
     }
@@ -344,9 +362,9 @@ void PatchModule(void* base) {
 
 VOID CALLBACK OnDllNotification(ULONG reason, const DllNotificationData* data, void*) {
     constexpr ULONG kLoaded = 1;
-    if (reason == kLoaded && data != nullptr && data->fullName != nullptr && TitleSide(data->fullName->Buffer, data->fullName->Length / sizeof(wchar_t))) {
-        PatchModule(data->base);
-    }
+    if (reason != kLoaded || data == nullptr || data->fullName == nullptr) return;
+    const Side side = ModuleSide(data->fullName->Buffer, data->fullName->Length / sizeof(wchar_t));
+    if (side != Side::System) PatchModule(data->base, side);
 }
 
 void Add(HMODULE kernel32, HMODULE kernelbase, const char* name, void* replacement) {
@@ -402,6 +420,7 @@ void InstallLoaderRedirect() {
     Add(kernel32, kernelbase, "GetModuleHandleExA", reinterpret_cast<void*>(&RedirectGetModuleHandleExA));
     AddPathRedirects([&](const char* name, void* replacement) { Add(kernel32, kernelbase, name, replacement); });
     AddBufferRedirects([&](const char* name, void* replacement) { Add(kernel32, kernelbase, name, replacement); });
+    AddExitRedirects([](void* original, void* replacement) { ExitReplacements().push_back({original, replacement}); });
     g_setThreadPriority = reinterpret_cast<SetThreadPriorityFunction>(reinterpret_cast<void*>(GetProcAddress(kernel32, "SetThreadPriority")));
     if (g_setThreadPriority != nullptr) Add(kernel32, kernelbase, "SetThreadPriority", reinterpret_cast<void*>(&RedirectSetThreadPriority));
     if (const HMODULE advapi32 = LoadLibraryW(L"advapi32.dll")) {
@@ -419,9 +438,9 @@ void InstallLoaderRedirect() {
     const LIST_ENTRY* head = &peb->Ldr->InMemoryOrderModuleList;
     for (const LIST_ENTRY* link = head->Flink; link != head; link = link->Flink) {
         const auto* entry = CONTAINING_RECORD(link, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-        if (entry->FullDllName.Buffer != nullptr && TitleSide(entry->FullDllName.Buffer, entry->FullDllName.Length / sizeof(wchar_t))) {
-            PatchModule(entry->DllBase);
-        }
+        if (entry->FullDllName.Buffer == nullptr) continue;
+        const Side side = ModuleSide(entry->FullDllName.Buffer, entry->FullDllName.Length / sizeof(wchar_t));
+        if (side != Side::System) PatchModule(entry->DllBase, side);
     }
     const auto registerNotification = reinterpret_cast<RegisterDllNotification>(
         reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification")));

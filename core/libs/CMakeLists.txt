@@ -18,7 +18,7 @@ else()
     set(modified_value ${ANYBOX_MODIFIED})
 endif()
 
-add_library(abx_runtime SHARED runtime/src/Runtime.cpp runtime/src/LoaderRedirect.cpp runtime/src/PathRedirect.cpp runtime/src/BufferRedirect.cpp runtime/src/CpuFixups.cpp runtime/src/Probe.cpp runtime/src/TitleAsserts.cpp runtime/src/Settings.cpp runtime/src/TitleConfig.cpp)
+add_library(abx_runtime SHARED runtime/src/Runtime.cpp runtime/src/LoaderRedirect.cpp runtime/src/PathRedirect.cpp runtime/src/BufferRedirect.cpp runtime/src/ExitWatch.cpp runtime/src/CpuFixups.cpp runtime/src/Probe.cpp runtime/src/TitleAsserts.cpp runtime/src/Settings.cpp runtime/src/TitleConfig.cpp)
 set_target_properties(abx_runtime PROPERTIES PREFIX "" OUTPUT_NAME ab_runtime
     RUNTIME_OUTPUT_DIRECTORY ${ANYBOX_LIBS_DIR} ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_definitions(abx_runtime PRIVATE ABX_RUNTIME_BUILD ABX_LIBRARY_NAME="runtime"

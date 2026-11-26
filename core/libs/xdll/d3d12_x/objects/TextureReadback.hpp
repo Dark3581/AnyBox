@@ -5,11 +5,14 @@
 #include "Resource.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -42,7 +45,8 @@ private:
         std::uint64_t copyBytes = 0;
         std::uint64_t sequenceOffset = 0;
         DeviceBuffer staging;
-        std::vector<std::pair<std::uint64_t, std::uint32_t>> elements;
+        std::uint64_t id = 0;
+        std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint32_t>>> elements;
         std::uint32_t element = 0;
         std::uint32_t mode = 0;
         std::uint32_t recorded = 0;
@@ -53,17 +57,44 @@ private:
         std::string name;
     };
 
+    struct Copy {
+        Resource* texture = nullptr;
+        std::uint64_t id = 0;
+        std::uint32_t sequence = 0;
+        std::uint64_t texelBase = 0;
+        std::uint32_t element = 0;
+        bool first = false;
+        std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint32_t>>> elements;
+        std::vector<std::uint8_t> texels;
+        bool written = false;
+        bool readBefore = false;
+        std::uint8_t before[16] = {};
+        std::size_t runs = 0;
+        std::size_t failedBytes = 0;
+        std::uint64_t failedAt = 0;
+        DWORD failure = 0;
+    };
+
     bool WriteTitle(std::uint64_t address, const std::uint8_t* data, std::size_t bytes, DWORD& failure) const;
     bool ReadTitle(std::uint64_t address, std::uint8_t* data, std::size_t bytes) const;
-    bool DeliverLocked(Slot& slot);
+    void WriteCopy(Copy& copy);
+    void Pass();
+    void RunPasses();
 
     ResourceContext context_;
     std::uint64_t maxTexels_ = kDefaultTexels;
     std::mutex lock_;
+    std::mutex passLock_;
     std::map<Resource*, Slot> slots_;
     std::vector<std::pair<DeviceBuffer, std::uint64_t>> retired_;
-    std::vector<std::uint8_t> snapshot_;
+    std::vector<Copy> copies_;
     std::vector<std::uint8_t> run_;
+    std::uint64_t slotIds_ = 0;
+    bool ownThread_ = false;
+    std::thread thread_;
+    std::mutex wakeLock_;
+    std::condition_variable wake_;
+    bool stop_ = false;
     std::set<std::string> refusals_;
     std::uint64_t presents_ = 0;
     std::uint64_t considered_ = 0;

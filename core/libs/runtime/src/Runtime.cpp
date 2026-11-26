@@ -1,4 +1,5 @@
 #include "CpuFixups.hpp"
+#include "ExitWatch.hpp"
 #include "Probe.hpp"
 #include "AbxRuntime.hpp"
 #include "LoaderRedirect.hpp"
@@ -539,6 +540,12 @@ void RawModuleOffset(char*& out, const char* end, std::uint64_t address) {
 
 using ThreadQuery = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 
+std::uint64_t ThreadStartAddress() {
+    static const ThreadQuery query = reinterpret_cast<ThreadQuery>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+    void* start = nullptr;
+    return query != nullptr && query(GetCurrentThread(), 9, &start, sizeof(start), nullptr) == 0 ? reinterpret_cast<std::uint64_t>(start) : 0;
+}
+
 void RawCrashLine(const EXCEPTION_POINTERS* pointers, const char* kind) {
     if (g_rawCrash == INVALID_HANDLE_VALUE) return;
     char line[2048];
@@ -552,12 +559,10 @@ void RawCrashLine(const EXCEPTION_POINTERS* pointers, const char* kind) {
     RawHex(out, " thread ", GetCurrentThreadId());
     RawHex(out, " title ", reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)));
     const char* const end = line + sizeof(line) - 2;
-    static const ThreadQuery query = reinterpret_cast<ThreadQuery>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
-    void* start = nullptr;
-    if (query != nullptr && query(GetCurrentThread(), 9, &start, sizeof(start), nullptr) == 0) {
+    if (const std::uint64_t start = ThreadStartAddress()) {
         const char* label = " thread-start";
         while (*label != '\0' && out < end) *out++ = *label++;
-        RawModuleOffset(out, end, reinterpret_cast<std::uint64_t>(start));
+        RawModuleOffset(out, end, start);
     }
     if (pointers != nullptr && pointers->ContextRecord != nullptr) {
         std::uint64_t frames[MaxFrames]{};
@@ -566,6 +571,36 @@ void RawCrashLine(const EXCEPTION_POINTERS* pointers, const char* kind) {
         while (*label != '\0' && out < end) *out++ = *label++;
         for (std::size_t frame = 0; frame < count && frame < 16; ++frame) RawModuleOffset(out, end, frames[frame]);
     }
+    *out++ = '\n';
+    DWORD written = 0;
+    WriteFile(g_rawCrash, line, static_cast<DWORD>(out - line), &written, nullptr);
+    FlushFileBuffers(g_rawCrash);
+}
+
+void RawExitLine(const abx::ExitEvent& event, const std::uint64_t* frames, std::size_t count) {
+    if (g_rawCrash == INVALID_HANDLE_VALUE) return;
+    char line[2048];
+    char* out = line;
+    const char* const end = line + sizeof(line) - 2;
+    const auto text = [&](const char* value) {
+        while (*value != '\0' && out < end) *out++ = *value++;
+    };
+    text(event.processEnds ? "exit " : "main-thread-exit ");
+    text(event.how);
+    if (event.hasCode && out + 24 < end) RawHex(out, " code ", event.code);
+    if (out + 28 < end) RawHex(out, " thread ", event.thread);
+    if (event.caller != nullptr) {
+        text(" caller");
+        RawModuleOffset(out, end, reinterpret_cast<std::uint64_t>(event.caller));
+    }
+    if (event.thread == GetCurrentThreadId()) {
+        if (const std::uint64_t start = ThreadStartAddress()) {
+            text(" thread-start");
+            RawModuleOffset(out, end, start);
+        }
+    }
+    if (count != 0) text(" frames");
+    for (std::size_t frame = 0; frame < count && frame < 16; ++frame) RawModuleOffset(out, end, frames[frame]);
     *out++ = '\n';
     DWORD written = 0;
     WriteFile(g_rawCrash, line, static_cast<DWORD>(out - line), &written, nullptr);
@@ -661,6 +696,62 @@ LONG WINAPI UnhandledException(EXCEPTION_POINTERS* pointers) {
 }
 
 std::atomic<int> g_firstChanceLogged{0};
+
+constexpr std::size_t MaxExitFrames = 16;
+
+void EmitExitLine(const std::string& line, bool late) {
+    if (!late) {
+        Emit(line);
+        return;
+    }
+    if (!g_logMutex.try_lock()) return;
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+    if (g_logFile != nullptr) {
+        std::fputs(line.c_str(), g_logFile);
+        std::fflush(g_logFile);
+    }
+    g_logMutex.unlock();
+}
+
+void ReportExit(const abx::ExitEvent& event) {
+    std::uint64_t frames[MaxFrames]{};
+    const std::size_t count = event.stack ? CaptureFrames(frames) : 0;
+    RawExitLine(event, frames, count);
+    const std::string code = event.hasCode ? std::format(" with exit code 0x{:x} ({})", event.code, event.code) : std::string(" (no exit code passed)");
+    const std::string caller = event.caller != nullptr ? ", called from " + FrameText(reinterpret_cast<std::uintptr_t>(event.caller)) : std::string{};
+    std::string line;
+    if (event.processEnds) {
+        const bool own = event.thread == GetCurrentThreadId();
+        const std::uint64_t start = own ? ThreadStartAddress() : 0;
+        line = std::format("[anybox] process exit: {} on {}{}, on thread {}{}{}{}\n", event.how, event.target, code, event.thread,
+                           event.thread == abx::MainThread() ? " (the title's main thread)" : "", start != 0 ? ", which started at " + FrameText(start) : std::string{}, caller);
+    } else {
+        line = std::format("[anybox] {} {} ended through {}{}{}; the process goes on with its other threads\n", event.target, event.thread, event.how, code, caller);
+    }
+    EmitExitLine(line, event.late);
+    const std::size_t first = CallerFrame(frames, count);
+    if (first < count) EmitExitLine(std::format("[anybox]   first code outside AnyBox and the system: {}\n", FrameText(frames[first])), event.late);
+    for (std::size_t index = 0; index < count && index < MaxExitFrames; ++index) {
+        EmitExitLine(std::format("[anybox]   #{:02} {}\n", index, FrameText(frames[index])), event.late);
+    }
+}
+
+void StartExitHook() {
+    const char* setting = AbxSetting("runtime.exit_hook");
+    if (setting != nullptr && std::strcmp(setting, "0") == 0) {
+        Emit("[anybox] process exits are logged from the calls of the title's and AnyBox's modules only (runtime.exit_hook = 0 leaves the system's NtTerminateProcess "
+             "alone): an exit through a system library is logged only when AnyBox's runtime is unloaded, without its exit code\n");
+        return;
+    }
+    if (const char* problem = abx::InstallTerminateHook()) {
+        Emit(std::format("[anybox] the system's NtTerminateProcess is not hooked: {}; an exit through a system library is logged only when AnyBox's runtime is unloaded, "
+                         "without its exit code\n", problem));
+        return;
+    }
+    Emit("[anybox] process exits are logged once, with exit code, thread and caller, to this log and anybox-crash-raw.txt: the exit calls of the title's and AnyBox's "
+         "modules, and the system's NtTerminateProcess for every other caller in this process (runtime.exit_hook = 0 leaves the system call alone)\n");
+}
 
 LONG WINAPI KeepFilter(EXCEPTION_POINTERS* pointers) {
     const DWORD code = pointers != nullptr && pointers->ExceptionRecord != nullptr ? pointers->ExceptionRecord->ExceptionCode : 0;
@@ -762,19 +853,22 @@ DWORD WINAPI WatchDumpRequests(LPVOID) {
     }
 }
 
-void Start() {
+void Start(bool loadedAtStart) {
     g_start = std::chrono::steady_clock::now();
     const std::string logPath = Environment("ANYBOX_LOG_FILE");
     if (!logPath.empty()) {
         g_logFile = std::fopen(logPath.c_str(), "a");
     }
     g_rawCrash = CreateFileW((ExecutableDirectory() + L"\\anybox-crash-raw.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    abx::SetExitReporter(ReportExit);
+    abx::WatchMainThread(loadedAtStart);
     SetUnhandledExceptionFilter(UnhandledException);
     g_keepFilter = AddVectoredExceptionHandler(0, KeepFilter);
     abx::InstallCpuFixups();
     abx::InstallProbes();
     abx::InstallTitleAssertPolicy();
     abx::InstallLoaderRedirect();
+    StartExitHook();
     if (const HANDLE watcher = CreateThread(nullptr, 0, WatchDumpRequests, nullptr, 0, nullptr)) CloseHandle(watcher);
     StartTitleWatchdogPause();
     WaitForDebugger();
@@ -942,10 +1036,11 @@ ABX_API void AbxWatchWrites(std::uint64_t address) {
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
-        Start();
+        Start(reserved != nullptr);
     } else if (reason == DLL_PROCESS_DETACH && reserved == nullptr && g_keepFilter != nullptr) {
         RemoveVectoredExceptionHandler(g_keepFilter);
     } else if (reason == DLL_PROCESS_DETACH && reserved != nullptr) {
+        if (!abx::ProcessExitReported()) abx::ReportShutdownUnseen();
         AbxStop stop{};
         stop.kind = "none";
         AbxWriteReport(&stop);

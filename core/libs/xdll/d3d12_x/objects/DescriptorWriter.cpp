@@ -40,6 +40,12 @@ void Check(bool ok, const char* function, const std::string& error) {
     }
 }
 
+void MarkRead(const ResourceContext& context, const BufferDescriptorWords& words) {
+    if (context.addresses == nullptr) return;
+    const BufferDescriptorFields fields = DecodeBufferDescriptor(words);
+    context.addresses->MarkGpuRead(fields.base, fields.stride != 0 ? std::uint64_t{fields.records} * fields.stride : fields.records);
+}
+
 std::optional<std::uint32_t> ImageBinding(VkImageViewType type, ImageComponent component, bool storage) {
     const std::uint32_t offset = component == ImageComponent::Uint ? 1u : component == ImageComponent::Sint ? 2u : 0u;
     if (!storage && component == ImageComponent::Float) {
@@ -142,6 +148,7 @@ void DescriptorWriter::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW
     const std::optional<BufferDescriptorWords> words = ConstantBufferDescriptor(*desc, error);
     Check(words.has_value(), function, error);
     WriteWords(target, words->data(), kBufferDescriptorBytes);
+    MarkRead(context_, *words);
     record.kind = HeapEntry::Buffer;
     target.heap->Record(target.index) = record;
 }
@@ -350,6 +357,7 @@ void DescriptorWriter::CreateShaderResourceView(ID3D12Resource* resource, const 
         const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(ours->GetGPUVirtualAddress(), ours->Width(), *desc, error);
         Check(words.has_value(), function, error);
         WriteWords(target, words->data(), kBufferDescriptorBytes);
+        MarkRead(context_, *words);
         DescriptorRecord record;
         record.kind = HeapEntry::Buffer;
         record.resource = ours;
@@ -367,6 +375,7 @@ void DescriptorWriter::CreateShaderResourceViewAt(std::uint64_t address, std::ui
     const std::optional<BufferDescriptorWords> words = ShaderResourceBufferDescriptor(address, bytes, desc, error);
     Check(words.has_value(), function, error);
     WriteWords(target, words->data(), kBufferDescriptorBytes);
+    MarkRead(context_, *words);
     DescriptorRecord record;
     record.kind = HeapEntry::Buffer;
     target.heap->Record(target.index) = record;

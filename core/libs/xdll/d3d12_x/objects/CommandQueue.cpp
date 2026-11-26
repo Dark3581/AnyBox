@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <deque>
 #include <map>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -19,6 +20,16 @@
 namespace abx::d3d12x {
 
 namespace {
+
+std::string LoggedFaultReport(const VulkanDevice& device) {
+    constexpr std::size_t kPiece = 1800;
+    const std::string report = device.FaultReport();
+    const std::size_t pieces = (report.size() + kPiece - 1) / kPiece;
+    for (std::size_t piece = 0; piece < pieces; ++piece) {
+        AbxLog("d3d12_x", "the GPU device was lost; its whole fault report, part %zu of %zu: %s", piece + 1, pieces, report.substr(piece * kPiece, kPiece).c_str());
+    }
+    return report.substr(0, 700);
+}
 
 std::chrono::milliseconds MemoryWaitLimit() {
     static const std::chrono::milliseconds limit = [] {
@@ -44,6 +55,93 @@ VkSemaphore g_timeline = VK_NULL_HANDLE;
 std::uint64_t g_point = 0;
 std::atomic<int> g_blocked{0};
 bool g_writerStarted = false;
+
+constexpr DWORD kPresentThread = 0;
+
+struct DuePresent {
+    DWORD owner = kPresentThread;
+    CommandQueue* queue = nullptr;
+    std::function<void()> present;
+};
+
+struct DuePresents {
+    std::mutex lock;
+    std::condition_variable wake;
+    std::deque<DuePresent> due;
+    bool threadStarted = false;
+};
+
+DuePresents& Due() {
+    static DuePresents* const due = new DuePresents;
+    return *due;
+}
+
+thread_local bool t_runningPresents = false;
+thread_local bool t_presentThread = false;
+std::atomic<std::uint64_t> g_presentsLater{0};
+std::atomic<std::uint64_t> g_waitsGivenUp{0};
+
+DWORD PresentOwner() {
+    return t_presentThread ? kPresentThread : GetCurrentThreadId();
+}
+
+void AddDuePresent(CommandQueue* queue, std::function<void()> present) {
+    DuePresents& due = Due();
+    const std::lock_guard guard(due.lock);
+    due.due.push_back({PresentOwner(), queue, std::move(present)});
+}
+
+bool TakeDuePresent(DWORD owner, DuePresent& taken) {
+    DuePresents& due = Due();
+    const std::lock_guard guard(due.lock);
+    const auto found = std::find_if(due.due.begin(), due.due.end(), [owner](const DuePresent& present) { return present.owner == owner; });
+    if (found == due.due.end()) return false;
+    taken = std::move(*found);
+    due.due.erase(found);
+    return true;
+}
+
+bool PresentThreadHasWork(const DuePresents& due) {
+    return std::any_of(due.due.begin(), due.due.end(), [](const DuePresent& present) { return present.owner == kPresentThread; });
+}
+
+void RunPresentThread() {
+    t_presentThread = true;
+    DuePresents& due = Due();
+    for (;;) {
+        {
+            std::unique_lock guard(due.lock);
+            due.wake.wait(guard, [&due] { return PresentThreadHasWork(due); });
+        }
+        CommandQueue::RunDuePresents();
+    }
+}
+
+void HandDuePresentsOn() {
+    const DWORD self = GetCurrentThreadId();
+    DuePresents& due = Due();
+    bool handed = false;
+    bool started = false;
+    {
+        const std::lock_guard guard(due.lock);
+        for (DuePresent& present : due.due) {
+            if (present.owner != self) continue;
+            present.owner = kPresentThread;
+            handed = true;
+        }
+        if (!handed) return;
+        if (!due.threadStarted) {
+            due.threadStarted = true;
+            started = true;
+            std::thread(RunPresentThread).detach();
+        }
+    }
+    due.wake.notify_all();
+    if (started) {
+        AbxLog("d3d12_x", "presents that the label writer released are shown on one present thread that lives as long as the process, in their queue's order "
+                          "(d3d12_x.present_in_queue_order)");
+    }
+}
 
 bool Holds(std::uint32_t comparison, std::uint64_t current, std::uint64_t value) {
     switch (comparison) {
@@ -101,7 +199,7 @@ void RunLabelWriter(const VulkanDevice* device) {
             wait.pSemaphores = &timeline;
             wait.pValues = &target;
             if (device->Vk().waitSemaphores(device->Handle(), &wait, 5'000'000) == VK_ERROR_DEVICE_LOST) {
-                const std::string detail = "the GPU device was lost while lists with labels were running" + device->CheckpointReport() + "; " + device->FaultReport().substr(0, 700);
+                const std::string detail = "the GPU device was lost while lists with labels were running" + device->CheckpointReport() + "; " + LoggedFaultReport(*device);
                 AbxUnsupported("D3D12 command queue (label writer)", detail.c_str());
             }
         }
@@ -128,6 +226,7 @@ void RunLabelWriter(const VulkanDevice* device) {
             }
         }
         if (!ready.empty() || g_blocked.load() > 0) FlushQueues(nullptr);
+        HandDuePresentsOn();
     }
 }
 
@@ -168,8 +267,7 @@ bool SubmitLabels(const VulkanDevice& device, const std::vector<CommandQueue::Me
 }
 
 void ReportTimeout(const CommandQueue::MemoryWait& wait) {
-    static std::atomic<std::uint64_t> timeouts{0};
-    const std::uint64_t count = ++timeouts;
+    const std::uint64_t count = ++g_waitsGivenUp;
     if (count > 8 && (count & (count - 1)) != 0) return;
     std::uint64_t promised = 0;
     bool known = false;
@@ -246,10 +344,52 @@ void STDMETHODCALLTYPE CommandQueue::ExecuteCommandLists(UINT count, ID3D12Comma
     ExecuteOrdered(count, lists, {}, {});
 }
 
+void CommandQueue::PresentOrdered(std::function<void()> present) {
+    Operation operation;
+    operation.present = std::move(present);
+    Enqueue(std::move(operation));
+}
+
+std::uint64_t CommandQueue::MemoryWaitsGivenUp() {
+    return g_waitsGivenUp.load(std::memory_order_relaxed);
+}
+
+void CommandQueue::EndPresent() {
+    {
+        const std::lock_guard<std::mutex> guard(lock_);
+        presenting_ = false;
+    }
+    Flush();
+}
+
+void CommandQueue::RunDuePresents() {
+    if (t_runningPresents) return;
+    t_runningPresents = true;
+    const DWORD owner = PresentOwner();
+    for (;;) {
+        DuePresent due;
+        if (!TakeDuePresent(owner, due)) break;
+        {
+            const TimedScope timed(TimedPart::PresentLater);
+            due.present();
+        }
+        const std::uint64_t count = ++g_presentsLater;
+        if (count == 1 || (count >= 64 && (count & (count - 1)) == 0)) {
+            AbxLog("d3d12_x", "a present whose queue still held lists waiting for a memory value or a fence was shown after those lists, in the queue's order, instead of "
+                              "waiting for them at the call (%llu so far; d3d12_x.present_in_queue_order)",
+                   static_cast<unsigned long long>(count));
+        }
+        due.queue->EndPresent();
+        due.queue->Release();
+    }
+    t_runningPresents = false;
+}
+
 bool CommandQueue::Drain(std::chrono::milliseconds limit) {
     const auto deadline = std::chrono::steady_clock::now() + limit;
     for (;;) {
         Flush();
+        RunDuePresents();
         if (Pending() == 0) return true;
         if (std::chrono::steady_clock::now() > deadline) return false;
         Sleep(1);
@@ -270,7 +410,9 @@ void CommandQueue::ExecuteOrdered(UINT count, ID3D12CommandList* const* lists, s
         if (list == nullptr) AbxUnsupported(function, "a command list that AnyBox did not create");
         if (!list->Closed()) AbxUnsupported(function, "a command list that is still recording");
         if (list->GetType() != desc_.Type) AbxUnsupported(function, "a command list whose type differs from the queue's");
-        operation.commands.push_back(list->Commands());
+        const std::vector<VkCommandBuffer> buffers = list->CommandBuffers();
+        operation.commands.insert(operation.commands.end(), buffers.begin(), buffers.end());
+        operation.listBuffers.push_back(static_cast<std::uint32_t>(buffers.size()));
     }
     Enqueue(std::move(operation));
 }
@@ -307,12 +449,13 @@ HRESULT CommandQueue::Enqueue(Operation operation) {
         pending_.push_back(std::move(operation));
     }
     Flush();
+    RunDuePresents();
     return S_OK;
 }
 
 std::size_t CommandQueue::Pending() const {
     std::lock_guard<std::mutex> guard(lock_);
-    return pending_.size();
+    return pending_.size() + (presenting_ ? 1 : 0);
 }
 
 bool CommandQueue::Submit(const Operation& operation) {
@@ -333,13 +476,18 @@ bool CommandQueue::Submit(const Operation& operation) {
             return on;
         }();
         const TimedScope timed(TimedPart::QueueSubmit);
+        const auto lockBegin = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> guard(device_.QueueLock());
+        AddTime(TimedPart::QueueLockWait, std::chrono::steady_clock::now() - lockBegin);
         if (perList) {
-            for (const VkCommandBufferSubmitInfo& info : buffers) {
+            std::size_t first = 0;
+            for (std::size_t list = 0; first < buffers.size(); ++list) {
+                const std::size_t inList = list < operation.listBuffers.size() ? (std::min)(static_cast<std::size_t>(operation.listBuffers[list]), buffers.size() - first) : 1;
                 VkSubmitInfo2 one{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-                one.commandBufferInfoCount = 1;
-                one.pCommandBufferInfos = &info;
+                one.commandBufferInfoCount = static_cast<std::uint32_t>((std::max)(inList, std::size_t{1}));
+                one.pCommandBufferInfos = buffers.data() + first;
                 if (device_.Vk().queueSubmit2(device_.Queue(), 1, &one, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+                first += one.commandBufferInfoCount;
             }
         } else {
             submit.commandBufferInfoCount = static_cast<std::uint32_t>(buffers.size());
@@ -377,8 +525,15 @@ void CommandQueue::Flush() {
         do {
             again_ = false;
             blocked = false;
-            while (!pending_.empty()) {
+            while (!pending_.empty() && !presenting_) {
                 Operation& front = pending_.front();
+                if (front.present) {
+                    presenting_ = true;
+                    AddRef();
+                    AddDuePresent(this, std::move(front.present));
+                    pending_.pop_front();
+                    break;
+                }
                 if (front.wait && front.fence->Promised() < front.value && front.fence->GetCompletedValue() < front.value) {
                     front.fence->WatchFor(this);
                     if (front.fence->Promised() < front.value) break;
@@ -399,7 +554,7 @@ void CommandQueue::Flush() {
                 const Operation operation = std::move(pending_.front());
                 pending_.pop_front();
                 if (!Submit(operation)) {
-                    const std::string detail = "vkQueueSubmit2 failed (a lost device fails every later submit)" + device_.CheckpointReport() + "; " + device_.FaultReport().substr(0, 700);
+                    const std::string detail = "vkQueueSubmit2 failed (a lost device fails every later submit)" + device_.CheckpointReport() + "; " + LoggedFaultReport(device_);
                     AbxUnsupported(operation.fence == nullptr ? "ID3D12CommandQueue::ExecuteCommandLists"
                                    : operation.wait          ? "ID3D12CommandQueue::Wait"
                                                              : "ID3D12CommandQueue::Signal",

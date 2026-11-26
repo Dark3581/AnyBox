@@ -202,7 +202,7 @@ def main():
     selection = subprocess.run([str(args.probe), "device-selection"], capture_output=True, text=True, env=env, timeout=120)
     print(selection.stdout.strip())
     assert selection.returncode in (0, 3) and "PASS device selection selftest" in selection.stdout, (selection.stdout, selection.stderr)
-    for command in ("states-gpu", "textures-gpu", "views-gpu", "commands-gpu", "draw-gpu", "indirect-gpu", "planes-gpu", "fence-gpu", "resources-gpu", "commandlist-gpu", "descriptors-gpu"):
+    for command in ("states-gpu", "textures-gpu", "views-gpu", "commands-gpu", "draw-gpu", "indirect-gpu", "planes-gpu", "fence-gpu", "resources-gpu", "commandlist-gpu", "clamp-batch-gpu", "descriptors-gpu"):
         checked = subprocess.run([str(args.probe), command, "--validate"], capture_output=True, text=True, env=env, timeout=600)
         if checked.returncode == 4:
             checked = subprocess.run([str(args.probe), command], capture_output=True, text=True, env=env, timeout=600)

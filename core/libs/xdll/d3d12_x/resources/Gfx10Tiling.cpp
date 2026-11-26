@@ -1068,8 +1068,10 @@ bool DetileSubresource(const ConsoleTexture& texture, const std::uint8_t* texels
         return false;
     }
     const std::size_t pitchBlocks = DivCeil(level.pitch, layout.blockWidth);
-    static thread_local std::vector<std::size_t> columnBase;
-    static thread_local std::vector<std::uint32_t> columnBits;
+    static thread_local std::vector<std::size_t>* const columnBaseStore = new std::vector<std::size_t>();
+    static thread_local std::vector<std::uint32_t>* const columnBitsStore = new std::vector<std::uint32_t>();
+    std::vector<std::size_t>& columnBase = *columnBaseStore;
+    std::vector<std::uint32_t>& columnBits = *columnBitsStore;
     columnBase.resize(level.width);
     columnBits.resize(level.width);
     for (std::size_t x = 0; x < level.width; ++x) {

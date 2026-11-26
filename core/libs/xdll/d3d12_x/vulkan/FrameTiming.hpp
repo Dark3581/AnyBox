@@ -27,6 +27,13 @@ enum class TimedPart : std::uint32_t {
     AddressIdleWait,
     SyncSubmit,
     DesktopRest,
+    PresentHeld,
+    PresentLater,
+    ReadbackWrite,
+    RefreshLock,
+    RefreshSubmit,
+    RefreshRelease,
+    QueueLockWait,
     Count
 };
 

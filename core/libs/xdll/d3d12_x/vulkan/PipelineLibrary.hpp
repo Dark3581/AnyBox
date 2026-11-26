@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace abx::d3d12x {
@@ -22,6 +23,7 @@ struct PipelineSource {
     std::uint32_t subgroupSize = 0;
     bool threadLimited = false;
     std::uint32_t limitRegister = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> constants;
 };
 
 struct GraphicsShaderSource {
@@ -48,7 +50,11 @@ struct PipelineEntry {
     bool driverCacheHit = false;
     bool subgroupForced = false;
     bool usesCodeBase = false;
+    bool writesMemory = true;
     std::vector<std::filesystem::path> codeBaseModules;
+    std::uint32_t laneTurns = 0;
+    std::size_t laneRegions = 0;
+    std::string laneNote;
     std::uintmax_t bytes = 0;
     double seconds = 0.0;
     std::string error;
@@ -72,6 +78,8 @@ public:
     PipelineEntry Graphics(const GraphicsRequest& request);
     PipelineLibraryStats Stats() const;
     std::uintmax_t CompileLimitBytes() const { return compileLimitBytes_; }
+    void RunMeshGroupsInTurns(bool turns) { meshGroupsInTurns_ = turns; }
+    bool MeshGroupsInTurns() const { return meshGroupsInTurns_; }
 
 private:
     struct Slot {
@@ -86,6 +94,7 @@ private:
     const VulkanDevice& device_;
     VkPipelineCache cache_;
     std::uintmax_t compileLimitBytes_;
+    bool meshGroupsInTurns_ = false;
     mutable std::mutex lock_;
     std::condition_variable finished_;
     std::unordered_map<std::string, std::unique_ptr<Slot>> slots_;

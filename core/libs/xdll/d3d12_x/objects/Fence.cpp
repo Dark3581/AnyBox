@@ -163,6 +163,7 @@ HRESULT STDMETHODCALLTYPE Fence::Signal(UINT64 value) {
         return DXGI_ERROR_DEVICE_REMOVED;
     }
     Promise(value);
+    CommandQueue::RunDuePresents();
     return S_OK;
 }
 

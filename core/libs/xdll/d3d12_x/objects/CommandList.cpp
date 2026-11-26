@@ -4,6 +4,7 @@
 #include "FrameTiming.hpp"
 #include "GpuProfile.hpp"
 #include "IndirectClamp.hpp"
+#include "TableCopy.hpp"
 #include "DescriptorWriter.hpp"
 #include "DescriptorHeap.hpp"
 #include "LiveStats.hpp"
@@ -12,6 +13,7 @@
 
 #include "AbxApi.hpp"
 #include "BindlessSet.hpp"
+#include "BufferFormatSpec.hpp"
 #include "CopyLayout.hpp"
 #include "ResourceState.hpp"
 
@@ -41,15 +43,8 @@ std::string TitleWordsText(const TitleAddressSpace* addresses, std::uint64_t add
     constexpr std::uint64_t kPage = 0x10000;
     const std::uint64_t wanted = (std::min)((std::min)(bytes, std::uint64_t{32}), kPage - (address & (kPage - 1))) & ~std::uint64_t{3};
     if (wanted == 0) return "";
-    const std::uint8_t* host = addresses != nullptr ? addresses->HostAt(address) : nullptr;
-    if (host == nullptr) {
-        MEMORY_BASIC_INFORMATION region{};
-        if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
-            (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize < address + wanted) {
-            return "; its first bytes are not readable from the CPU";
-        }
-        host = reinterpret_cast<const std::uint8_t*>(address);
-    }
+    std::uint8_t host[32] = {};
+    if (addresses == nullptr || addresses->ReadForTrace(address, host, wanted) != wanted) return "; its first bytes are not readable from the CPU";
     std::string text = "; first words:";
     for (std::uint64_t at = 0; at < wanted; at += 4) {
         std::uint32_t word = 0;
@@ -60,6 +55,7 @@ std::string TitleWordsText(const TitleAddressSpace* addresses, std::uint64_t add
     }
     return text;
 }
+
 constexpr std::uint32_t kGraphicsFirstRootSgpr = 8;
 constexpr std::uint32_t kComputeFirstRootSgpr = 4;
 constexpr std::uint32_t kUserSgprs = 32;
@@ -133,6 +129,14 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
         return false;
     }
     commands_ = commands;
+    finished_.clear();
+    checkCopies_ = VK_NULL_HANDLE;
+    checks_ = VK_NULL_HANDLE;
+    checksWritten_ = false;
+    std::copy(std::begin(kDefaultBlendFactor), std::end(kDefaultBlendFactor), blendFactor_.begin());
+    stencilReference_ = 0;
+    indexBuffer_.reset();
+    vertexBuffers_.fill(std::nullopt);
     profileGeneration_ = GpuProfile::BeginList(commands, profileList_);
     allocator_ = pool;
     closed_ = false;
@@ -160,9 +164,71 @@ bool CommandList::Begin(ID3D12CommandAllocator* allocator, ID3D12PipelineState* 
 }
 
 void CommandList::EndPass() {
+    CloseChecksAhead();
     if (!rendering_) return;
     Recorder("ID3D12GraphicsCommandList").EndRendering();
     rendering_ = false;
+}
+
+std::vector<VkCommandBuffer> CommandList::CommandBuffers() const {
+    std::vector<VkCommandBuffer> buffers = finished_;
+    buffers.push_back(commands_);
+    return buffers;
+}
+
+bool CommandList::OpenChecksAhead(const char* function) {
+    IndirectClamp* clamp = IndirectClamp::For(context_.device);
+    if (clamp == nullptr || allocator_ == nullptr || closed_) return false;
+    const DeviceFunctions& vk = context_.device.Vk();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    std::array<VkCommandBuffer, 3> made{};
+    std::string error;
+    for (VkCommandBuffer& buffer : made) {
+        buffer = allocator_->Next(error);
+        if (buffer == VK_NULL_HANDLE) AbxUnsupported(function, ("a command buffer for the indirect argument checks ahead of a render pass: " + error).c_str());
+        if (vk.beginCommandBuffer(buffer, &begin) != VK_SUCCESS) AbxUnsupported(function, "vkBeginCommandBuffer failed for the indirect argument checks ahead of a render pass");
+    }
+    if (vk.endCommandBuffer(commands_) != VK_SUCCESS) AbxUnsupported(function, "vkEndCommandBuffer failed where the list is split for the indirect argument checks");
+    finished_.push_back(commands_);
+    finished_.push_back(made[0]);
+    finished_.push_back(made[1]);
+    commands_ = made[2];
+    checkCopies_ = made[0];
+    checks_ = made[1];
+    checksWritten_ = false;
+    clamp->BeginBatch(checkCopies_, checks_);
+    ++Stats().clampBatches;
+    ReplayState(function);
+    return true;
+}
+
+void CommandList::CloseChecksAhead() {
+    if (checks_ == VK_NULL_HANDLE) return;
+    if (IndirectClamp* clamp = IndirectClamp::For(context_.device)) clamp->EndBatch(checks_);
+    const DeviceFunctions& vk = context_.device.Vk();
+    const bool ended = vk.endCommandBuffer(checkCopies_) == VK_SUCCESS && vk.endCommandBuffer(checks_) == VK_SUCCESS;
+    checkCopies_ = VK_NULL_HANDLE;
+    checks_ = VK_NULL_HANDLE;
+    if (!ended) AbxUnsupported("ID3D12GraphicsCommandList", "vkEndCommandBuffer failed for the indirect argument checks ahead of a render pass");
+}
+
+void CommandList::ReplayState(const char* function) {
+    pipelineBound_ = false;
+    graphicsSetBound_ = false;
+    computeSetBound_ = false;
+    if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    CommandRecorder recorder = Recorder(function);
+    std::string error;
+    if (!viewports_.empty()) Check(recorder.SetViewports(viewports_, error), function, error);
+    if (!scissors_.empty()) Check(recorder.SetScissors(scissors_, error), function, error);
+    if (topology_) Check(recorder.SetPrimitiveTopology(*topology_, false, error), function, error);
+    recorder.SetBlendFactor(blendFactor_.data());
+    recorder.SetStencilReference(stencilReference_);
+    if (indexBuffer_) Check(recorder.SetIndexBuffer(indexBuffer_->first, indexBuffer_->second, error), function, error);
+    for (UINT slot = 0; slot < vertexBuffers_.size(); ++slot) {
+        if (vertexBuffers_[slot]) Check(recorder.SetVertexBuffers(slot, {*vertexBuffers_[slot]}, error), function, error);
+    }
 }
 
 void CommandList::BindTitleSet(VkPipelineBindPoint point) {
@@ -324,6 +390,13 @@ void CommandList::ReportDamage(const char* function) const {
 }
 
 void CommandList::PushUserData(RootArguments& arguments, std::uint32_t firstSgpr, const char* function, std::uint32_t threadLimit) {
+    std::array<std::uint32_t, kPushWords> block{};
+    UserDataBlock(arguments, firstSgpr, function, threadLimit, block.data());
+    std::string error;
+    Check(Recorder(function).SetPushConstants(block.data(), static_cast<std::uint32_t>(block.size() * sizeof(std::uint32_t)), error), function, error);
+}
+
+void CommandList::UserDataBlock(RootArguments& arguments, std::uint32_t firstSgpr, const char* function, std::uint32_t threadLimit, std::uint32_t* out) {
     if (!arguments.pending.empty() && pipeline_ != nullptr && pipeline_->Signature() != nullptr && pipeline_->Signature() != arguments.signature) {
         arguments.signature = pipeline_->Signature();
         ApplyPending(arguments);
@@ -348,6 +421,7 @@ void CommandList::PushUserData(RootArguments& arguments, std::uint32_t firstSgpr
         AbxUnsupported(function, "a root signature whose words do not fit in the user SGPRs after the driver's reserved ones; the console's spill layout is not measured");
     }
     std::copy_n(arguments.words.begin(), words, block.begin() + firstSgpr);
+    if (context_.addresses != nullptr) context_.addresses->MarkGpuRootWords(arguments.words.data(), words);
     if (threadLimit != 0) {
         if (firstSgpr + words + (resourceIndexed ? 1u : 0u) + (samplerIndexed ? 1u : 0u) > kThreadLimitSgpr) {
             AbxUnsupported(function, "a thread-count dispatch whose root signature fills the user SGPR that carries the thread limit");
@@ -379,8 +453,52 @@ void CommandList::PushUserData(RootArguments& arguments, std::uint32_t firstSgpr
     const std::uint64_t codeBase = pipeline_ != nullptr ? pipeline_->CodeBase() : 0;
     block[kCodeBaseWord] = static_cast<std::uint32_t>(codeBase);
     block[kCodeBaseWord + 1] = static_cast<std::uint32_t>(codeBase >> 32);
-    std::string error;
-    Check(Recorder(function).SetPushConstants(block.data(), static_cast<std::uint32_t>(block.size() * sizeof(std::uint32_t)), error), function, error);
+    std::copy(block.begin(), block.end(), out);
+}
+
+int CommandList::ChooseFormatVariant(const char* function, VkPipeline& variant, std::string& why) {
+    enum { UseStored = 0, Ready = 1, Building = 2, Failed = 3 };
+    static std::mutex toldLock;
+    static std::set<std::string> told;
+    const auto tell = [&](const char* what, const std::string& detail) {
+        const std::string shader = pipeline_->Shaders().empty() ? std::string("(no shader)") : pipeline_->Shaders().front();
+        const std::lock_guard guard(toldLock);
+        if (told.size() < 64 && told.insert(shader + what).second) AbxLog("d3d12_x", "compute pipeline %s %s: %s", shader.c_str(), what, detail.c_str());
+    };
+    std::array<std::uint32_t, kPushWords> block{};
+    UserDataBlock(compute_, kComputeFirstRootSgpr, function, 0, block.data());
+    std::vector<std::uint32_t> words;
+    for (const BufferFormatSource& source : pipeline_->FormatSources()) {
+        const std::optional<std::uint64_t> address = BufferFormatAddress(source, block.data(), kUserSgprs);
+        const std::uint8_t* host = nullptr;
+        if (address) {
+            UINT increment = 0;
+            host = DescriptorHeap::AtGpuAddress(*address, increment);
+            if (host == nullptr && context_.addresses != nullptr && context_.addresses->Contains(*address, sizeof(std::uint32_t))) host = context_.addresses->HostAt(*address);
+        }
+        if (host == nullptr) {
+            char text[160];
+            std::snprintf(text, sizeof(text), "word 3 of a buffer descriptor (title address 0x%llx) is not readable by the CPU when the dispatch is recorded",
+                          static_cast<unsigned long long>(address.value_or(0)));
+            tell("uses the module as stored", text);
+            pipeline_->StartGenericBuild();
+            return UseStored;
+        }
+        std::uint32_t word = 0;
+        std::memcpy(&word, host, sizeof(word));
+        words.push_back(word);
+    }
+    bool pending = false;
+    bool generic = false;
+    variant = pipeline_->FormatVariant(words, pending, generic, why);
+    if (variant != VK_NULL_HANDLE) return Ready;
+    if (pending) return Building;
+    if (generic) {
+        tell("uses the module as stored", why);
+        pipeline_->StartGenericBuild();
+        return UseStored;
+    }
+    return Failed;
 }
 
 namespace {
@@ -406,6 +524,29 @@ bool DrawsWaitForPipelines() {
     return enabled;
 }
 
+bool ChecksAheadOfPass() {
+    static const bool enabled = [] {
+        const char* value = AbxSetting("d3d12_x.indirect_checks_ahead");
+        const bool on = value != nullptr && value[0] == '1' && value[1] == 0;
+        if (on) {
+            AbxLog("d3d12_x", "indirect mesh draws inside a render pass have their arguments checked ahead of that pass, in command buffers of their own, so the pass is not ended "
+                              "and begun again around each one (d3d12_x.indirect_checks_ahead = 1; off unless set)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+void NoteChecksRestarted(const PipelineStateObject& pipeline) {
+    const std::uint64_t total = ++Stats().clampBatchesRestarted;
+    if (total == 1 || (total & (total - 1)) == 0) {
+        AbxLog("d3d12_x", "an indirect mesh draw has its arguments checked ahead of a new render pass, not with the earlier ones of its pass, because a draw since those checks "
+                          "may have written memory (its pipeline stores to buffers or images), which could be these arguments; the pass is ended and begun again here, as "
+                          "with checks in place (%llu so far, this draw %s)",
+               static_cast<unsigned long long>(total), pipeline.Shaders().empty() ? "(no shader)" : pipeline.Shaders().front().substr(0, 22).c_str());
+    }
+}
+
 bool IndirectDispatchGuarded() {
     static const bool enabled = [] {
         const char* value = AbxSetting("d3d12_x.indirect_dispatch_guard");
@@ -426,7 +567,26 @@ bool CommandList::SkippedWork(const char* function) {
     };
     static std::atomic<std::uint64_t> skipped[Count]{};
     Reason reason = Count;
-    if (pipeline_->Pending() && pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE) {
+    VkPipeline variant = VK_NULL_HANDLE;
+    std::string variantWhy;
+    const int formatChoice = pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE && pipeline_->FormatSpecialized() ? ChooseFormatVariant(function, variant, variantWhy) : 0;
+    const auto checkCodeBase = [&] {
+        std::string why;
+        if (!ResolveCodeBase(function, why)) {
+            reason = CodeBase;
+            static std::mutex whyLock;
+            static std::set<std::string> told;
+            const std::lock_guard guard(whyLock);
+            if (told.size() < 64 && told.insert(why).second) AbxLog("d3d12_x", "DIAG no code base for %s: %s", pipeline_->Shaders().empty() ? "(no shader)" : pipeline_->Shaders().front().c_str(), why.c_str());
+        }
+    };
+    if (formatChoice == 2) {
+        reason = Pending;
+    } else if (formatChoice == 3) {
+        reason = Unbuilt;
+    } else if (formatChoice == 1) {
+        if (pipeline_->UsesCodeBase()) checkCodeBase();
+    } else if (pipeline_->Pending() && pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE) {
         static std::atomic<std::uint64_t> waited{0};
         const std::uint64_t count = ++waited;
         if (count == 1 || (count & (count - 1)) == 0) {
@@ -444,21 +604,14 @@ bool CommandList::SkippedWork(const char* function) {
         }
         pipeline_->BuildNow();
     }
-    if (pipeline_->Pending()) {
+    if (formatChoice != 0) {
+    } else if (pipeline_->Pending()) {
         reason = Pending;
         pipeline_->Prioritize();
     }
     else if (pipeline_->Pipeline() == VK_NULL_HANDLE) reason = Unbuilt;
-    else if (pipeline_->UsesCodeBase()) {
-        std::string why;
-        if (!ResolveCodeBase(function, why)) {
-            reason = CodeBase;
-            static std::mutex whyLock;
-            static std::set<std::string> told;
-            const std::lock_guard guard(whyLock);
-            if (told.size() < 64 && told.insert(why).second) AbxLog("d3d12_x", "DIAG no code base for %s: %s", pipeline_->Shaders().empty() ? "(no shader)" : pipeline_->Shaders().front().c_str(), why.c_str());
-        }
-    }
+    else if (pipeline_->UsesCodeBase()) checkCodeBase();
+    const auto unbuiltText = [&] { return formatChoice == 3 ? variantWhy : pipeline_->UnbuiltReason(); };
     static const int diagSkip = [] {
         char value[16] = {};
         GetEnvironmentVariableA("ANYBOX_DIAG_SKIP", value, sizeof(value));
@@ -496,7 +649,7 @@ bool CommandList::SkippedWork(const char* function) {
         std::string everyShader;
         for (const std::string& shader : pipeline_->Shaders()) everyShader += shader + " ";
         const bool watched = WatchedShader(everyShader);
-        AbxLog("d3d12_x", "TRACE %s%s%s | targets%s%s%s | list %04x", function, shaders.c_str(), reason == Count ? "" : (" SKIPPED: " + pipeline_->UnbuiltReason()).c_str(),
+        AbxLog("d3d12_x", "TRACE %s%s%s | targets%s%s%s | list %04x", function, shaders.c_str(), reason == Count ? "" : (" SKIPPED: " + unbuiltText()).c_str(),
                targets.c_str(), depthStencil_ ? " +depth" : "", rectangles_ ? " rects" : "", list);
         const RootArguments& arguments = computeTraced ? compute_ : graphics_;
         {
@@ -546,7 +699,17 @@ bool CommandList::SkippedWork(const char* function) {
                 if (at == nullptr) break;
                 std::uint32_t descriptor[8] = {};
                 std::memcpy(descriptor, at, sizeof(descriptor));
-                if ((descriptor[3] >> 28) < 8) continue;
+                if ((descriptor[3] >> 28) < 8) {
+                    const std::uint64_t base = static_cast<std::uint64_t>(descriptor[0]) | (static_cast<std::uint64_t>(descriptor[1] & 0xFFFFu) << 32);
+                    const std::uint32_t stride = (descriptor[1] >> 16) & 0x3FFFu;
+                    const std::uint64_t bytes = stride != 0 ? static_cast<std::uint64_t>(stride) * descriptor[2] : descriptor[2];
+                    if (computeTraced && base != 0 && bytes != 0 && context_.addresses != nullptr) {
+                        AbxLog("d3d12_x", "TRACE     root word %zu slot %u: buffer at title 0x%llx, %llu bytes (stride %u, %u records); %s | list %04x", word, slot,
+                               static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), stride, descriptor[2],
+                               (context_.addresses->DescribeBacking(base, bytes) + "; " + context_.addresses->DescribePlacement(base, bytes)).c_str(), list);
+                    }
+                    continue;
+                }
                 Resource* read = nullptr;
                 int readFormat = 0;
                 const std::string described = DescriptorWriter::DescribeImageWords(descriptor, &read, &readFormat);
@@ -563,20 +726,27 @@ bool CommandList::SkippedWork(const char* function) {
     if (reason == Count) {
         ++(pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE ? Stats().dispatches : Stats().draws);
         if (profileGeneration_ != 0) GpuProfile::MarkWork(commands_, profileGeneration_, profileList_, function, pipeline_->Shaders());
-        if (!pipelineBound_) {
-            Recorder(function).BindPipeline(pipeline_->BindPoint(), pipeline_->Pipeline());
-            pipelineBound_ = true;
+        if (variant != VK_NULL_HANDLE) {
+            Recorder(function).BindPipeline(pipeline_->BindPoint(), variant);
+            pipelineBound_ = false;
+            workPipeline_ = variant;
+        } else {
+            if (!pipelineBound_) {
+                Recorder(function).BindPipeline(pipeline_->BindPoint(), pipeline_->Pipeline());
+                pipelineBound_ = true;
+            }
+            workPipeline_ = pipeline_->Pipeline();
         }
         return false;
     }
-    if (pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE) NoteComputeSkip(*pipeline_, reason == Pending ? kReasons[Pending] : pipeline_->UnbuiltReason().empty() ? kReasons[reason] : pipeline_->UnbuiltReason().c_str());
+    if (pipeline_->BindPoint() == VK_PIPELINE_BIND_POINT_COMPUTE) NoteComputeSkip(*pipeline_, reason == Pending ? kReasons[Pending] : unbuiltText().empty() ? kReasons[reason] : unbuiltText().c_str());
     ++(reason == Pending ? Stats().skippedBuilding : Stats().skippedOther);
     const std::uint64_t total = ++skipped[reason];
     bool power = total == 1;
     for (std::uint64_t step = 10; step <= total && !power; step *= 10) power = total == step;
     if (power) {
         AbxLog("d3d12_x", "%s skipped (%llu so far for this reason): %s%s%s", function, static_cast<unsigned long long>(total), kReasons[reason],
-               reason == Unbuilt ? ": " : "", reason == Unbuilt ? pipeline_->UnbuiltReason().c_str() : "");
+               reason == Unbuilt ? ": " : "", reason == Unbuilt ? unbuiltText().c_str() : "");
     }
     return true;
 }
@@ -603,6 +773,7 @@ bool CommandList::PrepareDraw(const char* function) {
     }
     PushUserData(graphics_, kGraphicsFirstRootSgpr, function);
     BindTitleSet(VK_PIPELINE_BIND_POINT_GRAPHICS);
+    if (checks_ != VK_NULL_HANDLE && pipeline_->MayWriteMemory()) checksWritten_ = true;
     if (rendering_) return true;
     VkExtent2D extent{UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
@@ -791,6 +962,7 @@ void CommandList::SetRootView(RootArguments& arguments, UINT index, D3D12_ROOT_P
     }
     arguments.words[parameter.firstWord] = static_cast<std::uint32_t>(address);
     arguments.words[parameter.firstWord + 1] = static_cast<std::uint32_t>(address >> 32);
+    if (type == D3D12_ROOT_PARAMETER_TYPE_UAV && address != 0 && context_.addresses != nullptr) context_.addresses->MarkGpuRootWrite(address);
 }
 
 void CommandList::SetTable(RootArguments& arguments, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle, const char* function) {
@@ -895,6 +1067,7 @@ D3D12_RESOURCE_STATES CommandList::StateOf(const Resource* resource, UINT subres
 
 BufferRef CommandList::WindowRange(D3D12_GPU_VIRTUAL_ADDRESS address, UINT64 bytes, const char* function) const {
     if (context_.window.Contains(address, bytes)) return {context_.window.Buffer(), address - context_.window.Start(), bytes};
+    const TitleAddressSpace::Naming naming(function);
     if (context_.addresses != nullptr) {
         if (const std::optional<TitleAddressSpace::Location> found = context_.addresses->Locate(address, bytes)) return {found->buffer, found->offset, bytes};
     }
@@ -1105,7 +1278,7 @@ void CommandList::DispatchThreads(UINT x, UINT y, UINT z, UINT flags) {
     if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_COMPUTE) {
         AbxUnsupported(function, pipeline_ == nullptr ? "a dispatch with no pipeline state set on this command list since its last reset" : "a dispatch while a graphics pipeline state is set");
     }
-    if (SkippedWork(function)) return;
+    if (!pipeline_->FormatSpecialized() && SkippedWork(function)) return;
     std::array<std::uint32_t, 3> size{};
     std::string error;
     if (!pipeline_->GroupSize(size, error)) {
@@ -1117,6 +1290,18 @@ void CommandList::DispatchThreads(UINT x, UINT y, UINT z, UINT flags) {
     const UINT groups = x / size[0] + (x % size[0] != 0 ? 1u : 0u);
     const bool partial = x % size[0] != 0;
     VkPipeline limited = VK_NULL_HANDLE;
+    if (pipeline_->FormatSpecialized() && !partial && SkippedWork(function)) return;
+    if (partial && pipeline_->FormatSpecialized()) {
+        ++Stats().skippedOther;
+        static std::atomic<std::uint64_t> told{0};
+        const std::uint64_t count = ++told;
+        if (count == 1 || (count & (count - 1)) == 0) {
+            AbxLog("d3d12_x", "a dispatch that counts threads and ends in a partial thread group is skipped: its pipeline %s is built for the buffer formats its dispatch reads, "
+                              "and no thread-limited form of such a pipeline is built (%llu so far)",
+                   pipeline_->Shaders().empty() ? "(no shader)" : pipeline_->Shaders().front().c_str(), static_cast<unsigned long long>(count));
+        }
+        return;
+    }
     if (partial) {
         limited = pipeline_->ThreadLimited(kThreadLimitSgpr, error);
         if (limited == VK_NULL_HANDLE) {
@@ -1150,6 +1335,14 @@ void CommandList::CopyMemoryToMemory(std::uint64_t destination, std::uint64_t so
         AbxLog("d3d12_x", "CopyMemoryToMemoryX copies between title addresses on the GPU (first: 0x%llx -> 0x%llx, %llu bytes)", static_cast<unsigned long long>(source),
                static_cast<unsigned long long>(destination), static_cast<unsigned long long>(bytes));
     }
+    const TitleAddressSpace::Naming naming(function);
+    const bool throughTable = CopyThroughTable(destination, source, bytes, function);
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE %s: %llu bytes from title 0x%llx to title 0x%llx, %s | list %04x", function, static_cast<unsigned long long>(bytes),
+               static_cast<unsigned long long>(source), static_cast<unsigned long long>(destination),
+               throughTable ? "through the page table" : "naming the memory as buffers", static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+    }
+    if (throughTable) return;
     std::string error;
     OrderCopy(function);
     const auto locate = [&](std::uint64_t address, std::uint64_t wanted, bool write, std::uint64_t& available) {
@@ -1167,6 +1360,38 @@ void CommandList::CopyMemoryToMemory(std::uint64_t destination, std::uint64_t so
         source += piece;
         bytes -= piece;
     }
+}
+
+bool CommandList::CopyThroughTable(std::uint64_t destination, std::uint64_t source, std::uint64_t bytes, const char* function) {
+    if (context_.addresses == nullptr || !context_.addresses->TableCommands()) return false;
+    const TableCopy* const table = TableCopy::For(context_.device);
+    if (table == nullptr) return false;
+    const TitleAccess accesses[2] = {{destination, bytes, true}, {source, bytes, false}};
+    if (!context_.addresses->TableCommand(accesses, 2)) return false;
+    OrderCopy(function);
+    const std::uint64_t root = context_.addresses->RootTable();
+    for (std::uint64_t done = 0; done < bytes; done += kTableCopyBytes) {
+        table->Copy(commands_, root, destination + done, false, source + done, false, (std::min)(bytes - done, kTableCopyBytes));
+    }
+    pipelineBound_ = false;
+    computeSetBound_ = false;
+    return true;
+}
+
+bool CommandList::FillThroughTable(std::uint64_t destination, std::uint64_t bytes, std::uint32_t value, const char* function) {
+    if (context_.addresses == nullptr || !context_.addresses->TableCommands()) return false;
+    const TableCopy* const table = TableCopy::For(context_.device);
+    if (table == nullptr) return false;
+    const TitleAccess access{destination, bytes, true};
+    if (!context_.addresses->TableCommand(&access, 1)) return false;
+    OrderCopy(function);
+    const std::uint64_t root = context_.addresses->RootTable();
+    for (std::uint64_t done = 0; done < bytes; done += kTableCopyBytes) {
+        table->Fill(commands_, root, destination + done, (std::min)(bytes - done, kTableCopyBytes), value);
+    }
+    pipelineBound_ = false;
+    computeSetBound_ = false;
+    return true;
 }
 
 std::optional<TitleAddressSpace::Location> CommandList::LocateTitleMemory(std::uint64_t address, std::uint64_t wanted, bool write, std::uint64_t& available, std::uint64_t bytes,
@@ -1214,6 +1439,14 @@ void CommandList::FillTitleMemory(std::uint64_t destination, std::uint64_t bytes
         AbxLog("d3d12_x", "FillMemoryWith*BitValueX fills title memory on the GPU (first: 0x%llx, %llu bytes, value 0x%08x)", static_cast<unsigned long long>(destination),
                static_cast<unsigned long long>(bytes), value);
     }
+    const TitleAddressSpace::Naming naming(function);
+    const bool throughTable = FillThroughTable(destination, bytes, value, function);
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE %s: %llu bytes at title 0x%llx filled with 0x%08x, %s | list %04x", function, static_cast<unsigned long long>(bytes),
+               static_cast<unsigned long long>(destination), value, throughTable ? "through the page table" : "naming the memory as a buffer",
+               static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+    }
+    if (throughTable) return;
     std::string error;
     OrderCopy(function);
     while (bytes != 0) {
@@ -1235,6 +1468,17 @@ void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* destination
     if (!to->IsBuffer() || !from->IsBuffer()) {
         AbxUnsupported(function, "a copy between buffers with a texture");
     }
+    const TitleAddressSpace::Naming naming(function);
+    const bool inside = destinationOffset <= to->Width() && bytes <= to->Width() - destinationOffset && sourceOffset <= from->Width() && bytes <= from->Width() - sourceOffset;
+    const std::uint64_t destinationTitle = to->GetGPUVirtualAddress() + destinationOffset;
+    const std::uint64_t sourceTitle = from->GetGPUVirtualAddress() + sourceOffset;
+    const bool throughTable = inside && bytes != 0 && CopyThroughTable(destinationTitle, sourceTitle, bytes, function);
+    if (TracingFrame()) {
+        AbxLog("d3d12_x", "TRACE %s: %llu bytes from title 0x%llx to title 0x%llx, %s | list %04x", function, static_cast<unsigned long long>(bytes),
+               static_cast<unsigned long long>(sourceTitle), static_cast<unsigned long long>(destinationTitle),
+               throughTable ? "through the page table" : "naming the memory as buffers", static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+    }
+    if (throughTable) return;
     std::string error;
     OrderCopy(function);
     while (bytes != 0) {
@@ -1444,7 +1688,9 @@ void STDMETHODCALLTYPE CommandList::RSSetScissorRects(UINT count, const D3D12_RE
 
 void STDMETHODCALLTYPE CommandList::OMSetBlendFactor(const FLOAT factor[4]) {
     const float ones[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    Recorder("ID3D12GraphicsCommandList::OMSetBlendFactor").SetBlendFactor(factor != nullptr ? factor : ones);
+    const float* const used = factor != nullptr ? factor : ones;
+    Recorder("ID3D12GraphicsCommandList::OMSetBlendFactor").SetBlendFactor(used);
+    std::copy(used, used + 4, blendFactor_.begin());
 }
 
 void STDMETHODCALLTYPE CommandList::OMSetStencilRef(UINT reference) {
@@ -1452,6 +1698,7 @@ void STDMETHODCALLTYPE CommandList::OMSetStencilRef(UINT reference) {
         AbxLog("d3d12_x", "TRACE     stencil reference 0x%x | list %04x", reference, static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
     }
     Recorder("ID3D12GraphicsCommandList::OMSetStencilRef").SetStencilReference(reference);
+    stencilReference_ = reference;
 }
 
 void STDMETHODCALLTYPE CommandList::SetPipelineState(ID3D12PipelineState* state) {
@@ -1537,9 +1784,10 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
             images.push_back(*image);
         }
         if (subresource == kAllSubresources) {
-            for (auto entry = states_.begin(); entry != states_.end();) {
-                entry = entry->first.first == resource ? states_.erase(entry) : std::next(entry);
-            }
+            const auto first = states_.lower_bound({resource, 0});
+            auto last = first;
+            while (last != states_.end() && last->first.first == resource) ++last;
+            states_.erase(first, last);
         }
         states_[{resource, subresource}] = barrier.Transition.StateAfter;
     }
@@ -1739,7 +1987,9 @@ void STDMETHODCALLTYPE CommandList::IASetIndexBuffer(const D3D12_INDEX_BUFFER_VI
     }
     const char* function = "ID3D12GraphicsCommandList::IASetIndexBuffer";
     std::string error;
-    Check(Recorder(function).SetIndexBuffer(WindowRange(view->BufferLocation, view->SizeInBytes, function), view->Format, error), function, error);
+    const BufferRef range = WindowRange(view->BufferLocation, view->SizeInBytes, function);
+    Check(Recorder(function).SetIndexBuffer(range, view->Format, error), function, error);
+    indexBuffer_ = std::make_pair(range, view->Format);
     indexView_ = *view;
 }
 
@@ -1789,6 +2039,7 @@ void STDMETHODCALLTYPE CommandList::IASetVertexBuffers(UINT start, UINT count, c
         }
         const BufferRef range = WindowRange(views[index].BufferLocation, views[index].SizeInBytes, function);
         Check(Recorder(function).SetVertexBuffers(start + index, {{range, views[index].StrideInBytes}}, error), function, error);
+        if (start + index < vertexBuffers_.size()) vertexBuffers_[start + index] = VertexBufferRef{range, views[index].StrideInBytes};
     }
 }
 
@@ -1892,6 +2143,15 @@ void CommandList::ClearUnorderedAccess(ID3D12Resource* resource, const VkClearCo
             AbxUnsupported(function, "a buffer clear whose four values differ: the view's format, which decides the pattern, is not read yet");
         }
         const UINT64 bytes = texture->Width() & ~UINT64{3};
+        const TitleAddressSpace::Naming naming(function);
+        const std::uint64_t destination = texture->GetGPUVirtualAddress();
+        const bool throughTable = bytes != 0 && FillThroughTable(destination, bytes, value.uint32[0], function);
+        if (TracingFrame()) {
+            AbxLog("d3d12_x", "TRACE %s: %llu bytes at title 0x%llx filled with 0x%08x, %s | list %04x", function, static_cast<unsigned long long>(bytes),
+                   static_cast<unsigned long long>(destination), value.uint32[0], throughTable ? "through the page table" : "naming the memory as a buffer",
+                   static_cast<unsigned>((reinterpret_cast<std::uintptr_t>(this) >> 4) & 0xFFFFu));
+        }
+        if (throughTable) return;
         const std::optional<BufferRef> range = texture->BufferSpan(0, bytes);
         if (!range || range->size < bytes || (range->offset & 3) != 0) AbxUnsupported(function, "a buffer clear of a range that is not one GPU-visible, 4-byte aligned range");
         if (bytes != 0) context_.device.Vk().cmdFillBuffer(commands_, range->buffer, range->offset, bytes, value.uint32[0]);
@@ -2019,8 +2279,25 @@ void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* sign
     Resource* argumentBuffer = Ours(arguments, function);
     if (argumentBuffer == nullptr || !argumentBuffer->IsBuffer()) AbxUnsupported(function, "indirect arguments that are not in a buffer");
     const UINT64 span = static_cast<UINT64>(indirect.stride) * (maxCount - 1) + IndirectArgumentBytes(indirect.kind);
-    const std::optional<BufferRef> argumentRef = argumentBuffer->BufferSpan(argumentOffset, span);
-    if (!argumentRef || argumentRef->size < span) AbxUnsupported(function, "indirect arguments that are not one GPU-visible range");
+    const TitleAddressSpace::Naming naming(function);
+    TableArguments tableArguments;
+    bool argumentsThroughTable = false;
+    if ((indirect.kind == IndirectKind::Dispatch || indirect.kind == IndirectKind::DispatchMesh) && context_.addresses != nullptr && context_.addresses->TableCommands() &&
+        argumentOffset <= argumentBuffer->Width() && span <= argumentBuffer->Width() - argumentOffset && IndirectClamp::For(context_.device) != nullptr &&
+        TableCopy::For(context_.device) != nullptr) {
+        tableArguments.root = context_.addresses->RootTable();
+        tableArguments.title = argumentBuffer->GetGPUVirtualAddress() + argumentOffset;
+        const TitleAccess access{tableArguments.title, span, false};
+        argumentsThroughTable = context_.addresses->TableCommand(&access, 1);
+    }
+    const TableArguments* const throughTable = argumentsThroughTable ? &tableArguments : nullptr;
+    std::optional<BufferRef> argumentRef;
+    if (!argumentsThroughTable) {
+        argumentRef = argumentBuffer->BufferSpan(argumentOffset, span);
+        if (!argumentRef || argumentRef->size < span) AbxUnsupported(function, "indirect arguments that are not one GPU-visible range");
+    }
+    const VkBuffer argumentHandle = argumentRef ? argumentRef->buffer : VK_NULL_HANDLE;
+    const VkDeviceSize argumentAt = argumentRef ? argumentRef->offset : 0;
     std::optional<BufferRef> countRef;
     std::uint64_t countTitle = 0;
     if (count != nullptr) {
@@ -2055,11 +2332,11 @@ void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* sign
         }
         if (IndirectClamp* clamp = IndirectClamp::For(context_.device)) {
             std::string clampError;
-            const std::optional<ClampedArguments> checked = clamp->RecordDispatches(commands_, argumentRef->buffer, argumentRef->offset, maxCount, indirect.stride, false, clampError);
+            const std::optional<ClampedArguments> checked = clamp->RecordDispatches(commands_, argumentHandle, argumentAt, maxCount, indirect.stride, false, clampError, throughTable);
             Check(checked.has_value(), function, clampError);
             checkedArguments = BufferRef{checked->buffer, checked->offset, checked->size};
             traceArguments(*clamp, *checked, false);
-            Recorder(function).BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_->Pipeline());
+            Recorder(function).BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, workPipeline_);
             pipelineBound_ = true;
             computeSetBound_ = false;
         }
@@ -2069,13 +2346,25 @@ void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* sign
         if (pipeline_ == nullptr || pipeline_->BindPoint() != VK_PIPELINE_BIND_POINT_GRAPHICS) AbxUnsupported(function, "an indirect mesh dispatch without a graphics pipeline state set");
         if (!pipeline_->Shaders().empty() && !pipeline_->HasStage("ms")) AbxUnsupported(function, "an indirect mesh dispatch with a pipeline that has no mesh shader");
         if (IndirectClamp* clamp = IndirectClamp::For(context_.device)) {
-            EndPass();
             std::string clampError;
-            const std::optional<ClampedArguments> checked = clamp->RecordDispatches(commands_, argumentRef->buffer, argumentRef->offset, maxCount, indirect.stride, true, clampError);
+            std::optional<ClampedArguments> checked;
+            const bool ahead = ChecksAheadOfPass() && type_ == D3D12_COMMAND_LIST_TYPE_DIRECT && !TracingFrame();
+            const bool grouped = rendering_ && checks_ != VK_NULL_HANDLE;
+            if (ahead && (!grouped || checksWritten_)) {
+                if (grouped) NoteChecksRestarted(*pipeline_);
+                EndPass();
+                OpenChecksAhead(function);
+            }
+            if (ahead && checks_ != VK_NULL_HANDLE) {
+                checked = clamp->RecordBatched(checkCopies_, checks_, argumentHandle, argumentAt, maxCount, indirect.stride, true, clampError, throughTable);
+            } else {
+                EndPass();
+                checked = clamp->RecordDispatches(commands_, argumentHandle, argumentAt, maxCount, indirect.stride, true, clampError, throughTable);
+                computeSetBound_ = false;
+            }
             Check(checked.has_value(), function, clampError);
             checkedArguments = BufferRef{checked->buffer, checked->offset, checked->size};
             traceArguments(*clamp, *checked, true);
-            computeSetBound_ = false;
         }
         if (!PrepareDraw(function)) return;
     } else {
@@ -2108,6 +2397,7 @@ void STDMETHODCALLTYPE CommandList::ExecuteIndirect(ID3D12CommandSignature* sign
         }
     }
     std::string error;
+    if (!checkedArguments && !argumentRef) AbxUnsupported(function, "indirect arguments read through the page table without the argument check");
     Check(Recorder(function).ExecuteIndirect(indirect, maxCount, checkedArguments ? *checkedArguments : *argumentRef, 0, countRef ? &*countRef : nullptr, 0, error), function, error);
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true)) {

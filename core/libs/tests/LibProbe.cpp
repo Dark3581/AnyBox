@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <type_traits>
@@ -617,6 +618,29 @@ int StorageFiles() {
     return 0;
 }
 
+DWORD WINAPI ExitAfterMainThread(LPVOID) {
+    Sleep(1000);
+    ExitProcess(9);
+}
+
+int ExitScenario(const std::string& scenario) {
+    if (Load(L"ab_runtime.dll") == nullptr) return Fail("load ab_runtime.dll");
+    std::fflush(stdout);
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (scenario == "exit_process") ExitProcess(3);
+    if (scenario == "terminate_process") TerminateProcess(GetCurrentProcess(), 4);
+    if (scenario == "exit_process_direct") Get<void(WINAPI*)(UINT)>(kernel32, "ExitProcess")(5);
+    if (scenario == "terminate_process_direct") Get<BOOL(WINAPI*)(HANDLE, UINT)>(kernel32, "TerminateProcess")(GetCurrentProcess(), 6);
+    if (scenario == "crt_exit") std::exit(7);
+    if (scenario == "main_thread_exit") {
+        const HANDLE worker = CreateThread(nullptr, 0, ExitAfterMainThread, nullptr, 0, nullptr);
+        if (worker == nullptr) return Fail("CreateThread");
+        CloseHandle(worker);
+        ExitThread(8);
+    }
+    return Fail("unknown exit scenario");
+}
+
 int ExpectUnsupported(const char* scenario) {
     wchar_t self[MAX_PATH];
     if (GetModuleFileNameW(nullptr, self, MAX_PATH) == 0) return Fail("GetModuleFileNameW");
@@ -658,5 +682,6 @@ int main(int argc, char** argv) {
     if (scenario == "alloc_zero") return AllocZero();
     if (scenario == "rootsig_version") return UnknownVersion();
     if (scenario == "unsupported" && argc > 3) return ExpectUnsupported(argv[3]);
+    if (scenario == "exit" && argc > 3) return ExitScenario(argv[3]);
     return Fail("unknown scenario");
 }

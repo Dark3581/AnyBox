@@ -47,6 +47,12 @@ if(Python3_FOUND)
 endif()
 
 if(Python3_FOUND)
+    add_test(NAME runtime_exit
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/exit_test.py
+            --probe $<TARGET_FILE:lib_probe> --libs ${ANYBOX_LIBS_DIR} --work ${CMAKE_CURRENT_BINARY_DIR}/runtime_exit)
+endif()
+
+if(Python3_FOUND)
     add_test(NAME runtime_trace
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/trace_test.py
             --probe $<TARGET_FILE:lib_probe> --libs ${ANYBOX_LIBS_DIR} --work ${CMAKE_CURRENT_BINARY_DIR}/runtime_trace)
@@ -83,6 +89,23 @@ add_executable(xg_layout_test XgLayoutTest.cpp)
 target_link_libraries(xg_layout_test PRIVATE gfx10_tiling)
 anybox_static_runtime(xg_layout_test)
 add_test(NAME xg_layout COMMAND xg_layout_test)
+
+add_executable(lane_registers_test LaneRegistersTest.cpp)
+target_link_libraries(lane_registers_test PRIVATE d3d12_x_vulkan)
+anybox_static_runtime(lane_registers_test)
+add_test(NAME lane_registers COMMAND lane_registers_test)
+
+add_executable(buffer_format_spec_test BufferFormatSpecTest.cpp)
+target_link_libraries(buffer_format_spec_test PRIVATE d3d12_x_vulkan)
+anybox_static_runtime(buffer_format_spec_test)
+add_test(NAME buffer_format_spec COMMAND buffer_format_spec_test)
+
+add_executable(queue_order_test QueueOrderTest.cpp)
+target_link_libraries(queue_order_test PRIVATE d3d12_x_pso)
+target_include_directories(queue_order_test PRIVATE ${ANYBOX_LIBS_INCLUDE})
+anybox_static_runtime(queue_order_test)
+add_test(NAME queue_order COMMAND queue_order_test WORKING_DIRECTORY ${ANYBOX_LIBS_DIR})
+set_tests_properties(queue_order PROPERTIES ENVIRONMENT ANYBOX_NO_REPORT=1 SKIP_REGULAR_EXPRESSION "SKIP ")
 
 add_executable(pso_probe PsoProbe.cpp)
 target_link_libraries(pso_probe PRIVATE d3d12_x_pso)

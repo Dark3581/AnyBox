@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -15,13 +16,14 @@
 #include <set>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace abx::d3d12x {
 
 class TitleTextures {
 public:
-    TitleTextures(const ResourceContext& context, IUnknown* parent) : context_(context), parent_(parent) { active_.store(this); }
+    TitleTextures(const ResourceContext& context, IUnknown* parent);
     static TitleTextures* Active() { return active_.load(); }
     ~TitleTextures();
     TitleTextures(const TitleTextures&) = delete;
@@ -40,9 +42,19 @@ private:
     Filled Upload(Resource& texture, std::uint64_t address, std::uint32_t mips, std::string& error, bool filledBefore = false);
     bool MakeReadable(Resource& texture, std::string& error);
 
+    void RefreshNow();
+    void RunRefreshes();
+
     ResourceContext context_;
     IUnknown* parent_;
     std::mutex lock_;
+    bool ownThread_ = false;
+    std::size_t maxInFlight_ = 8;
+    std::thread thread_;
+    std::mutex wakeLock_;
+    std::condition_variable wake_;
+    bool due_ = false;
+    bool stop_ = false;
     std::map<std::pair<std::uint64_t, std::vector<std::uint8_t>>, Resource*> textures_;
     std::map<Resource*, std::pair<std::uint64_t, std::uint32_t>> pending_;
     struct Tracked {

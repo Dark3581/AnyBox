@@ -1,5 +1,6 @@
 #pragma once
 
+#include "BufferFormatSpec.hpp"
 #include "ObjectBase.hpp"
 #include "PipelineLibrary.hpp"
 #include "RootSignature.hpp"
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -59,6 +61,7 @@ public:
     std::string UnbuiltReason() const { return Pending() ? std::string("its pipeline is still being built in the background") : unbuilt_; }
     const std::vector<std::string>& Shaders() const { return shaders_; }
     bool UsesCodeBase() const { return usesCodeBase_; }
+    bool MayWriteMemory() const { return writesMemory_.load(std::memory_order_relaxed); }
     const std::vector<std::filesystem::path>& CodeBaseModules() const { return codeBaseModules_; }
     std::uint64_t CodeBase() const { return codeBase_.load(std::memory_order_acquire); }
     void SetCodeBase(std::uint64_t address) { codeBase_.store(address, std::memory_order_release); }
@@ -67,6 +70,10 @@ public:
     const GraphicsDescription* Description() const { return description_.get(); }
     bool GroupSize(std::array<std::uint32_t, 3>& size, std::string& error);
     VkPipeline ThreadLimited(std::uint32_t limitRegister, std::string& error);
+    bool FormatSpecialized() const { return !formatSources_.empty(); }
+    const std::vector<BufferFormatSource>& FormatSources() const { return formatSources_; }
+    VkPipeline FormatVariant(const std::vector<std::uint32_t>& words, bool& pending, bool& generic, std::string& why);
+    void StartGenericBuild();
 
 protected:
     bool Implements(REFIID riid) const override;
@@ -95,6 +102,7 @@ private:
     std::string unbuilt_;
     std::vector<std::string> shaders_;
     bool usesCodeBase_ = false;
+    std::atomic<bool> writesMemory_{true};
     std::vector<std::filesystem::path> codeBaseModules_;
     std::atomic<std::uint64_t> codeBase_{0};
     std::shared_ptr<const GraphicsDescription> description_;
@@ -105,6 +113,18 @@ private:
     std::optional<std::array<std::uint32_t, 3>> groupSize_;
     std::string groupSizeError_;
     std::optional<std::uint32_t> limitRegister_;
+    struct FormatVariantBuild {
+        std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};
+        std::atomic<bool> pending{true};
+        std::string error;
+    };
+    std::vector<BufferFormatSource> formatSources_;
+    std::mutex variantLock_;
+    std::map<std::vector<std::uint32_t>, std::unique_ptr<FormatVariantBuild>> variants_;
+    std::function<PipelineEntry()> genericBuild_;
+    std::uint64_t genericBytes_ = 0;
+    std::atomic<bool> genericStarted_{false};
+    std::atomic<bool> codeBaseNoted_{false};
     VkPipeline threadLimited_ = VK_NULL_HANDLE;
     std::string threadLimitedError_;
 };

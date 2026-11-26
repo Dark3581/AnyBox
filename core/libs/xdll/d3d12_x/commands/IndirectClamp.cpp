@@ -1,6 +1,8 @@
 #include "IndirectClamp.hpp"
 
 #include "AbxApi.hpp"
+#include "LiveStats.hpp"
+#include "TableCopy.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -93,7 +95,7 @@ bool IndirectClamp::Create(std::string& error) {
     meshMaxGroups_ = (std::min)(device_.MeshMaxTotal(), maxGroups_);
     for (int axis = 0; axis < 3; ++axis) meshMaxDimension_[axis] = (std::min)(device_.MeshMaxGroups()[axis], meshMaxGroups_);
     if (!CreateHostBuffer(device_, kScratchBytes,
-                          VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, scratch_,
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, scratch_,
                           error)) {
         return false;
     }
@@ -154,6 +156,11 @@ std::string IndirectClamp::RecentReport() {
     for (std::size_t back = 0; back < shown; ++back) {
         const Recent& recent = clamp->recent_[(clamp->recentCount_ - 1 - back) % kRecent];
         const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(clamp->scratch_.mapped) + recent.at);
+        if (words[0] == kNotRun) {
+            std::snprintf(text, sizeof(text), " [%s, %u record(s), not run by the GPU yet]", recent.mesh ? "mesh" : "compute", recent.records);
+            report += text;
+            continue;
+        }
         std::uint64_t groups = 0;
         std::uint64_t largest = 0;
         for (std::uint32_t record = 0; record < recent.records; ++record) {
@@ -177,9 +184,18 @@ std::string IndirectClamp::RecentReport() {
     std::uint64_t meshLargest[3] = {};
     std::uint32_t meshLargestSize[3][3] = {};
     std::string latest;
+    std::size_t meshNotRun = 0;
     for (std::size_t back = 0; back < meshShown; ++back) {
         const Recent& recent = clamp->recentMesh_[(clamp->recentMeshCount_ - 1 - back) % kRecentMesh];
         const auto* words = reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(clamp->scratch_.mapped) + recent.at);
+        if (words[0] == kNotRun) {
+            ++meshNotRun;
+            if (back < 6) {
+                std::snprintf(text, sizeof(text), " %u:-", recent.records);
+                latest += text;
+            }
+            continue;
+        }
         std::uint64_t groups = 0;
         for (std::uint32_t record = 0; record < recent.records; ++record) {
             const std::uint32_t* xyz = words + static_cast<std::size_t>(record) * recent.strideWords;
@@ -203,9 +219,9 @@ std::string IndirectClamp::RecentReport() {
         }
     }
     std::snprintf(text, sizeof(text),
-                  "; the latest %zu indirect mesh batches as the GPU left them (%llu in all): %llu groups together, the three largest records %u x %u x %u, %u x %u x %u and "
-                  "%u x %u x %u; newest first as records:groups",
-                  meshShown, static_cast<unsigned long long>(clamp->recentMeshCount_), static_cast<unsigned long long>(meshGroups), meshLargestSize[0][0], meshLargestSize[0][1],
+                  "; the latest %zu indirect mesh batches as the GPU left them (%llu in all), %zu of them not run by the GPU yet and left out: %llu groups together, the three "
+                  "largest records %u x %u x %u, %u x %u x %u and %u x %u x %u; newest first as records:groups (- not run yet)",
+                  meshShown, static_cast<unsigned long long>(clamp->recentMeshCount_), meshNotRun, static_cast<unsigned long long>(meshGroups), meshLargestSize[0][0], meshLargestSize[0][1],
                   meshLargestSize[0][2], meshLargestSize[1][0], meshLargestSize[1][1], meshLargestSize[1][2], meshLargestSize[2][0], meshLargestSize[2][1], meshLargestSize[2][2]);
     report += text;
     report += latest;
@@ -337,8 +353,7 @@ void IndirectClamp::Report() {
            stats[0], stats[1], stats[2], stats[3]);
 }
 
-std::optional<ClampedArguments> IndirectClamp::RecordDispatches(VkCommandBuffer commands, VkBuffer arguments, VkDeviceSize offset, std::uint32_t records, std::uint32_t stride,
-                                                              bool mesh, std::string& error) {
+std::optional<IndirectClamp::Prepared> IndirectClamp::Prepare(std::uint32_t records, std::uint32_t stride, bool mesh, std::string& error) {
     if (records == 0 || stride < 12 || stride % 4 != 0) {
         error = "indirect dispatch records with a stride that is not a multiple of 4 or below 12 bytes";
         return std::nullopt;
@@ -352,12 +367,11 @@ std::optional<ClampedArguments> IndirectClamp::RecordDispatches(VkCommandBuffer 
     }
     Report();
     const VkDeviceSize at = Reserve(room);
-    const DeviceFunctions& vk = device_.Vk();
-    Barrier(device_, commands, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    const VkBufferCopy region{offset, at, span};
-    vk.cmdCopyBuffer(commands, arguments, scratch_.buffer, 1, &region);
-    Barrier(device_, commands, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    auto* bytes = static_cast<std::uint8_t*>(scratch_.mapped) + at;
+    for (std::uint32_t record = 0; record < records; ++record) {
+        const std::uint32_t words[3] = {kNotRun, kNotRun, kNotRun};
+        std::memcpy(bytes + static_cast<std::size_t>(record) * stride, words, sizeof(words));
+    }
     {
         const std::lock_guard guard(recentLock_);
         recent_[recentCount_ % kRecent] = Recent{at, records, stride / 4, mesh};
@@ -367,8 +381,13 @@ std::optional<ClampedArguments> IndirectClamp::RecordDispatches(VkCommandBuffer 
             ++recentMeshCount_;
         }
     }
+    ++Stats().clampDispatches;
+    return Prepared{at, span};
+}
+
+void IndirectClamp::PushAndDispatch(VkCommandBuffer commands, const Prepared& prepared, std::uint32_t records, std::uint32_t stride, bool mesh) {
     ClampPush push{};
-    push.arguments = scratch_.address + at;
+    push.arguments = scratch_.address + prepared.at;
     push.stats = scratch_.address;
     push.records = records;
     push.strideWords = stride / 4;
@@ -377,11 +396,65 @@ std::optional<ClampedArguments> IndirectClamp::RecordDispatches(VkCommandBuffer 
     push.maxY = dimensions[1];
     push.maxZ = dimensions[2];
     push.maxGroups = mesh ? meshMaxGroups_ : maxGroups_;
-    vk.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    const DeviceFunctions& vk = device_.Vk();
     vk.cmdPushConstants(commands, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vk.cmdDispatch(commands, 1, 1, 1);
+}
+
+std::optional<ClampedArguments> IndirectClamp::RecordDispatches(VkCommandBuffer commands, VkBuffer arguments, VkDeviceSize offset, std::uint32_t records, std::uint32_t stride,
+                                                              bool mesh, std::string& error, const TableArguments* table) {
+    const TableCopy* const throughTable = table != nullptr ? TableCopy::For(device_) : nullptr;
+    if (table != nullptr && throughTable == nullptr) {
+        error = "indirect arguments cannot be read through the page table on this device";
+        return std::nullopt;
+    }
+    const std::optional<Prepared> prepared = Prepare(records, stride, mesh, error);
+    if (!prepared) return std::nullopt;
+    const DeviceFunctions& vk = device_.Vk();
+    if (throughTable != nullptr) {
+        throughTable->Copy(commands, table->root, scratch_.address + prepared->at, true, table->title, false, prepared->span);
+    } else {
+        Barrier(device_, commands, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        const VkBufferCopy region{offset, prepared->at, prepared->span};
+        vk.cmdCopyBuffer(commands, arguments, scratch_.buffer, 1, &region);
+        Barrier(device_, commands, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+    vk.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    PushAndDispatch(commands, *prepared, records, stride, mesh);
     Barrier(device_, commands, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
-    return ClampedArguments{scratch_.buffer, at, span};
+    return ClampedArguments{scratch_.buffer, prepared->at, prepared->span};
+}
+
+void IndirectClamp::BeginBatch(VkCommandBuffer copies, VkCommandBuffer checks) {
+    Barrier(device_, copies, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    Barrier(device_, checks, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    device_.Vk().cmdBindPipeline(checks, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+}
+
+std::optional<ClampedArguments> IndirectClamp::RecordBatched(VkCommandBuffer copies, VkCommandBuffer checks, VkBuffer arguments, VkDeviceSize offset, std::uint32_t records,
+                                                           std::uint32_t stride, bool mesh, std::string& error, const TableArguments* table) {
+    const TableCopy* const throughTable = table != nullptr ? TableCopy::For(device_) : nullptr;
+    if (table != nullptr && throughTable == nullptr) {
+        error = "indirect arguments cannot be read through the page table on this device";
+        return std::nullopt;
+    }
+    const std::optional<Prepared> prepared = Prepare(records, stride, mesh, error);
+    if (!prepared) return std::nullopt;
+    if (throughTable != nullptr) {
+        throughTable->Copy(copies, table->root, scratch_.address + prepared->at, true, table->title, false, prepared->span);
+    } else {
+        const VkBufferCopy region{offset, prepared->at, prepared->span};
+        device_.Vk().cmdCopyBuffer(copies, arguments, scratch_.buffer, 1, &region);
+    }
+    PushAndDispatch(checks, *prepared, records, stride, mesh);
+    ++Stats().clampsAhead;
+    return ClampedArguments{scratch_.buffer, prepared->at, prepared->span};
+}
+
+void IndirectClamp::EndBatch(VkCommandBuffer checks) {
+    Barrier(device_, checks, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
 }
 
 }

@@ -1,4 +1,6 @@
 #include "PipelineLibrary.hpp"
+#include "LaneRegisters.hpp"
+#include "MemoryWrites.hpp"
 #include "PipelineCompiler.hpp"
 #include "ThreadLimit.hpp"
 #include "UserDataRebase.hpp"
@@ -41,7 +43,8 @@ PipelineEntry PipelineLibrary::Compute(const PipelineSource& source) {
         entry.error = "the pipeline has no key";
         return entry;
     }
-    const std::string variant = source.threadLimited ? ":threads" + std::to_string(source.limitRegister) : std::string();
+    std::string variant = source.threadLimited ? ":threads" + std::to_string(source.limitRegister) : std::string();
+    for (const auto& [id, value] : source.constants) variant += ":spec" + std::to_string(id) + "=" + std::to_string(value);
     return Obtain("cs:" + source.key + variant, [this, &source] { return Create(source); });
 }
 
@@ -120,6 +123,7 @@ PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) co
             vk.destroyShaderModule(device_.Handle(), stage.module, nullptr);
         }
     };
+    entry.writesMemory = false;
     for (const GraphicsShaderSource& shader : request.shaders) {
         bool stageUsesCodeBase = false;
         std::optional<std::vector<std::uint32_t>> words = ReadTitleModule(shader.module, stageUsesCodeBase, entry.error);
@@ -136,6 +140,17 @@ PipelineEntry PipelineLibrary::CreateGraphics(const GraphicsRequest& request) co
             release();
             return finish();
         }
+        if (shader.stage == VK_SHADER_STAGE_MESH_BIT_EXT && meshGroupsInTurns_) {
+            std::string why;
+            const std::optional<LaneTurns> turns = RunLaneGroupInTurns(*words, device_.MeshPreferredLanes(), why);
+            if (turns) {
+                entry.laneTurns = turns->turns;
+                entry.laneRegions += turns->regions;
+            } else {
+                entry.laneNote = why;
+            }
+        }
+        entry.writesMemory = entry.writesMemory || MayWriteMemory(*words);
         entry.bytes += words->size() * sizeof(std::uint32_t);
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         moduleInfo.codeSize = words->size() * sizeof(std::uint32_t);
@@ -237,6 +252,14 @@ PipelineEntry PipelineLibrary::Create(const PipelineSource& source) const {
     info.stage.module = module;
     info.stage.pName = "main";
     info.layout = device_.TitlePipelineLayout();
+    std::vector<VkSpecializationMapEntry> specEntries;
+    std::vector<std::uint32_t> specData;
+    for (const auto& [id, value] : source.constants) {
+        specEntries.push_back({id, static_cast<std::uint32_t>(specData.size() * sizeof(std::uint32_t)), sizeof(std::uint32_t)});
+        specData.push_back(value);
+    }
+    const VkSpecializationInfo specialization{static_cast<std::uint32_t>(specEntries.size()), specEntries.data(), specData.size() * sizeof(std::uint32_t), specData.data()};
+    if (!specEntries.empty()) info.stage.pSpecializationInfo = &specialization;
     if (source.subgroupSize != 0 && device_.CanRequireSubgroupSize(source.subgroupSize, VK_SHADER_STAGE_COMPUTE_BIT)) {
         info.stage.pNext = &subgroup;
         entry.subgroupForced = true;

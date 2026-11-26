@@ -8,6 +8,7 @@
 #include "TitleAddressSpace.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,11 +49,27 @@ TextureReadback::TextureReadback(const ResourceContext& context) : context_(cont
         AbxLog("d3d12_x", "small GPU-written textures are not copied back to title memory (d3d12_x.texture_readback_texels = 0): a title whose CPU reads one there sees the "
                           "memory as it was");
     }
+    if (const char* value = AbxSetting("d3d12_x.texture_readback_thread")) ownThread_ = value[0] == '1' && value[1] == 0;
+    if (maxTexels_ != 0) {
+        AbxLog("d3d12_x", "small GPU-written textures are copied back to title memory %s (d3d12_x.texture_readback_thread)",
+               ownThread_ ? "by a thread of their own, a few milliseconds after the GPU wrote them, as the console's GPU writes that memory whenever it gets there"
+                          : "on the title's thread before each ExecuteCommandLists and present");
+    }
+    if (ownThread_ && maxTexels_ != 0) thread_ = std::thread([this] { RunPasses(); });
     active_.store(this);
 }
 
 TextureReadback::~TextureReadback() {
     active_.store(nullptr);
+    if (thread_.joinable()) {
+        {
+            const std::lock_guard wake(wakeLock_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
+    const std::lock_guard pass(passLock_);
     const std::lock_guard guard(lock_);
     for (auto& [texture, slot] : slots_) {
         texture->SetReadBack(false);
@@ -117,18 +134,22 @@ void TextureReadback::Consider(Resource& texture, std::uint64_t address, const D
     slot.element = static_cast<std::uint32_t>(element);
     slot.mode = console->mode;
     slot.name = name;
-    slot.elements.reserve(level.width * level.height);
+    slot.id = ++slotIds_;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> elements;
+    elements.reserve(level.width * level.height);
     for (std::size_t y = 0; y < level.height; ++y) {
         for (std::size_t x = 0; x < level.width; ++x) {
             const std::size_t at = console->chain.ElementAt(level, x, y, 0);
             if (at + element > texelBytes) return refuse("a texel lies outside the console layout's texel bytes");
-            slot.elements.emplace_back(at, static_cast<std::uint32_t>(slot.footprint.Offset + y * slot.footprint.Footprint.RowPitch + x * element));
+            elements.emplace_back(at, static_cast<std::uint32_t>(slot.footprint.Offset + y * slot.footprint.Footprint.RowPitch + x * element));
         }
     }
-    std::sort(slot.elements.begin(), slot.elements.end());
+    std::sort(elements.begin(), elements.end());
+    if (elements.empty()) return refuse("the console level has no texels");
+    slot.elements = std::make_shared<const std::vector<std::pair<std::uint64_t, std::uint32_t>>>(std::move(elements));
     if (!CreateHostBuffer(context_.device, slot.sequenceOffset + 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, slot.staging, why)) return refuse("no staging buffer: " + why);
     std::memset(slot.staging.mapped, 0, static_cast<std::size_t>(slot.sequenceOffset + 16));
-    const std::uint64_t first = slot.texelBase + slot.elements.front().first;
+    const std::uint64_t first = slot.texelBase + slot.elements->front().first;
     slots_.emplace(&texture, std::move(slot));
     texture.SetReadBack(true);
     const std::uint64_t count = ++considered_;
@@ -191,6 +212,7 @@ bool TextureReadback::WriteTitle(std::uint64_t address, const std::uint8_t* data
         const std::uint8_t* host = context_.addresses != nullptr ? context_.addresses->HostAt(at) : nullptr;
         void* const target = host != nullptr ? const_cast<std::uint8_t*>(host) : reinterpret_cast<void*>(at);
         SIZE_T written = 0;
+        const TimedScope timed(TimedPart::ReadbackWrite);
         if (!WriteProcessMemory(GetCurrentProcess(), target, data + done, piece, &written) || written != piece) {
             failure = GetLastError();
             return false;
@@ -214,66 +236,117 @@ bool TextureReadback::ReadTitle(std::uint64_t address, std::uint8_t* data, std::
     return true;
 }
 
-bool TextureReadback::DeliverLocked(Slot& slot) {
-    const auto* mapped = static_cast<const std::uint8_t*>(slot.staging.mapped);
-    std::uint32_t sequence = 0;
-    std::memcpy(&sequence, mapped + slot.sequenceOffset, 4);
-    if (sequence == slot.delivered || presents_ < slot.retryAt) return false;
-    snapshot_.assign(mapped, mapped + slot.copyBytes);
-    const std::uint64_t firstAt = slot.texelBase + slot.elements.front().first;
-    std::uint8_t before[16]{};
-    const std::size_t shown = (std::min)(static_cast<std::size_t>(slot.element), sizeof(before));
-    const bool readBefore = slot.deliveries == 0 && ReadTitle(firstAt, before, shown);
-    std::size_t runs = 0;
+void TextureReadback::WriteCopy(Copy& copy) {
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>>& elements = *copy.elements;
+    const std::uint64_t firstAt = copy.texelBase + elements.front().first;
+    const std::size_t shown = (std::min)(static_cast<std::size_t>(copy.element), sizeof(copy.before));
+    copy.readBefore = copy.first && ReadTitle(firstAt, copy.before, shown);
     std::size_t index = 0;
-    DWORD failure = 0;
-    std::uint64_t failedAt = 0;
-    bool written = true;
-    while (index < slot.elements.size() && written) {
-        const std::uint64_t start = slot.elements[index].first;
+    copy.written = true;
+    while (index < elements.size() && copy.written) {
+        const std::uint64_t start = elements[index].first;
         std::uint64_t end = start;
         run_.clear();
-        while (index < slot.elements.size() && slot.elements[index].first == end) {
-            const std::uint8_t* const source = snapshot_.data() + slot.elements[index].second;
-            run_.insert(run_.end(), source, source + slot.element);
-            end += slot.element;
+        while (index < elements.size() && elements[index].first == end) {
+            const std::uint8_t* const source = copy.texels.data() + elements[index].second;
+            run_.insert(run_.end(), source, source + copy.element);
+            end += copy.element;
             ++index;
         }
-        written = WriteTitle(slot.texelBase + start, run_.data(), run_.size(), failure);
-        if (!written) failedAt = slot.texelBase + start;
-        ++runs;
-    }
-    if (!written) {
-        slot.retryAt = presents_ + kRetryAfterPresents;
-        if (!slot.failureLogged) {
-            slot.failureLogged = true;
-            AbxLog("d3d12_x", "a small GPU-written texture at title address 0x%llx (%s) could not be copied back to title memory: writing %zu byte(s) at 0x%llx failed with "
-                              "error %lu; tried again every %llu presents",
-                   static_cast<unsigned long long>(slot.address), slot.name.c_str(), run_.size(), static_cast<unsigned long long>(failedAt), failure,
-                   static_cast<unsigned long long>(kRetryAfterPresents));
+        copy.written = WriteTitle(copy.texelBase + start, run_.data(), run_.size(), copy.failure);
+        if (!copy.written) {
+            copy.failedAt = copy.texelBase + start;
+            copy.failedBytes = run_.size();
         }
-        return false;
+        ++copy.runs;
     }
-    slot.delivered = sequence;
-    slot.retryAt = 0;
-    if (slot.deliveries++ == 0) {
-        const std::uint64_t count = ++reported_;
-        if (count <= 64 || (count & (count - 1)) == 0) {
-            const std::uint8_t* const firstTexel = snapshot_.data() + slot.elements.front().second;
-            AbxLog("d3d12_x", "texture readback: the GPU's texels of the texture at title address 0x%llx (%s) are now in title memory, %zu byte(s) in %zu run(s) from 0x%llx; "
-                              "the first texel was %s there and is %s on the GPU; later copies of this texture are not logged (%llu texture(s) so far)",
-                   static_cast<unsigned long long>(slot.address), slot.name.c_str(), slot.elements.size() * static_cast<std::size_t>(slot.element), runs,
-                   static_cast<unsigned long long>(firstAt), readBefore ? WordsText(before, shown).c_str() : "not readable", WordsText(firstTexel, shown).c_str(),
-                   static_cast<unsigned long long>(count));
+}
+
+void TextureReadback::Pass() {
+    const std::lock_guard pass(passLock_);
+    copies_.clear();
+    {
+        const std::lock_guard guard(lock_);
+        for (auto& [texture, slot] : slots_) {
+            const auto* mapped = static_cast<const std::uint8_t*>(slot.staging.mapped);
+            std::uint32_t sequence = 0;
+            std::memcpy(&sequence, mapped + slot.sequenceOffset, 4);
+            if (sequence == slot.delivered || presents_ < slot.retryAt) continue;
+            Copy copy;
+            copy.texture = texture;
+            copy.id = slot.id;
+            copy.sequence = sequence;
+            copy.texelBase = slot.texelBase;
+            copy.element = slot.element;
+            copy.first = slot.deliveries == 0;
+            copy.elements = slot.elements;
+            copy.texels.assign(mapped, mapped + slot.copyBytes);
+            copies_.push_back(std::move(copy));
         }
     }
-    return true;
+    if (copies_.empty()) return;
+    for (Copy& copy : copies_) WriteCopy(copy);
+    const std::lock_guard guard(lock_);
+    for (const Copy& copy : copies_) {
+        const auto found = slots_.find(copy.texture);
+        if (found == slots_.end() || found->second.id != copy.id) continue;
+        Slot& slot = found->second;
+        if (!copy.written) {
+            slot.retryAt = presents_ + kRetryAfterPresents;
+            if (!slot.failureLogged) {
+                slot.failureLogged = true;
+                AbxLog("d3d12_x", "a small GPU-written texture at title address 0x%llx (%s) could not be copied back to title memory: writing %zu byte(s) at 0x%llx failed with "
+                                  "error %lu; tried again every %llu presents",
+                       static_cast<unsigned long long>(slot.address), slot.name.c_str(), copy.failedBytes, static_cast<unsigned long long>(copy.failedAt), copy.failure,
+                       static_cast<unsigned long long>(kRetryAfterPresents));
+            }
+            continue;
+        }
+        slot.delivered = copy.sequence;
+        slot.retryAt = 0;
+        if (slot.deliveries++ == 0) {
+            const std::uint64_t count = ++reported_;
+            if (count <= 64 || (count & (count - 1)) == 0) {
+                const std::vector<std::pair<std::uint64_t, std::uint32_t>>& elements = *copy.elements;
+                const std::size_t shown = (std::min)(static_cast<std::size_t>(copy.element), sizeof(copy.before));
+                const std::uint8_t* const firstTexel = copy.texels.data() + elements.front().second;
+                AbxLog("d3d12_x", "texture readback: the GPU's texels of the texture at title address 0x%llx (%s) are now in title memory, %zu byte(s) in %zu run(s) from 0x%llx; "
+                                  "the first texel was %s there and is %s on the GPU; later copies of this texture are not logged (%llu texture(s) so far)",
+                       static_cast<unsigned long long>(slot.address), slot.name.c_str(), elements.size() * static_cast<std::size_t>(copy.element), copy.runs,
+                       static_cast<unsigned long long>(copy.texelBase + elements.front().first), copy.readBefore ? WordsText(copy.before, shown).c_str() : "not readable",
+                       WordsText(firstTexel, shown).c_str(), static_cast<unsigned long long>(count));
+            }
+        }
+        const std::uint64_t count = ++delivered_;
+        if (count >= 64 && (count & (count - 1)) == 0) {
+            AbxLog("d3d12_x", "texture readback: %llu copies of small GPU-written textures delivered to title memory so far, %zu texture(s) alive",
+                   static_cast<unsigned long long>(count), slots_.size());
+        }
+    }
+}
+
+void TextureReadback::RunPasses() {
+    constexpr auto kBusy = std::chrono::milliseconds(4);
+    constexpr auto kIdle = std::chrono::milliseconds(100);
+    for (;;) {
+        bool any = false;
+        {
+            const std::lock_guard guard(lock_);
+            any = !slots_.empty();
+        }
+        {
+            std::unique_lock wake(wakeLock_);
+            wake_.wait_for(wake, any ? kBusy : kIdle);
+            if (stop_) return;
+        }
+        const TimedScope timed(TimedPart::Readback);
+        Pass();
+    }
 }
 
 void TextureReadback::Deliver(bool present) {
-    const TimedScope timed(TimedPart::Readback);
-    const std::lock_guard guard(lock_);
     if (present) {
+        const std::lock_guard guard(lock_);
         ++presents_;
         for (auto entry = retired_.begin(); entry != retired_.end();) {
             if (entry->second + kRetireAfterPresents > presents_) {
@@ -284,14 +357,12 @@ void TextureReadback::Deliver(bool present) {
             entry = retired_.erase(entry);
         }
     }
-    for (auto& [texture, slot] : slots_) {
-        if (!DeliverLocked(slot)) continue;
-        const std::uint64_t count = ++delivered_;
-        if (count >= 64 && (count & (count - 1)) == 0) {
-            AbxLog("d3d12_x", "texture readback: %llu copies of small GPU-written textures delivered to title memory so far, %zu texture(s) alive",
-                   static_cast<unsigned long long>(count), slots_.size());
-        }
+    if (ownThread_) {
+        wake_.notify_one();
+        return;
     }
+    const TimedScope timed(TimedPart::Readback);
+    Pass();
 }
 
 }

@@ -601,19 +601,12 @@ void DumpTracedBuffers(const TitleAddressSpace* addresses, const std::string& sh
             std::uint64_t written = 0;
             if (fresh) {
                 std::FILE* file = std::fopen((folder + "\\" + name).c_str(), "wb");
+                std::vector<std::uint8_t> piece(kPage);
                 while (file != nullptr && written < bytes) {
                     const std::uint64_t address = base + written;
                     const std::uint64_t run = (std::min)(bytes - written, kPage - (address & (kPage - 1)));
-                    const std::uint8_t* host = addresses != nullptr ? addresses->HostAt(address) : nullptr;
-                    if (host == nullptr) {
-                        MEMORY_BASIC_INFORMATION region{};
-                        if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
-                            (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize < address + run) {
-                            break;
-                        }
-                        host = reinterpret_cast<const std::uint8_t*>(address);
-                    }
-                    if (std::fwrite(host, 1, static_cast<std::size_t>(run), file) != run) break;
+                    if (addresses == nullptr || addresses->ReadForTrace(address, piece.data(), run) != run) break;
+                    if (std::fwrite(piece.data(), 1, static_cast<std::size_t>(run), file) != run) break;
                     written += run;
                 }
                 if (file != nullptr) std::fclose(file);

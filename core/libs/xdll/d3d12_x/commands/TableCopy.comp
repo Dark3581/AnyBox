@@ -1,0 +1,49 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Table {
+    uint64_t entries[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint v[];
+};
+
+layout(push_constant, std430) uniform Push {
+    uint64_t root;
+    uint64_t destination;
+    uint64_t source;
+    uint words;
+    uint value;
+    uint mode;
+    uint spare;
+} push;
+
+const uint kSourceIsDevice = 1u;
+const uint kDestinationIsDevice = 2u;
+const uint kFill = 4u;
+
+uint64_t Device(uint64_t address) {
+    uint64_t page = address >> 16;
+    Table root = Table(push.root);
+    Table region = Table(root.entries[uint(page >> 16) & 0x7FFFu]);
+    return region.entries[uint(page & 0xFFFFul)] + (address & 0xFFFFul);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= push.words) return;
+    uint64_t offset = uint64_t(index) * 4ul;
+    uint value = push.value;
+    if ((push.mode & kFill) == 0u) {
+        uint64_t from = push.source + offset;
+        if ((push.mode & kSourceIsDevice) == 0u) from = Device(from);
+        value = Words(from).v[0];
+    }
+    uint64_t to = push.destination + offset;
+    if ((push.mode & kDestinationIsDevice) == 0u) to = Device(to);
+    Words(to).v[0] = value;
+}

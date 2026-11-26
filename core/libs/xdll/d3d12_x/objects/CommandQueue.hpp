@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -54,6 +55,9 @@ public:
     };
 
     void ExecuteOrdered(UINT count, ID3D12CommandList* const* lists, std::vector<MemoryWait> waits, std::vector<MemoryLabel> labels);
+    void PresentOrdered(std::function<void()> present);
+    static void RunDuePresents();
+    static std::uint64_t MemoryWaitsGivenUp();
     void Flush();
     bool Drain(std::chrono::milliseconds limit);
     std::size_t Pending() const;
@@ -67,15 +71,18 @@ private:
         Fence* fence = nullptr;
         UINT64 value = 0;
         std::vector<VkCommandBuffer> commands;
+        std::vector<std::uint32_t> listBuffers;
         std::vector<MemoryWait> waits;
         std::vector<MemoryLabel> labels;
         std::chrono::steady_clock::time_point blockedSince{};
+        std::function<void()> present;
     };
 
     CommandQueue(const VulkanDevice& device, IUnknown* parent, const D3D12_COMMAND_QUEUE_DESC& desc) : DeviceChildBase(parent), device_(device), desc_(desc) {}
     ~CommandQueue() override;
     HRESULT Enqueue(Operation operation);
     bool Submit(const Operation& operation);
+    void EndPresent();
 
     const VulkanDevice& device_;
     D3D12_COMMAND_QUEUE_DESC desc_;
@@ -84,6 +91,7 @@ private:
     bool flushing_ = false;
     bool again_ = false;
     bool memoryBlocked_ = false;
+    bool presenting_ = false;
 };
 
 }

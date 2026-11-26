@@ -346,6 +346,17 @@ void STDMETHODCALLTYPE QueueExecuteCommandLists(Facade* self, UINT count, void* 
     }
     AbxTrace("ExecuteCommandLists(%u lists, frame token %llu)", count, static_cast<unsigned long long>(frameToken));
     CommandQueue* queue = InnerOf<CommandQueue>(self);
+    static const std::uint64_t traceAfter = [] {
+        const char* value = AbxSetting("d3d12_x.wait_trace_after_given_up");
+        const std::uint64_t asked = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        if (asked != 0) {
+            AbxLog("d3d12_x", "memory waits, labels, submissions and presents are traced for 30 s (600 WTRACE lines at most) once %llu memory waits were given up "
+                              "(d3d12_x.wait_trace_after_given_up)",
+                   static_cast<unsigned long long>(asked));
+        }
+        return asked;
+    }();
+    if (traceAfter != 0 && CommandQueue::MemoryWaitsGivenUp() >= traceAfter) StartTracing();
     if (Tracing()) {
         std::string ids;
         for (UINT index = 0; index < count; ++index) {
@@ -513,9 +524,27 @@ HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std:
     std::memcpy(&resources, planes + kPlaneResources, sizeof(resources));
     Resource* image = resources != nullptr ? static_cast<Resource*>(FacadeInner(resources[0])) : nullptr;
     if (image == nullptr || image->IsBuffer()) AbxUnsupported("D3D12 command queue slot 32", "a present plane without a texture AnyBox handed out");
-    if (!InnerOf<CommandQueue>(self)->Drain(std::chrono::milliseconds(300))) {
-        static std::atomic<bool> reported{false};
-        if (!reported.exchange(true)) AbxLog("d3d12_x", "a present was shown while its queue still held work waiting for a fence or a memory value for over 300 ms");
+    CommandQueue* const queue = InnerOf<CommandQueue>(self);
+    static const bool inQueueOrder = [] {
+        const char* value = AbxSetting("d3d12_x.present_in_queue_order");
+        const bool on = value != nullptr && value[0] == '1' && value[1] == 0;
+        AbxLog("d3d12_x", "a present whose queue still holds lists waiting for a memory value or a fence %s (d3d12_x.present_in_queue_order)",
+               on ? "returns at once and is shown after those lists, in the queue's order, as the console queues it"
+                  : "waits up to 300 ms for them on the calling thread and is then shown, whether or not they ran");
+        return on;
+    }();
+    bool later = false;
+    TraceLine("present queue %p thread %lu, %zu operation(s) of the queue not submitted yet", static_cast<void*>(queue), GetCurrentThreadId(), queue->Pending());
+    if (inQueueOrder && !TracingFrame()) {
+        queue->Flush();
+        CommandQueue::RunDuePresents();
+        later = queue->Pending() != 0;
+    } else {
+        const abx::d3d12x::TimedScope held(abx::d3d12x::TimedPart::PresentHeld);
+        if (!queue->Drain(std::chrono::milliseconds(300))) {
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) AbxLog("d3d12_x", "a present was shown while its queue still held work waiting for a fence or a memory value for over 300 ms");
+        }
     }
     if (TracingFrame()) {
         const D3D12_RESOURCE_DESC& traced = image->Texture().desc;
@@ -529,64 +558,96 @@ HRESULT STDMETHODCALLTYPE QueuePresent(Facade* self, UINT planeCount, const std:
     StartLiveStats();
     if (TitleTextures* textures = TitleTextures::Active()) textures->Refresh();
     if (TextureReadback* readback = TextureReadback::Active()) readback->Deliver(true);
-    const std::lock_guard guard(g_presentLock);
-    std::string error;
-    static std::chrono::steady_clock::time_point failingSince{};
-    static std::uint64_t dropped = 0;
-    constexpr auto kGiveUp = std::chrono::seconds(120);
-    const auto failed = [&](const char* what) {
-        const auto now = std::chrono::steady_clock::now();
-        if (failingSince == std::chrono::steady_clock::time_point{}) {
-            failingSince = now;
-            AbxLog("d3d12_x", "%s: %s; frames are not shown until the window's surface can be presented to again (display off, locked or changed), retried every frame for 120 s", what,
-                   error.c_str());
-        }
-        ++dropped;
-        g_presenter.reset();
-        if (const VulkanDevice* probe = g_vulkan.load()) {
-            std::string lost;
-            if (!probe->Submit([](VkCommandBuffer) {}, lost)) AbxUnsupported("D3D12 command queue slot 32", (std::string(what) + " and the GPU no longer accepts work: " + lost).c_str());
-        }
-        if (now - failingSince > kGiveUp) AbxUnsupported("D3D12 command queue slot 32", (std::string(what) + " for 120 s: " + error).c_str());
-    };
-    if (!g_presenter) {
-        const VulkanDevice* device = g_vulkan.load();
-        const HWND window = FindProcessWindow();
-        if (device == nullptr || window == nullptr) AbxUnsupported("D3D12 command queue slot 32", "presenting before the title's window or the Vulkan device exists");
-        g_presenter = Presenter::Create(*device, window, error);
+    const auto show = [image, overlay, planeCount] {
+        const std::lock_guard guard(g_presentLock);
+        std::string error;
+        static std::chrono::steady_clock::time_point failingSince{};
+        static std::uint64_t dropped = 0;
+        constexpr auto kGiveUp = std::chrono::seconds(120);
+        const auto failed = [&](const char* what) {
+            const auto now = std::chrono::steady_clock::now();
+            if (failingSince == std::chrono::steady_clock::time_point{}) {
+                failingSince = now;
+                AbxLog("d3d12_x", "%s: %s; frames are not shown until the window's surface can be presented to again (display off, locked or changed), retried every frame for 120 s", what,
+                       error.c_str());
+            }
+            ++dropped;
+            g_presenter.reset();
+            if (const VulkanDevice* probe = g_vulkan.load()) {
+                std::string lost;
+                if (!probe->Submit([](VkCommandBuffer) {}, lost)) AbxUnsupported("D3D12 command queue slot 32", (std::string(what) + " and the GPU no longer accepts work: " + lost).c_str());
+            }
+            if (now - failingSince > kGiveUp) AbxUnsupported("D3D12 command queue slot 32", (std::string(what) + " for 120 s: " + error).c_str());
+        };
         if (!g_presenter) {
-            if (failingSince == std::chrono::steady_clock::time_point{}) AbxUnsupported("D3D12 command queue slot 32", ("the swapchain could not be created: " + error).c_str());
-            failed("the swapchain could not be created again");
+            const VulkanDevice* device = g_vulkan.load();
+            const HWND window = FindProcessWindow();
+            if (device == nullptr || window == nullptr) AbxUnsupported("D3D12 command queue slot 32", "presenting before the title's window or the Vulkan device exists");
+            g_presenter = Presenter::Create(*device, window, error);
+            if (!g_presenter) {
+                if (failingSince == std::chrono::steady_clock::time_point{}) AbxUnsupported("D3D12 command queue slot 32", ("the swapchain could not be created: " + error).c_str());
+                failed("the swapchain could not be created again");
+                Sleep(16);
+                return;
+            }
+            if (failingSince == std::chrono::steady_clock::time_point{}) AbxLog("d3d12_x", "presenting to the title's window (%u plane(s); two planes are composited unless d3d12_x.present_plane names one)", planeCount);
+        }
+        const D3D12_RESOURCE_DESC& desc = image->Texture().desc;
+        if (overlay != nullptr) {
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
+                AbxLog("d3d12_x", "a present with two planes is composited: plane 0 (%llux%u) scaled to the window, plane 1 (%llux%u) blended over it with its alpha (%s; "
+                                  "d3d12_x.present_overlay_premultiplied, d3d12_x.present_plane picks one plane instead)",
+                       static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<unsigned long long>(overlay->Texture().desc.Width), overlay->Texture().desc.Height,
+                       premultipliedOverlay ? "premultiplied" : "straight");
+            }
+        }
+        const bool shown = overlay != nullptr
+                               ? g_presenter->PresentComposited({image->Texture().image, image->Texture().layout.info.format},
+                                                                {overlay->Texture().image, overlay->Texture().layout.info.format}, VK_IMAGE_LAYOUT_GENERAL, premultipliedOverlay, error)
+                               : g_presenter->Present(image->Texture().image, {static_cast<std::uint32_t>(desc.Width), desc.Height}, VK_IMAGE_LAYOUT_GENERAL, error);
+        if (!shown) {
+            failed("presenting failed");
             Sleep(16);
-            return S_OK;
+            return;
         }
-        if (failingSince == std::chrono::steady_clock::time_point{}) AbxLog("d3d12_x", "presenting to the title's window (%u plane(s); two planes are composited unless d3d12_x.present_plane names one)", planeCount);
-    }
-    const D3D12_RESOURCE_DESC& desc = image->Texture().desc;
-    if (overlay != nullptr) {
-        static std::atomic<bool> reported{false};
-        if (!reported.exchange(true)) {
-            AbxLog("d3d12_x", "a present with two planes is composited: plane 0 (%llux%u) scaled to the window, plane 1 (%llux%u) blended over it with its alpha (%s; "
-                              "d3d12_x.present_overlay_premultiplied, d3d12_x.present_plane picks one plane instead)",
-                   static_cast<unsigned long long>(desc.Width), desc.Height, static_cast<unsigned long long>(overlay->Texture().desc.Width), overlay->Texture().desc.Height,
-                   premultipliedOverlay ? "premultiplied" : "straight");
+        if (failingSince != std::chrono::steady_clock::time_point{}) {
+            AbxLog("d3d12_x", "presenting works again after %llu frames that were not shown", static_cast<unsigned long long>(dropped));
+            failingSince = {};
+            dropped = 0;
         }
-    }
-    const bool shown = overlay != nullptr
-                           ? g_presenter->PresentComposited({image->Texture().image, image->Texture().layout.info.format},
-                                                            {overlay->Texture().image, overlay->Texture().layout.info.format}, VK_IMAGE_LAYOUT_GENERAL, premultipliedOverlay, error)
-                           : g_presenter->Present(image->Texture().image, {static_cast<std::uint32_t>(desc.Width), desc.Height}, VK_IMAGE_LAYOUT_GENERAL, error);
-    if (!shown) {
-        failed("presenting failed");
-        Sleep(16);
+        RestForDesktop();
+    };
+    if (!later) {
+        show();
         return S_OK;
     }
-    if (failingSince != std::chrono::steady_clock::time_point{}) {
-        AbxLog("d3d12_x", "presenting works again after %llu frames that were not shown", static_cast<unsigned long long>(dropped));
-        failingSince = {};
-        dropped = 0;
+    static std::atomic<std::uint64_t> queuedLater{0};
+    static std::atomic<std::uint64_t> shownLater{0};
+    const std::uint64_t waiting = ++queuedLater - shownLater.load();
+    if (waiting >= 8 && (waiting & (waiting - 1)) == 0) {
+        AbxLog("d3d12_x", "%llu presents are queued behind lists their queue still holds and are not shown yet: a fence wait nothing signals holds a queue without a limit "
+                          "(memory waits give up after d3d12_x.memory_wait_ms); d3d12_x.present_in_queue_order = 0 shows presents at the call again",
+               static_cast<unsigned long long>(waiting));
     }
-    RestForDesktop();
+    image->AddRef();
+    if (overlay != nullptr) overlay->AddRef();
+    const auto queuedAt = std::chrono::steady_clock::now();
+    queue->PresentOrdered([show, image, overlay, queuedAt] {
+        show();
+        ++shownLater;
+        const long long late = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - queuedAt).count();
+        static std::atomic<std::uint64_t> slow{0};
+        if (late >= 1000) {
+            const std::uint64_t count = ++slow;
+            if ((count & (count - 1)) == 0) {
+                AbxLog("d3d12_x", "a present was shown %lld ms after its call, when the lists its queue held had run (%llu presents a second or more late so far)", late,
+                       static_cast<unsigned long long>(count));
+            }
+        }
+        image->Release();
+        if (overlay != nullptr) overlay->Release();
+    });
     return S_OK;
 }
 

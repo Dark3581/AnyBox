@@ -37,6 +37,10 @@ struct LiveStats {
     std::atomic<std::uint64_t> titleBufferCount[2] = {};
     std::atomic<std::uint64_t> titleBufferLargeBytes[2] = {};
     std::atomic<std::uint64_t> titleBufferPageBytes[2] = {};
+    std::atomic<std::uint64_t> clampDispatches{0};
+    std::atomic<std::uint64_t> clampsAhead{0};
+    std::atomic<std::uint64_t> clampBatches{0};
+    std::atomic<std::uint64_t> clampBatchesRestarted{0};
 };
 
 std::uint32_t TextureBucket(bool written, std::uint64_t bytes);

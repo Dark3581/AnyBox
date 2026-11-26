@@ -28,8 +28,10 @@ constexpr std::uint32_t kVideoPageGuardRefused = 0xFFFFFFFFu;
 constexpr int kVideoPageGuardAll = 1;
 constexpr int kVideoPageGuardWrites = 2;
 constexpr std::uint32_t kReadPageBackoffSteps = 4;
+constexpr std::uint32_t kUseMarkEpochSeconds = 15;
+constexpr std::uint64_t kRootWriteMarkBytes = 1ull << 20;
 
-enum class PageReturn : std::uint32_t { CpuAccess, UsedByHandle, ReadByLayer, GivenOut, Remapped, Unmapped, BufferReleased, GpuMayWrite, Count };
+enum class PageReturn : std::uint32_t { CpuAccess, UsedByHandle, ReadByLayer, GivenOut, Remapped, Unmapped, BufferReleased, GpuMayWrite, SystemCall, Unused, Count };
 
 constexpr std::size_t kPageReturnKinds = static_cast<std::size_t>(PageReturn::Count);
 
@@ -39,9 +41,13 @@ struct VideoPageSetup {
     std::uint64_t capBytes = 0;
     std::uint32_t settleSeconds = 5;
     bool wholeBuffer = true;
+    bool partialPages = false;
+    bool tableCommands = false;
     VideoPageGuard guard = nullptr;
     std::uint64_t readCapBytes = 0;
     std::uint32_t readSettleSeconds = 10;
+    std::uint64_t readOwnCapBytes = 0;
+    std::uint32_t useMarkEpochMilliseconds = kUseMarkEpochSeconds * 1000;
 };
 
 struct VideoPageEvent {
@@ -54,6 +60,14 @@ struct VideoPageEvent {
     std::uint64_t code = 0;
     bool readOnly = false;
     std::uint64_t count = 0;
+    bool own = false;
+    const char* command = nullptr;
+};
+
+struct TitleAccess {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    bool write = false;
 };
 
 struct VideoPageReport {
@@ -66,6 +80,7 @@ struct VideoPageReport {
     std::uint64_t movedPages = 0;
     std::uint64_t movedOwnPages = 0;
     std::uint64_t movedSharedPages = 0;
+    std::uint64_t movedPartialPages = 0;
     std::uint64_t returnedPages[kPageReturnKinds] = {};
     std::uint64_t returnEvents[kPageReturnKinds] = {};
     std::uint64_t waitingPages = 0;
@@ -82,6 +97,9 @@ struct VideoPageReport {
     std::uint64_t lostPages = 0;
     std::uint64_t unusedRounds = 0;
     std::uint64_t droppedEvents = 0;
+    std::uint64_t tableCommands = 0;
+    std::uint64_t tableBytes = 0;
+    std::uint64_t tableRefused = 0;
     std::uint64_t readCapBytes = 0;
     std::uint64_t readHeldBytes = 0;
     std::uint64_t readKnownPages = 0;
@@ -97,6 +115,24 @@ struct VideoPageReport {
     std::uint64_t readCheckedPages = 0;
     std::uint64_t readDifferedPages = 0;
     std::uint64_t readCopyNanoseconds = 0;
+    std::uint64_t readOwnCapBytes = 0;
+    std::uint64_t readOwnHeldBytes = 0;
+    std::uint64_t readOwnUsedPages = 0;
+    std::uint64_t readOwnUsedHeldPages = 0;
+    std::uint64_t readOwnRootWrittenPages = 0;
+    std::uint64_t readOwnLookedAt = 0;
+    std::uint64_t readOwnPinnedPages = 0;
+    std::uint64_t readOwnWritablePages = 0;
+    std::uint64_t readOwnSettlingPages = 0;
+    std::uint64_t readOwnWaitingPages = 0;
+    std::uint64_t readOwnMovedPages = 0;
+    std::uint64_t readOwnReturnedPages[kPageReturnKinds] = {};
+    std::uint64_t readOwnWrittenTwice = 0;
+    std::uint64_t readOwnRefusedPages = 0;
+    std::uint64_t readOwnUnusedRounds = 0;
+    std::uint64_t readOwnCheckedPages = 0;
+    std::uint64_t readOwnDifferedPages = 0;
+    std::uint64_t readOwnCopyNanoseconds = 0;
     std::vector<VideoPageEvent> events;
 };
 
@@ -125,12 +161,30 @@ public:
     std::uint64_t ImportedBytes() const;
     std::string DescribeDeviceAddress(std::uint64_t device) const;
     std::string DescribeTitleAddress(std::uint64_t address) const;
+    std::uint64_t ReadForTrace(std::uint64_t address, void* destination, std::uint64_t bytes) const;
+    std::string DescribePlacement(std::uint64_t address, std::uint64_t bytes) const;
+    std::string DescribeBacking(std::uint64_t address, std::uint64_t bytes) const;
     std::optional<std::uint64_t> AliasBelow4GiB(std::uint64_t start, std::uint64_t bytes, std::string& error);
     void ReleaseAlias(std::uint64_t alias);
 
     bool EnableVideoPages(const VideoPageSetup& setup, std::string& error);
     void WatchBuffer(std::uint64_t address, std::uint64_t bytes, bool added);
     void MarkGpuWritten(std::uint64_t address, std::uint64_t bytes);
+    bool TableCommands() const { return tableCommands_.load(std::memory_order_relaxed); }
+    bool TableCommand(const TitleAccess* accesses, std::size_t count);
+    class Naming {
+    public:
+        explicit Naming(const char* command);
+        ~Naming();
+        Naming(const Naming&) = delete;
+        Naming& operator=(const Naming&) = delete;
+
+    private:
+        const char* previous_ = nullptr;
+    };
+    void MarkGpuRead(std::uint64_t address, std::uint64_t bytes);
+    void MarkGpuRootWords(const std::uint32_t* words, std::uint32_t count);
+    void MarkGpuRootWrite(std::uint64_t address);
     bool PumpVideoPages();
     VideoPageReport TakeVideoPageReport();
     void ReturnSource(std::uint64_t source);
@@ -175,6 +229,17 @@ private:
         std::uint32_t protection = 0;
         bool readOnly = false;
     };
+    using UseMarks = std::atomic<std::uint8_t>;
+    struct OwnSnapshot {
+        std::uint64_t used = 0;
+        std::uint64_t usedHeld = 0;
+        std::uint64_t rootWritten = 0;
+        std::uint64_t lookedAt = 0;
+        std::uint64_t pinned = 0;
+        std::uint64_t writable = 0;
+        std::uint64_t settling = 0;
+        std::uint64_t waiting = 0;
+    };
     struct ReadState {
         std::chrono::steady_clock::time_point due;
         std::uint32_t writes = 0;
@@ -196,6 +261,7 @@ private:
         std::uint64_t source = 0;
         std::uint64_t group = 0;
         bool own = false;
+        bool partial = false;
     };
     struct SettledBuffer {
         std::uint64_t id = 0;
@@ -243,6 +309,17 @@ private:
         bool readStopped = false;
         std::uint64_t readWaiting = 0;
         std::chrono::steady_clock::time_point readWaitingAt;
+        std::uint64_t heldOwnReadBytes = 0;
+        std::map<std::uint64_t, ReadState> ownStates;
+        std::vector<std::uint64_t> markRegions;
+        std::vector<std::unique_ptr<UseMarks[]>> markArrays;
+        std::uint64_t ownCursor = 0;
+        std::uint64_t ownWriteEvents = 0;
+        OwnSnapshot ownSnapshot;
+        VkCommandPool usePool = VK_NULL_HANDLE;
+        VkCommandBuffer useCommands = VK_NULL_HANDLE;
+        VkFence useFence = VK_NULL_HANDLE;
+        std::vector<std::pair<std::uint64_t, VkDeviceMemory>> usePending;
         VideoPageReport report;
     };
 
@@ -264,11 +341,21 @@ private:
     std::uint64_t VideoRoom() const;
     std::uint64_t ArenaRoom() const;
     std::uint64_t ReadRoom() const;
+    std::uint64_t ReadOwnRoom() const;
     bool PumpReadPages();
+    bool PumpOwnReadPages();
+    bool MoveOwnReadPage(std::uint64_t title);
+    int OwnReadCandidate(std::uint64_t title, std::chrono::steady_clock::time_point now);
+    void AddUseMarks(std::uint64_t start, std::uint64_t bytes);
+    UseMarks* MarkAt(std::uint64_t title) const;
+    void SetHeldMark(std::uint64_t title, bool held);
+    std::uint8_t UseEpoch() const;
     bool PumpWritablePages();
     void CollectFreedPages();
     void DeferRead(std::uint64_t source, std::chrono::steady_clock::time_point due);
     bool GpuMayWrite(std::uint64_t title);
+    bool Covered(std::uint64_t address, std::uint64_t bytes) const;
+    void MarkWritten(std::uint64_t address, std::uint64_t bytes);
     int ReadCandidate(std::uint64_t source);
     bool MoveReadPage(std::uint64_t source);
     void DropReadPage(std::uint64_t source, PageReturn reason, std::uint64_t address, std::uint64_t code);
@@ -293,6 +380,7 @@ private:
     void Reconsider(const std::vector<std::uint64_t>& sources);
     bool GuardOwnPage(std::uint64_t title, void* copy, std::uint32_t& protection);
     bool UseOwnRanges(const std::vector<Candidate>& candidates);
+    bool UseOwnRangesLater(const std::vector<std::uint64_t>& starts);
     void NoteAlias(std::uint64_t start, std::uint64_t bytes, std::uint64_t source, bool gpuMapped);
     void NoteRelease(std::uint64_t start, std::uint64_t end);
     void NoteBackingRemoved(std::uint64_t view, std::uint64_t bytes);
@@ -320,6 +408,10 @@ private:
     std::map<std::uint64_t, Allocation> chunks_;
     std::unique_ptr<VideoPages> video_;
     std::atomic<bool> everMoved_{false};
+    std::atomic<bool> tableCommands_{false};
+    std::unique_ptr<std::atomic<UseMarks*>[]> useMarks_;
+    std::atomic<bool> marking_{false};
+    std::atomic<std::uint32_t> epochMilliseconds_{kUseMarkEpochSeconds * 1000};
 };
 
 }

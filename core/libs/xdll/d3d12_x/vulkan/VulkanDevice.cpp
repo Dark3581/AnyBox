@@ -9,10 +9,34 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <mutex>
 
 namespace abx::d3d12x {
 
 namespace {
+
+RecordedCommandCounts g_recorded;
+std::mutex g_countedLock;
+PFN_vkCmdPipelineBarrier2 g_barrier = nullptr;
+PFN_vkCmdBeginRendering g_beginRendering = nullptr;
+
+VKAPI_ATTR void VKAPI_CALL CountedBarrier(VkCommandBuffer commands, const VkDependencyInfo* dependency) {
+    g_recorded.pipelineBarriers.fetch_add(1, std::memory_order_relaxed);
+    g_barrier(commands, dependency);
+}
+
+VKAPI_ATTR void VKAPI_CALL CountedBeginRendering(VkCommandBuffer commands, const VkRenderingInfo* rendering) {
+    g_recorded.renderPasses.fetch_add(1, std::memory_order_relaxed);
+    g_beginRendering(commands, rendering);
+}
+
+void CountRecordedCommands(DeviceFunctions& vk) {
+    const std::lock_guard guard(g_countedLock);
+    if (g_barrier == nullptr) g_barrier = vk.cmdPipelineBarrier2;
+    if (g_beginRendering == nullptr) g_beginRendering = vk.cmdBeginRendering;
+    if (g_barrier == vk.cmdPipelineBarrier2) vk.cmdPipelineBarrier2 = &CountedBarrier;
+    if (g_beginRendering == vk.cmdBeginRendering) vk.cmdBeginRendering = &CountedBeginRendering;
+}
 
 struct FeatureChain {
     VkPhysicalDeviceFeatures2 core{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -478,6 +502,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
         getProperties2(physical_, &meshProperties);
         for (int axis = 0; axis < 3; ++axis) meshMaxGroups_[axis] = mesh.maxMeshWorkGroupCount[axis];
         meshMaxTotal_ = mesh.maxMeshWorkGroupTotalCount;
+        meshPreferredLanes_ = mesh.maxPreferredMeshWorkGroupInvocations;
     }
     if (requirements.presentation) {
         if (bestExtensions.count(VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
@@ -663,6 +688,7 @@ bool VulkanDevice::Open(const DeviceRequirements& requirements, std::string& err
             return false;
         }
     }
+    CountRecordedCommands(vk_);
     vk_.getDeviceQueue(device_, queueFamily_, 0, &queue_);
     const auto getMemoryProperties = LoadInstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties>(loader, rawInstance, "vkGetPhysicalDeviceMemoryProperties");
     if (getMemoryProperties == nullptr || queue_ == VK_NULL_HANDLE) {
@@ -934,6 +960,10 @@ bool VulkanDevice::HasFeature(const std::string& name) const {
 
 bool VulkanDevice::CanRequireSubgroupSize(std::uint32_t size, VkShaderStageFlagBits stage) const {
     return subgroupSizeControl_ && size >= gpu_.subgroup.minSize && size <= gpu_.subgroup.maxSize && (gpu_.subgroup.requiredSizeStages & stage) != 0;
+}
+
+RecordedCommandCounts& RecordedCommands() {
+    return g_recorded;
 }
 
 }

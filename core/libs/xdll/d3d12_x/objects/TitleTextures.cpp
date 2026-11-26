@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <set>
@@ -140,7 +141,28 @@ std::uint64_t SampleHash(std::uint64_t address, std::uint64_t bytes) {
 
 }
 
+TitleTextures::TitleTextures(const ResourceContext& context, IUnknown* parent) : context_(context), parent_(parent) {
+    if (const char* value = AbxSetting("d3d12_x.texture_refresh_thread")) ownThread_ = value[0] == '1' && value[1] == 0;
+    if (const char* value = AbxSetting("d3d12_x.texture_upload_batches")) {
+        const unsigned long asked = std::strtoul(value, nullptr, 10);
+        if (asked >= 1 && asked <= 256) maxInFlight_ = asked;
+    }
+    AbxLog("d3d12_x", "title textures are checked against their title memory once a present %s (d3d12_x.texture_refresh_thread); at most %zu batches of texture uploads are "
+                      "with the GPU before a further one waits for the oldest (d3d12_x.texture_upload_batches)",
+           ownThread_ ? "by a thread of their own, so the presenting thread does not wait for the check, its uploads or the texture lock" : "on the presenting thread", maxInFlight_);
+    if (ownThread_) thread_ = std::thread([this] { RunRefreshes(); });
+    active_.store(this);
+}
+
 TitleTextures::~TitleTextures() {
+    if (thread_.joinable()) {
+        {
+            const std::lock_guard wake(wakeLock_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
     FlushLocked();
     ReapLocked(true);
     for (auto& [texture, stamp] : graveyard_) texture->Release();
@@ -635,10 +657,36 @@ void TitleTextures::EvictOverlapping(Resource* kept, std::uint64_t address, std:
 }
 
 void TitleTextures::Refresh() {
+    if (!ownThread_) {
+        RefreshNow();
+        return;
+    }
+    {
+        const std::lock_guard wake(wakeLock_);
+        due_ = true;
+    }
+    wake_.notify_one();
+}
+
+void TitleTextures::RunRefreshes() {
+    for (;;) {
+        {
+            std::unique_lock wake(wakeLock_);
+            wake_.wait(wake, [this] { return due_ || stop_; });
+            if (stop_) return;
+            due_ = false;
+        }
+        RefreshNow();
+    }
+}
+
+void TitleTextures::RefreshNow() {
     const TimedScope timed(TimedPart::TextureRefresh);
     constexpr auto kBudget = std::chrono::microseconds(2000);
     const auto started = std::chrono::steady_clock::now();
-    const std::lock_guard guard(lock_);
+    std::unique_lock guard(lock_);
+    AddTime(TimedPart::RefreshLock, std::chrono::steady_clock::now() - started);
+    std::vector<Resource*> released;
     std::size_t refreshed = 0;
     ++frame_;
     refreshing_ = true;
@@ -652,14 +700,17 @@ void TitleTextures::Refresh() {
         partMicroseconds[index] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - mark).count());
         mark = now;
     };
-    FlushLocked();
+    {
+        const TimedScope submit(TimedPart::RefreshSubmit);
+        FlushLocked();
+    }
     part(0);
     for (auto grave = graveyard_.begin(); grave != graveyard_.end();) {
         if (grave->second + 4 > frame_) {
             ++grave;
             continue;
         }
-        grave->first->Release();
+        released.push_back(grave->first);
         grave = graveyard_.erase(grave);
     }
     part(5);
@@ -694,7 +745,10 @@ void TitleTextures::Refresh() {
     }
     part(3);
     refreshing_ = false;
-    FlushLocked();
+    {
+        const TimedScope submit(TimedPart::RefreshSubmit);
+        FlushLocked();
+    }
     part(4);
     refreshMicroseconds_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
     if (frame_ % 300 == 0) {
@@ -708,13 +762,17 @@ void TitleTextures::Refresh() {
                static_cast<double>(visitCount_) / 300.0, static_cast<double>(visitNotMapped_) / 300.0, static_cast<double>(visitAccessUs_) / 300000.0,
                static_cast<double>(visitHashUs_) / 300000.0, static_cast<double>(visitHashIndirectUs_) / 300000.0, static_cast<double>(visitUploadUs_) / 300000.0);
         visitCount_ = visitNotMapped_ = visitAccessUs_ = visitHashUs_ = visitHashIndirectUs_ = visitUploadUs_ = 0;
-        AbxLog("d3d12_x", "DIAG title texture refresh parts per frame: first flush %.2f ms, graveyard releases %.2f ms, rechecks %.2f ms, whole-hashed textures %.2f ms, sampled round-robin %.2f ms, last flush %.2f ms",
+        AbxLog("d3d12_x", "DIAG title texture refresh parts per frame: first flush %.2f ms, graveyard collected %.2f ms, rechecks %.2f ms, whole-hashed textures %.2f ms, sampled round-robin %.2f ms, last flush %.2f ms",
                static_cast<double>(partMicroseconds[0]) / 300000.0, static_cast<double>(partMicroseconds[5]) / 300000.0, static_cast<double>(partMicroseconds[1]) / 300000.0,
                static_cast<double>(partMicroseconds[2]) / 300000.0,
                static_cast<double>(partMicroseconds[3]) / 300000.0, static_cast<double>(partMicroseconds[4]) / 300000.0);
         for (std::uint64_t& value : partMicroseconds) value = 0;
         refreshMicroseconds_ = 0;
     }
+    guard.unlock();
+    if (released.empty()) return;
+    const TimedScope release(TimedPart::RefreshRelease);
+    for (Resource* const texture : released) texture->Release();
 }
 
 void TitleTextures::Written(std::uint64_t start, std::uint64_t bytes) {
@@ -982,9 +1040,8 @@ void TitleTextures::FlushLocked() {
     batch_.clear();
     cleanup_.clear();
     batchBytes_ = 0;
-    constexpr std::size_t kMaxInFlight = 8;
     constexpr std::uint64_t kMaxInFlightBytes = 512ull << 20;
-    while (inFlight_.size() > kMaxInFlight || inFlightBytes_ > kMaxInFlightBytes) {
+    while (inFlight_.size() > maxInFlight_ || inFlightBytes_ > kMaxInFlightBytes) {
         if (!RetireOldest(true)) break;
     }
 }

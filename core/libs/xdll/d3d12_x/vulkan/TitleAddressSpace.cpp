@@ -47,8 +47,30 @@ constexpr std::uint64_t kReadDifferencesAllowed = 16;
 constexpr std::uint64_t kReadWriteEventsAlways = 16;
 constexpr int kReadNow = 0;
 constexpr int kReadNever = 1;
+constexpr int kReadLater = 2;
+constexpr int kReadPinned = 3;
+constexpr int kReadWritable = 4;
+
+constexpr std::uint8_t kMarkEpochs = 0x3F;
+constexpr std::uint8_t kMarkHeld = 0x40;
+constexpr std::uint8_t kMarkRootWrites = 0x80;
+constexpr std::uint32_t kMarkNever = 0xFFFFFFFFu;
+constexpr std::uint32_t kUsedEpochs = 4;
+constexpr std::uint32_t kStaleEpochs = 8;
+constexpr std::uint64_t kMarkSpanBytes = 16ull << 20;
+constexpr std::uint64_t kRootWordMarkBytes = 2 * kTitlePageBytes;
+constexpr std::uint64_t kTitleAddressLimit = kTitleRegionCount * kTitleRegionBytes;
+constexpr std::size_t kOwnRoundLooks = 4096;
+
+std::uint32_t MarkAge(std::uint8_t mark, std::uint8_t epoch) {
+    const std::uint32_t at = mark & kMarkEpochs;
+    if (at == 0) return kMarkNever;
+    return (epoch + kMarkEpochs - at) % kMarkEpochs;
+}
 
 std::atomic<TitleAddressSpace*> g_guarded{nullptr};
+
+thread_local const char* t_namingCommand = nullptr;
 
 constexpr std::size_t kActivities = 64;
 constexpr const char* kWaitsForLock = "waits for the address space lock";
@@ -210,6 +232,7 @@ std::unique_ptr<TitleAddressSpace> TitleAddressSpace::Create(const VulkanDevice&
 }
 
 TitleAddressSpace::~TitleAddressSpace() {
+    marking_.store(false, std::memory_order_release);
     if (video_) {
         TitleAddressSpace* self = this;
         g_guarded.compare_exchange_strong(self, nullptr);
@@ -228,6 +251,11 @@ TitleAddressSpace::~TitleAddressSpace() {
             device_.Vk().waitForFences(device_.Handle(), 1, &fence, VK_TRUE, kReturnWaitNanoseconds);
             device_.Vk().destroyFence(device_.Handle(), fence, nullptr);
         }
+        if (video_->useFence != VK_NULL_HANDLE) {
+            device_.Vk().waitForFences(device_.Handle(), 1, &video_->useFence, VK_TRUE, kReturnWaitNanoseconds);
+            device_.Vk().destroyFence(device_.Handle(), video_->useFence, nullptr);
+        }
+        if (video_->usePool != VK_NULL_HANDLE) device_.Vk().destroyCommandPool(device_.Handle(), video_->usePool, nullptr);
         if (video_->pool != VK_NULL_HANDLE) device_.Vk().destroyCommandPool(device_.Handle(), video_->pool, nullptr);
         for (VideoBlock& block : video_->blocks) Destroy(block.allocation);
     }
@@ -410,6 +438,7 @@ bool TitleAddressSpace::ImportLocked(std::uint64_t start, std::uint64_t bytes, s
     Point(start, bytes, range.device, start);
     importedBytes_ += bytes;
     ranges_[start] = range;
+    if (marking_.load(std::memory_order_relaxed)) AddUseMarks(start, bytes);
     return true;
 }
 
@@ -781,14 +810,16 @@ std::string TitleAddressSpace::DescribeDeviceAddress(std::uint64_t device) const
     std::lock_guard<std::mutex> guard(lock_);
     std::string best = "in no title address range";
     std::uint64_t bestDistance = UINT64_MAX;
+    bool inside = false;
     const auto consider = [&](const char* kind, std::uint64_t title, std::uint64_t start, std::uint64_t bytes) {
-        if (start == 0) return;
+        if (start == 0 || inside) return;
         char text[192];
         if (device >= start && device - start < bytes) {
             std::snprintf(text, sizeof(text), "inside %s for title 0x%llx (+0x%llx of 0x%llx bytes)", kind, static_cast<unsigned long long>(title),
                           static_cast<unsigned long long>(device - start), static_cast<unsigned long long>(bytes));
             best = text;
             bestDistance = 0;
+            inside = true;
             return;
         }
         if (device >= start + bytes && device - (start + bytes) < bestDistance) {
@@ -799,26 +830,169 @@ std::string TitleAddressSpace::DescribeDeviceAddress(std::uint64_t device) const
         }
     };
     for (const auto& [start, range] : ranges_) {
-        if (bestDistance == 0) break;
+        if (inside) break;
         consider(range.imported.memory != VK_NULL_HANDLE ? "imported title memory" : "a mapped range", start, range.device, range.bytes);
     }
     for (const auto& [view, chunk] : chunks_) {
-        if (bestDistance == 0) break;
+        if (inside) break;
         consider("a physical page chunk", view, chunk.address, kBackingChunkBytes);
     }
     if (video_) {
         for (const VideoBlock& block : video_->blocks) {
-            if (bestDistance == 0) break;
+            if (inside) break;
             consider("a block of title pages kept in video memory", 0, block.allocation.address, block.bytes);
         }
     }
-    if (bestDistance != 0) consider("the null page", 0, nullPage_.address, 2 * kTitlePageBytes);
-    if (bestDistance != 0) consider("the null region table", 0, nullRegion_.address, kTitlePagesPerRegion * sizeof(std::uint64_t));
-    for (std::size_t region = 0; region < regions_.size() && bestDistance != 0; ++region) {
+    consider("the null page", 0, nullPage_.address, 2 * kTitlePageBytes);
+    consider("the null region table", 0, nullRegion_.address, kTitlePagesPerRegion * sizeof(std::uint64_t));
+    for (std::size_t region = 0; region < regions_.size() && !inside; ++region) {
         if (regions_[region].buffer != VK_NULL_HANDLE) consider("a region page table", region << 32, regions_[region].address, kTitlePagesPerRegion * sizeof(std::uint64_t));
     }
-    if (bestDistance != 0) consider("the page table root", 0, root_.address, kTitleRegionCount * sizeof(std::uint64_t));
+    consider("the page table root", 0, root_.address, kTitleRegionCount * sizeof(std::uint64_t));
     return best;
+}
+
+std::uint64_t TitleAddressSpace::ReadForTrace(std::uint64_t address, void* destination, std::uint64_t bytes) const {
+    std::uint64_t done = 0;
+    while (done < bytes) {
+        const std::uint64_t at = address + done;
+        const std::uint64_t page = AlignDown(at, kTitlePageBytes);
+        const std::uint64_t run = (std::min)(bytes - done, page + kTitlePageBytes - at);
+        std::lock_guard<std::mutex> guard(lock_);
+        const auto host = hostPages_.find(page);
+        const std::uint8_t* from = nullptr;
+        if (video_) {
+            const auto moved = video_->moved.find(host != hostPages_.end() ? host->second : page);
+            if (moved != video_->moved.end() && (host != hostPages_.end() || moved->second.own)) {
+                from = static_cast<const std::uint8_t*>(video_->blocks[moved->second.block].allocation.mapped) + std::uint64_t{moved->second.page} * kTitlePageBytes + (at - page);
+            }
+        }
+        if (from == nullptr && host != hostPages_.end()) from = reinterpret_cast<const std::uint8_t*>(host->second + (at - page));
+        if (from == nullptr) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
+                (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize < at + run) {
+                break;
+            }
+            from = reinterpret_cast<const std::uint8_t*>(at);
+        }
+        std::memcpy(static_cast<std::uint8_t*>(destination) + done, from, static_cast<std::size_t>(run));
+        done += run;
+    }
+    return done;
+}
+
+std::string TitleAddressSpace::DescribeBacking(std::uint64_t address, std::uint64_t bytes) const {
+    constexpr std::uint64_t kSamples = 16;
+    if (bytes == 0 || address + bytes < address) return "no pages";
+    std::lock_guard<std::mutex> guard(lock_);
+    const std::uint64_t first = address / kTitlePageBytes;
+    const std::uint64_t pages = (address + bytes - 1) / kTitlePageBytes - first + 1;
+    const std::uint64_t step = (pages + kSamples - 1) / kSamples;
+    std::uint64_t sampled = 0, video = 0, imported = 0, chunk = 0, other = 0;
+    std::string firstText;
+    for (std::uint64_t page = 0; page < pages; page += step) {
+        const std::uint64_t title = (first + page) * kTitlePageBytes;
+        const std::uint64_t probe = (std::max)(title, address);
+        char where[192];
+        auto range = ranges_.upper_bound(probe);
+        const bool mapped = range != ranges_.begin() && probe - std::prev(range)->first < std::prev(range)->second.bytes;
+        if (mapped) --range;
+        if (video_ && video_->movedTitles.count(title) != 0) {
+            ++video;
+            std::snprintf(where, sizeof(where), "inside a block of title pages kept in video memory");
+        } else if (!mapped) {
+            ++other;
+            std::snprintf(where, sizeof(where), "in no title address range");
+        } else {
+            const bool own = range->second.imported.memory != VK_NULL_HANDLE;
+            const bool physical = !own && hostPages_.count(title) != 0;
+            ++(own ? imported : physical ? chunk : other);
+            std::snprintf(where, sizeof(where), "inside %s for title 0x%llx (+0x%llx of 0x%llx bytes)",
+                          own ? "imported title memory" : physical ? "a physical page chunk" : "a mapped range", static_cast<unsigned long long>(range->first),
+                          static_cast<unsigned long long>(probe - range->first), static_cast<unsigned long long>(range->second.bytes));
+        }
+        ++sampled;
+        if (firstText.empty()) firstText = where;
+    }
+    char text[256];
+    std::snprintf(text, sizeof(text), "%llu of its %llu pages looked at: %llu in video memory blocks, %llu in imported title memory, %llu in physical page chunks, %llu elsewhere",
+                  static_cast<unsigned long long>(sampled), static_cast<unsigned long long>(pages), static_cast<unsigned long long>(video), static_cast<unsigned long long>(imported),
+                  static_cast<unsigned long long>(chunk), static_cast<unsigned long long>(other));
+    return std::string(text) + " (first: " + firstText + ")";
+}
+
+std::string TitleAddressSpace::DescribePlacement(std::uint64_t address, std::uint64_t bytes) const {
+    constexpr std::uint64_t kMostPages = 4096;
+    constexpr std::size_t kMostBuffers = 64;
+    constexpr std::size_t kBuffersNamed = 2;
+    std::lock_guard<std::mutex> guard(lock_);
+    if (!video_ || bytes == 0 || address + bytes < address) return "title pages: not watched";
+    const VideoPages& video = *video_;
+    const std::uint64_t end = address + bytes;
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::uint64_t overlapping = 0;
+    std::string named;
+    for (auto it = video.buffers.begin(); it != video.buffers.end() && it->first < end; ++it) {
+        if (it->first + it->second.bytes <= address) continue;
+        ++overlapping;
+        if (spans.size() < kMostBuffers) spans.emplace_back(it->first, it->first + it->second.bytes);
+        if (overlapping > kBuffersNamed) continue;
+        const char* state = it->second.home       ? "back in system memory for good"
+                            : it->second.complete ? "decided"
+                            : now - it->second.added < std::chrono::seconds(video.setup.settleSeconds) ? "settling"
+                                                                                                     : "open";
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s0x%llx %llu B %s", named.empty() ? "" : ", ", static_cast<unsigned long long>(it->first),
+                      static_cast<unsigned long long>(it->second.bytes), state);
+        named += text;
+    }
+    const std::uint64_t first = AlignDown(address, kTitlePageBytes);
+    const std::uint64_t pages = (std::min)((AlignUp(end, kTitlePageBytes) - first) / kTitlePageBytes, kMostPages);
+    std::uint64_t moved = 0, copies = 0, whole = 0, partly = 0, outside = 0, pinned = 0, shared = 0, most = 0, none = 0;
+    for (std::uint64_t index = 0; index < pages; ++index) {
+        const std::uint64_t title = first + index * kTitlePageBytes;
+        bool inWhole = false;
+        bool inPart = false;
+        for (const auto& [from, to] : spans) {
+            if (from <= title && title + kTitlePageBytes <= to) inWhole = true;
+            if (from < title + kTitlePageBytes && to > title) inPart = true;
+        }
+        whole += inWhole ? 1 : 0;
+        partly += !inWhole && inPart ? 1 : 0;
+        outside += inPart ? 0 : 1;
+        const auto host = hostPages_.find(title);
+        const std::uint64_t source = host != hostPages_.end() ? host->second : title;
+        const auto found = video.moved.find(source);
+        if (found != video.moved.end() && (host != hostPages_.end() || found->second.own)) {
+            ++(found->second.readOnly ? copies : moved);
+            continue;
+        }
+        if (host == hostPages_.end()) {
+            if (!OwnRange(title)) {
+                ++none;
+            } else if (OwnPinned(title)) {
+                ++pinned;
+            }
+            continue;
+        }
+        if (video.pinned.count(source) != 0) ++pinned;
+        const std::uint64_t titles = video.titlesOf.count(source);
+        most = (std::max)(most, titles);
+        if (titles > kVideoPageTitles) ++shared;
+    }
+    char text[512];
+    std::snprintf(text, sizeof(text),
+                  "title pages: %llu watched buffer(s) the GPU may write overlap it%s%s%s; of %llu page(s): %llu in video memory, %llu read-only copies, %llu wholly under "
+                  "such a buffer, %llu only partly, %llu under none, %llu pinned by an earlier use, %llu physical with more than %u GPU addresses (most %llu), %llu neither "
+                  "physical nor committed on its own",
+                  static_cast<unsigned long long>(overlapping), named.empty() ? "" : " (", named.c_str(), named.empty() ? "" : (overlapping > kBuffersNamed ? ", ...)" : ")"),
+                  static_cast<unsigned long long>(pages), static_cast<unsigned long long>(moved), static_cast<unsigned long long>(copies),
+                  static_cast<unsigned long long>(whole), static_cast<unsigned long long>(partly), static_cast<unsigned long long>(outside),
+                  static_cast<unsigned long long>(pinned), static_cast<unsigned long long>(shared), kVideoPageTitles, static_cast<unsigned long long>(most),
+                  static_cast<unsigned long long>(none));
+    return text;
 }
 
 std::uint64_t TitleAddressSpace::ImportedBytes() const {
@@ -873,7 +1047,7 @@ bool TitleAddressSpace::CreateVideoBlock(std::uint64_t bytes, Allocation& block,
 }
 
 bool TitleAddressSpace::EnableVideoPages(const VideoPageSetup& setup, std::string& error) {
-    if (setup.capBytes + setup.readCapBytes < kTitlePageBytes || setup.guard == nullptr) {
+    if (setup.capBytes + setup.readCapBytes + setup.readOwnCapBytes < kTitlePageBytes || setup.guard == nullptr) {
         error = "no room for one page or no way to take the CPU's access to a page away";
         return false;
     }
@@ -886,7 +1060,8 @@ bool TitleAddressSpace::EnableVideoPages(const VideoPageSetup& setup, std::strin
     video->setup = setup;
     video->setup.capBytes = AlignDown(setup.capBytes, kTitlePageBytes);
     video->setup.readCapBytes = AlignDown(setup.readCapBytes, kTitlePageBytes);
-    video->arenaCap = video->setup.capBytes + video->setup.readCapBytes;
+    video->setup.readOwnCapBytes = AlignDown(setup.readOwnCapBytes, kTitlePageBytes);
+    video->arenaCap = video->setup.capBytes + video->setup.readCapBytes + video->setup.readOwnCapBytes;
     VideoBlock first;
     first.bytes = (std::min)(kVideoBlockBytes, video->arenaCap);
     if (!CreateVideoBlock(first.bytes, first.allocation, error)) {
@@ -916,16 +1091,103 @@ bool TitleAddressSpace::EnableVideoPages(const VideoPageSetup& setup, std::strin
     }
     for (const auto& [title, source] : hostPages_) video->titlesOf.emplace(source, title);
     video_ = std::move(video);
+    tableCommands_.store(video_->setup.tableCommands && video_->setup.capBytes != 0, std::memory_order_relaxed);
     static const bool handled = AddVectoredExceptionHandler(1, &OnGuardedPage) != nullptr;
     if (!handled) {
         error = "the access handler for guarded title pages could not be installed";
         device_.Vk().destroyCommandPool(device_.Handle(), video_->pool, nullptr);
         for (VideoBlock& block : video_->blocks) Destroy(block.allocation);
         video_.reset();
+        tableCommands_.store(false, std::memory_order_relaxed);
         return false;
     }
     g_guarded.store(this, std::memory_order_release);
+    if (video_->setup.readOwnCapBytes != 0) {
+        if (device_.Vk().createCommandPool(device_.Handle(), &poolInfo, nullptr, &video_->usePool) == VK_SUCCESS) {
+            allocateInfo.commandPool = video_->usePool;
+            if (device_.Vk().allocateCommandBuffers(device_.Handle(), &allocateInfo, &video_->useCommands) != VK_SUCCESS) video_->useCommands = VK_NULL_HANDLE;
+        } else {
+            video_->usePool = VK_NULL_HANDLE;
+        }
+        useMarks_.reset(new std::atomic<UseMarks*>[kTitleRegionCount]());
+        epochMilliseconds_.store((std::max)(video_->setup.useMarkEpochMilliseconds, std::uint32_t{1}), std::memory_order_relaxed);
+        marking_.store(true, std::memory_order_release);
+        for (const auto& [start, range] : ranges_) {
+            if (range.imported.memory != VK_NULL_HANDLE) AddUseMarks(start, range.bytes);
+        }
+    }
     return true;
+}
+
+void TitleAddressSpace::AddUseMarks(std::uint64_t start, std::uint64_t bytes) {
+    if (!video_ || !useMarks_ || bytes == 0 || start >= kTitleAddressLimit) return;
+    const std::uint64_t last = (std::min)(start + bytes, kTitleAddressLimit) - 1;
+    for (std::uint64_t region = start / kTitleRegionBytes; region <= last / kTitleRegionBytes; ++region) {
+        if (useMarks_[region].load(std::memory_order_relaxed) != nullptr) continue;
+        std::unique_ptr<UseMarks[]> marks(new UseMarks[kTitlePagesPerRegion]());
+        useMarks_[region].store(marks.get(), std::memory_order_release);
+        video_->markRegions.push_back(region);
+        video_->markArrays.push_back(std::move(marks));
+    }
+}
+
+TitleAddressSpace::UseMarks* TitleAddressSpace::MarkAt(std::uint64_t title) const {
+    if (!useMarks_ || title >= kTitleAddressLimit) return nullptr;
+    UseMarks* const marks = useMarks_[title / kTitleRegionBytes].load(std::memory_order_acquire);
+    return marks != nullptr ? marks + (title % kTitleRegionBytes) / kTitlePageBytes : nullptr;
+}
+
+std::uint8_t TitleAddressSpace::UseEpoch() const {
+    return static_cast<std::uint8_t>(GetTickCount64() / epochMilliseconds_.load(std::memory_order_relaxed) % kMarkEpochs + 1);
+}
+
+void TitleAddressSpace::SetHeldMark(std::uint64_t title, bool held) {
+    UseMarks* const mark = MarkAt(title);
+    if (mark == nullptr) return;
+    if (held) {
+        mark->fetch_or(kMarkHeld, std::memory_order_relaxed);
+    } else {
+        mark->fetch_and(static_cast<std::uint8_t>(~kMarkHeld), std::memory_order_relaxed);
+    }
+}
+
+void TitleAddressSpace::MarkGpuRead(std::uint64_t address, std::uint64_t bytes) {
+    if (!marking_.load(std::memory_order_acquire) || bytes == 0 || address >= kTitleAddressLimit) return;
+    const std::uint8_t epoch = UseEpoch();
+    const std::uint64_t last = (std::min)(address + (std::min)(bytes, kMarkSpanBytes), kTitleAddressLimit) - 1;
+    for (std::uint64_t page = address / kTitlePageBytes; page <= last / kTitlePageBytes; ++page) {
+        UseMarks* const marks = useMarks_[page / kTitlePagesPerRegion].load(std::memory_order_acquire);
+        if (marks == nullptr) {
+            page = (page / kTitlePagesPerRegion + 1) * kTitlePagesPerRegion - 1;
+            continue;
+        }
+        UseMarks& mark = marks[page % kTitlePagesPerRegion];
+        std::uint8_t old = mark.load(std::memory_order_relaxed);
+        while ((old & kMarkEpochs) != epoch && !mark.compare_exchange_weak(old, static_cast<std::uint8_t>((old & ~kMarkEpochs) | epoch), std::memory_order_relaxed)) {
+        }
+    }
+}
+
+void TitleAddressSpace::MarkGpuRootWords(const std::uint32_t* words, std::uint32_t count) {
+    if (!marking_.load(std::memory_order_acquire) || words == nullptr) return;
+    for (std::uint32_t index = 0; index + 1 < count; ++index) {
+        const std::uint32_t high = words[index + 1] & 0xFFFFu;
+        if (high == 0) continue;
+        const std::uint64_t address = words[index] | (static_cast<std::uint64_t>(high) << 32);
+        if (address >= kTitleAddressLimit || useMarks_[address / kTitleRegionBytes].load(std::memory_order_relaxed) == nullptr) continue;
+        MarkGpuRead(AlignDown(address, kTitlePageBytes), kRootWordMarkBytes);
+    }
+}
+
+void TitleAddressSpace::MarkGpuRootWrite(std::uint64_t address) {
+    if (!marking_.load(std::memory_order_acquire) || address >= kTitleAddressLimit) return;
+    bool fresh = false;
+    const std::uint64_t first = AlignDown(address, kTitlePageBytes);
+    for (std::uint64_t title = first; title < first + kRootWriteMarkBytes; title += kTitlePageBytes) {
+        UseMarks* const mark = MarkAt(title);
+        if (mark != nullptr) fresh = (mark->fetch_or(kMarkRootWrites, std::memory_order_relaxed) & kMarkRootWrites) == 0 || fresh;
+    }
+    if (fresh) MarkGpuWritten(first, kRootWriteMarkBytes);
 }
 
 bool TitleAddressSpace::TakeVideoPage(std::uint32_t& block, std::uint32_t& page) {
@@ -1154,6 +1416,7 @@ void TitleAddressSpace::ReturnForUse(std::uint64_t source, PageReturn reason, st
     event.reason = reason;
     event.address = address;
     event.code = code;
+    if (reason == PageReturn::UsedByHandle) event.command = t_namingCommand;
     std::vector<std::uint64_t> sources;
     const auto live = video.byId.find(group);
     if (live != video.byId.end()) {
@@ -1328,6 +1591,54 @@ bool TitleAddressSpace::UseOwnRanges(const std::vector<Candidate>& candidates) {
     return true;
 }
 
+bool TitleAddressSpace::UseOwnRangesLater(const std::vector<std::uint64_t>& starts) {
+    VideoPages& video = *video_;
+    const DeviceFunctions& vk = device_.Vk();
+    if (video.useFence != VK_NULL_HANDLE) {
+        if (vk.getFenceStatus(device_.Handle(), video.useFence) != VK_SUCCESS) return true;
+        vk.destroyFence(device_.Handle(), video.useFence, nullptr);
+        video.useFence = VK_NULL_HANDLE;
+        for (const auto& [start, memory] : video.usePending) {
+            const auto range = ranges_.find(start);
+            if (range != ranges_.end() && range->second.imported.memory == memory) range->second.used = true;
+        }
+        video.usePending.clear();
+    }
+    std::vector<std::map<std::uint64_t, Range>::iterator> fresh;
+    for (const std::uint64_t start : starts) {
+        const auto range = ranges_.find(start);
+        if (range != ranges_.end() && !range->second.used && range->second.imported.memory != VK_NULL_HANDLE && range->second.buffer != VK_NULL_HANDLE) fresh.push_back(range);
+    }
+    if (fresh.empty()) return true;
+    if (video.useCommands == VK_NULL_HANDLE) return false;
+    if (!video.scratchTaken) {
+        if (!TakeVideoPage(video.scratchBlock, video.scratchPage)) return false;
+        video.scratchTaken = true;
+    }
+    std::unique_lock<std::mutex> queue(device_.QueueLock(), std::try_to_lock);
+    if (!queue.owns_lock()) return false;
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vk.resetCommandPool(device_.Handle(), video.usePool, 0) != VK_SUCCESS || vk.beginCommandBuffer(video.useCommands, &begin) != VK_SUCCESS) return false;
+    for (const auto& range : fresh) {
+        const VkBufferCopy region{range->second.bufferOffset, std::uint64_t{video.scratchPage} * kTitlePageBytes, (std::min)(kTitlePageBytes, range->second.bytes)};
+        vk.cmdCopyBuffer(video.useCommands, range->second.buffer, video.blocks[video.scratchBlock].allocation.buffer, 1, &region);
+    }
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    if (vk.endCommandBuffer(video.useCommands) != VK_SUCCESS || vk.createFence(device_.Handle(), &fenceInfo, nullptr, &fence) != VK_SUCCESS) return false;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &video.useCommands;
+    if (vk.queueSubmit(device_.Queue(), 1, &submit, fence) != VK_SUCCESS) {
+        vk.destroyFence(device_.Handle(), fence, nullptr);
+        return false;
+    }
+    video.useFence = fence;
+    for (const auto& range : fresh) video.usePending.emplace_back(range->first, range->second.imported.memory);
+    return true;
+}
+
 bool TitleAddressSpace::GuardOwnPage(std::uint64_t title, void* copy, std::uint32_t& protection) {
     void* const page = reinterpret_cast<void*>(title);
     MEMORY_BASIC_INFORMATION region{};
@@ -1405,6 +1716,7 @@ void TitleAddressSpace::NoteRelease(std::uint64_t start, std::uint64_t end) {
     ReturnPages(leaving, PageReturn::Unmapped);
     CutOwnPins(AlignDown(start, kTitlePageBytes), AlignUp(end, kTitlePageBytes));
     video.pinned.erase(video.pinned.lower_bound(AlignDown(start, kTitlePageBytes)), video.pinned.lower_bound(AlignUp(end, kTitlePageBytes)));
+    video.ownStates.erase(video.ownStates.lower_bound(AlignDown(start, kTitlePageBytes)), video.ownStates.lower_bound(AlignUp(end, kTitlePageBytes)));
 }
 
 void TitleAddressSpace::NoteBackingRemoved(std::uint64_t view, std::uint64_t bytes) {
@@ -1483,13 +1795,16 @@ void TitleAddressSpace::CollectVideoWork(std::vector<Candidate>& candidates, std
     std::unordered_set<std::uint64_t> taken;
     for (auto& [address, buffer] : video.buffers) {
         if (buffer.home || buffer.complete || now - buffer.added < std::chrono::seconds(video.setup.settleSeconds)) continue;
-        const std::uint64_t first = AlignUp(address, kTitlePageBytes);
-        const std::uint64_t last = AlignDown(address + buffer.bytes, kTitlePageBytes);
+        const std::uint64_t whole = AlignUp(address, kTitlePageBytes);
+        const std::uint64_t wholeEnd = AlignDown(address + buffer.bytes, kTitlePageBytes);
+        const std::uint64_t first = video.setup.partialPages ? AlignDown(address, kTitlePageBytes) : whole;
+        const std::uint64_t last = video.setup.partialPages ? AlignUp(address + buffer.bytes, kTitlePageBytes) : wholeEnd;
         bool decided = true;
         std::uint64_t shared = 0;
         std::uint64_t pinned = 0;
         for (std::uint64_t title = first; title < last; title += kTitlePageBytes) {
             if (video.movedTitles.count(title) != 0) continue;
+            const bool partial = title < whole || title >= wholeEnd;
             const auto host = hostPages_.find(title);
             if (host == hostPages_.end()) {
                 if (!OwnRange(title)) {
@@ -1503,13 +1818,14 @@ void TitleAddressSpace::CollectVideoWork(std::vector<Candidate>& candidates, std
                     ++pinned;
                     continue;
                 }
+                DropReadPage(title, PageReturn::GpuMayWrite, title, 0);
                 if (video.moved.count(title) != 0) continue;
                 if (candidates.size() * kTitlePageBytes >= room) {
                     ++overCap;
                     decided = false;
                     continue;
                 }
-                candidates.push_back(Candidate{title, title, buffer.id, true});
+                candidates.push_back(Candidate{title, title, buffer.id, true, partial});
                 continue;
             }
             const std::uint64_t source = host->second;
@@ -1530,7 +1846,7 @@ void TitleAddressSpace::CollectVideoWork(std::vector<Candidate>& candidates, std
                 continue;
             }
             taken.insert(source);
-            candidates.push_back(Candidate{title, source, buffer.id, false});
+            candidates.push_back(Candidate{title, source, buffer.id, false, partial});
         }
         if (decided) settled.push_back(SettledBuffer{buffer.id, shared, pinned});
     }
@@ -1552,7 +1868,13 @@ std::uint64_t TitleAddressSpace::VideoRoom() const {
 
 std::uint64_t TitleAddressSpace::ReadRoom() const {
     if (video_->readStopped) return 0;
-    return (std::min)(ArenaRoom(), video_->setup.readCapBytes - (std::min)(video_->setup.readCapBytes, video_->heldReadBytes));
+    const std::uint64_t held = video_->heldReadBytes - video_->heldOwnReadBytes;
+    return (std::min)(ArenaRoom(), video_->setup.readCapBytes - (std::min)(video_->setup.readCapBytes, held));
+}
+
+std::uint64_t TitleAddressSpace::ReadOwnRoom() const {
+    if (video_->readStopped) return 0;
+    return (std::min)(ArenaRoom(), video_->setup.readOwnCapBytes - (std::min)(video_->setup.readOwnCapBytes, video_->heldOwnReadBytes));
 }
 
 void TitleAddressSpace::DeferRead(std::uint64_t source, std::chrono::steady_clock::time_point due) {
@@ -1662,30 +1984,54 @@ void TitleAddressSpace::DropReadPage(std::uint64_t source, PageReturn reason, st
     const MovedPage page = found->second;
     VideoBlock& block = video.blocks[page.block];
     const std::uint8_t* const held = static_cast<const std::uint8_t*>(block.allocation.mapped) + std::uint64_t{page.page} * kTitlePageBytes;
-    const bool written = reason == PageReturn::CpuAccess || reason == PageReturn::GivenOut;
+    const bool written = reason == PageReturn::CpuAccess || reason == PageReturn::GivenOut || reason == PageReturn::SystemCall;
+    const bool gone = reason == PageReturn::Unmapped || reason == PageReturn::Remapped;
+    bool open = true;
+    if (page.own) {
+        MEMORY_BASIC_INFORMATION region{};
+        open = VirtualQuery(reinterpret_cast<const void*>(source), &region, sizeof(region)) == sizeof(region) && region.State == MEM_COMMIT && region.Protect == PAGE_READONLY &&
+               reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize >= source + kTitlePageBytes;
+    }
     bool differed = false;
-    if (reason != PageReturn::Unmapped && reason != PageReturn::Remapped) {
+    if (!gone && open) {
         ++video.readDrops;
         if (video.readDiffered != 0 || video.readDrops <= kReadChecksAlways || video.readDrops % (written ? kReadCheckEvery : kReadCheckEveryRead) == 0) {
-            ++video.report.readCheckedPages;
+            ++(page.own ? video.report.readOwnCheckedPages : video.report.readCheckedPages);
             video.staging.resize(kTitlePageBytes);
             std::memcpy(video.staging.data(), held, kTitlePageBytes);
-            if (std::memcmp(video.staging.data(), reinterpret_cast<const void*>(source), kTitlePageBytes) != 0) {
-                std::memcpy(reinterpret_cast<void*>(source), video.staging.data(), kTitlePageBytes);
-                differed = true;
-                ++video.report.readDifferedPages;
+            differed = std::memcmp(video.staging.data(), reinterpret_cast<const void*>(source), kTitlePageBytes) != 0;
+            if (differed) {
+                ++(page.own ? video.report.readOwnDifferedPages : video.report.readDifferedPages);
                 ++video.readDiffered;
                 video.pinned.insert(source);
                 if (video.readDiffered >= kReadDifferencesAllowed) video.readStopped = true;
             }
         }
     }
+    DWORD previous = 0;
+    DWORD current = PAGE_READONLY;
+    if (page.own && open && differed) {
+        if (VirtualProtect(reinterpret_cast<void*>(source), kTitlePageBytes, PAGE_READWRITE, &previous)) {
+            current = PAGE_READWRITE;
+            std::memcpy(reinterpret_cast<void*>(source), video.staging.data(), kTitlePageBytes);
+        } else {
+            ++video.report.lostPages;
+        }
+    } else if (differed) {
+        std::memcpy(reinterpret_cast<void*>(source), video.staging.data(), kTitlePageBytes);
+    }
     video.movedTitles.erase(page.title);
     for (std::uint32_t index = 0; index < page.extraCount; ++index) video.movedTitles.erase(page.extra[index]);
     video.moved.erase(found);
     SetEntry(page.title, HostEntry(page.title));
     for (std::uint32_t index = 0; index < page.extraCount; ++index) SetEntry(page.extra[index], HostEntry(page.extra[index]));
-    video.setup.guard(source, 0, nullptr, 0);
+    if (page.own) {
+        if (open && page.protection != current) VirtualProtect(reinterpret_cast<void*>(source), kTitlePageBytes, page.protection, &previous);
+        SetHeldMark(source, false);
+        video.heldOwnReadBytes -= kTitlePageBytes;
+    } else {
+        video.setup.guard(source, 0, nullptr, 0);
+    }
     for (std::uint32_t index = 0; index < page.viewCount; ++index) {
         const auto view = video.guardedViews.find(page.views[index]);
         if (view != video.guardedViews.end() && view->second == source) video.guardedViews.erase(view);
@@ -1693,19 +2039,27 @@ void TitleAddressSpace::DropReadPage(std::uint64_t source, PageReturn reason, st
     video.freed.push_back(FreedPage{page.block, page.page});
     video.heldBytes -= kTitlePageBytes;
     video.heldReadBytes -= kTitlePageBytes;
-    ++video.report.readReturnedPages[static_cast<std::size_t>(reason)];
+    ++(page.own ? video.report.readOwnReturnedPages : video.report.readReturnedPages)[static_cast<std::size_t>(reason)];
     if (written && !differed) {
-        ReadState& state = video.readStates[source];
+        ReadState& state = page.own ? video.ownStates[source] : video.readStates[source];
         ++state.writes;
-        if (state.writes == 2) ++video.report.readWrittenTwice;
+        if (state.writes == 2) ++(page.own ? video.report.readOwnWrittenTwice : video.report.readWrittenTwice);
         const std::uint32_t steps = (std::min)(state.writes, kReadPageBackoffSteps);
-        DeferRead(source, std::chrono::steady_clock::now() + std::chrono::seconds(std::uint64_t{video.setup.readSettleSeconds} << steps));
-    } else if ((reason == PageReturn::Remapped || reason == PageReturn::Unmapped) && video.titlesOf.count(source) != 0) {
+        const auto due = std::chrono::steady_clock::now() + std::chrono::seconds(std::uint64_t{video.setup.readSettleSeconds} << steps);
+        if (page.own) {
+            state.due = due;
+        } else {
+            DeferRead(source, due);
+        }
+    } else if (!page.own && gone && video.titlesOf.count(source) != 0) {
         DeferRead(source, std::chrono::steady_clock::now() + std::chrono::seconds(video.setup.readSettleSeconds));
+    } else if (page.own && gone) {
+        video.ownStates.erase(source);
     }
-    const bool cpu = reason == PageReturn::CpuAccess;
-    if (cpu) ++video.readWriteEvents;
-    if (differed || (cpu && (video.readWriteEvents <= kReadWriteEventsAlways || (video.readWriteEvents & (video.readWriteEvents - 1)) == 0))) {
+    const bool cpu = reason == PageReturn::CpuAccess || reason == PageReturn::SystemCall;
+    std::uint64_t& events = page.own ? video.ownWriteEvents : video.readWriteEvents;
+    if (cpu) ++events;
+    if (differed || (cpu && (events <= kReadWriteEventsAlways || (events & (events - 1)) == 0))) {
         VideoPageEvent event;
         event.reason = reason;
         event.buffer = page.title;
@@ -1714,7 +2068,8 @@ void TitleAddressSpace::DropReadPage(std::uint64_t source, PageReturn reason, st
         event.address = address;
         event.code = code;
         event.readOnly = true;
-        event.count = differed ? video.readDiffered : video.readWriteEvents;
+        event.own = page.own;
+        event.count = differed ? video.readDiffered : events;
         AddEvent(event);
     }
 }
@@ -1725,8 +2080,68 @@ void TitleAddressSpace::DropReadSpan(std::uint64_t start, std::uint64_t end) {
     for (std::uint64_t title = AlignDown(start, kTitlePageBytes); title < end; title += kTitlePageBytes) {
         if (video.movedTitles.count(title) == 0) continue;
         const auto host = hostPages_.find(title);
-        if (host != hostPages_.end()) DropReadPage(host->second, PageReturn::GpuMayWrite, title, 0);
+        DropReadPage(host != hostPages_.end() ? host->second : title, PageReturn::GpuMayWrite, title, 0);
     }
+}
+
+TitleAddressSpace::Naming::Naming(const char* command) : previous_(t_namingCommand) {
+    t_namingCommand = command;
+}
+
+TitleAddressSpace::Naming::~Naming() {
+    t_namingCommand = previous_;
+}
+
+bool TitleAddressSpace::Covered(std::uint64_t address, std::uint64_t bytes) const {
+    const std::uint64_t end = address + bytes;
+    auto it = ranges_.upper_bound(address);
+    if (it == ranges_.begin()) return false;
+    --it;
+    std::uint64_t at = address;
+    while (at < end) {
+        if (it == ranges_.end() || it->first > at || at - it->first >= it->second.bytes) return false;
+        at = it->first + it->second.bytes;
+        ++it;
+    }
+    return true;
+}
+
+bool TitleAddressSpace::TableCommand(const TitleAccess* accesses, std::size_t count) {
+    constexpr std::uint64_t kMostBytes = 256ull << 20;
+    if (!tableCommands_.load(std::memory_order_relaxed) || count == 0) return false;
+    Doing doing("a command on title memory is checked for running through the page table", accesses[0].address);
+    std::lock_guard<std::mutex> guard(lock_);
+    doing.Stage(kHoldsLock);
+    if (!video_) return false;
+    VideoPages& video = *video_;
+    bool wanted = false;
+    bool fits = true;
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const TitleAccess& access = accesses[index];
+        if (access.bytes == 0 || access.address + access.bytes < access.address) return false;
+        const std::uint64_t end = access.address + (std::min)(access.bytes, kMostBytes);
+        for (std::uint64_t title = AlignDown(access.address, kTitlePageBytes); title < end && !wanted; title += kTitlePageBytes) {
+            wanted = GpuMayWrite(title);
+        }
+        fits = fits && access.address % 4 == 0 && access.bytes % 4 == 0 && access.bytes <= kMostBytes && Covered(access.address, access.bytes);
+        for (std::size_t other = 0; other < index; ++other) {
+            const bool apart = accesses[other].address + accesses[other].bytes <= access.address || access.address + access.bytes <= accesses[other].address;
+            fits = fits && (apart || (!access.write && !accesses[other].write));
+        }
+        total += access.bytes;
+    }
+    if (!wanted) return false;
+    if (!fits) {
+        ++video.report.tableRefused;
+        return false;
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        if (accesses[index].write) MarkWritten(accesses[index].address, accesses[index].bytes);
+    }
+    ++video.report.tableCommands;
+    video.report.tableBytes += total;
+    return true;
 }
 
 void TitleAddressSpace::MarkGpuWritten(std::uint64_t address, std::uint64_t bytes) {
@@ -1734,7 +2149,11 @@ void TitleAddressSpace::MarkGpuWritten(std::uint64_t address, std::uint64_t byte
     Doing doing("a view the GPU may write is created", address);
     std::lock_guard<std::mutex> guard(lock_);
     doing.Stage(kHoldsLock);
-    if (!video_ || video_->setup.readCapBytes == 0) return;
+    if (video_) MarkWritten(address, bytes);
+}
+
+void TitleAddressSpace::MarkWritten(std::uint64_t address, std::uint64_t bytes) {
+    if (video_->setup.readCapBytes == 0 && video_->setup.readOwnCapBytes == 0) return;
     VideoPages& video = *video_;
     std::uint64_t first = address;
     std::uint64_t last = address + bytes;
@@ -1828,9 +2247,171 @@ bool TitleAddressSpace::PumpReadPages() {
     return more;
 }
 
+int TitleAddressSpace::OwnReadCandidate(std::uint64_t title, std::chrono::steady_clock::time_point now) {
+    VideoPages& video = *video_;
+    if (video.moved.count(title) != 0 || video.movedTitles.count(title) != 0 || hostPages_.count(title) != 0 || !OwnRange(title)) return kReadNever;
+    if (OwnPinned(title) || video.pinned.count(title) != 0) return kReadPinned;
+    if (GpuMayWrite(title)) return kReadWritable;
+    const auto [state, fresh] = video.ownStates.try_emplace(title);
+    if (fresh) state->second.due = now + std::chrono::seconds(video.setup.readSettleSeconds);
+    return state->second.due <= now ? kReadNow : kReadLater;
+}
+
+bool TitleAddressSpace::MoveOwnReadPage(std::uint64_t title) {
+    VideoPages& video = *video_;
+    void* const page = reinterpret_cast<void*>(title);
+    MEMORY_BASIC_INFORMATION region{};
+    if (VirtualQuery(page, &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT || region.Type != MEM_PRIVATE ||
+        (region.Protect != PAGE_READWRITE && region.Protect != PAGE_READONLY) || reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize < title + kTitlePageBytes) {
+        video.pinned.insert(title);
+        ++video.report.readOwnRefusedPages;
+        return false;
+    }
+    std::uint32_t block = 0;
+    std::uint32_t slot = 0;
+    if (!TakeVideoPage(block, slot)) return false;
+    DWORD previous = 0;
+    video.everGuarded.insert(title);
+    if (region.Protect != PAGE_READONLY && !VirtualProtect(page, kTitlePageBytes, PAGE_READONLY, &previous)) {
+        video.blocks[block].free.push_back(slot);
+        video.pinned.insert(title);
+        ++video.report.readOwnRefusedPages;
+        return false;
+    }
+    void* const held = static_cast<std::uint8_t*>(video.blocks[block].allocation.mapped) + std::uint64_t{slot} * kTitlePageBytes;
+    std::memcpy(held, page, kTitlePageBytes);
+    const VkDeviceAddress device = video.blocks[block].allocation.address + std::uint64_t{slot} * kTitlePageBytes;
+    MovedPage moved;
+    moved.title = title;
+    moved.block = block;
+    moved.page = slot;
+    moved.own = true;
+    moved.readOnly = true;
+    moved.protection = region.Protect;
+    moved.viewCount = 1;
+    moved.views[0] = title;
+    video.moved[title] = moved;
+    video.movedTitles[title] = device;
+    video.guardedViews[title] = title;
+    SetEntry(title, device);
+    SetHeldMark(title, true);
+    video.heldBytes += kTitlePageBytes;
+    video.heldReadBytes += kTitlePageBytes;
+    video.heldOwnReadBytes += kTitlePageBytes;
+    ++video.report.readOwnMovedPages;
+    return true;
+}
+
+bool TitleAddressSpace::PumpOwnReadPages() {
+    Doing doing("the copier's round for read-only copies of memory committed on its own", 0);
+    std::lock_guard<std::mutex> guard(lock_);
+    doing.Stage(kHoldsLock);
+    if (!video_ || video_->setup.readOwnCapBytes == 0 || !useMarks_) return false;
+    VideoPages& video = *video_;
+    CollectFreedPages();
+    const auto now = std::chrono::steady_clock::now();
+    const std::uint8_t epoch = UseEpoch();
+    const std::uint64_t total = video.markRegions.size() * kTitlePagesPerRegion;
+    if (total == 0) return false;
+    OwnSnapshot snapshot;
+    std::vector<std::uint64_t> wanted[kUsedEpochs];
+    std::vector<std::uint64_t> unused;
+    std::size_t looked = 0;
+    std::uint64_t resume = total;
+    const std::uint64_t start = video.ownCursor % total;
+    for (std::uint64_t step = 0; step < total; ++step) {
+        const std::uint64_t at = (start + step) % total;
+        const std::uint64_t region = video.markRegions[at / kTitlePagesPerRegion];
+        UseMarks& mark = useMarks_[region].load(std::memory_order_relaxed)[at % kTitlePagesPerRegion];
+        std::uint8_t value = mark.load(std::memory_order_relaxed);
+        if (value == 0) continue;
+        const std::uint64_t title = region * kTitleRegionBytes + (at % kTitlePagesPerRegion) * kTitlePageBytes;
+        std::uint32_t age = MarkAge(value, epoch);
+        while (age >= kStaleEpochs && age != kMarkNever) {
+            if (mark.compare_exchange_weak(value, static_cast<std::uint8_t>(value & ~kMarkEpochs), std::memory_order_relaxed)) {
+                value = static_cast<std::uint8_t>(value & ~kMarkEpochs);
+                age = kMarkNever;
+                break;
+            }
+            age = MarkAge(value, epoch);
+        }
+        if ((value & kMarkRootWrites) != 0) ++snapshot.rootWritten;
+        const bool used = age < kUsedEpochs;
+        if ((value & kMarkHeld) != 0) {
+            if (used) {
+                ++snapshot.used;
+                ++snapshot.usedHeld;
+            } else {
+                unused.push_back(title);
+            }
+            continue;
+        }
+        if (!used) continue;
+        ++snapshot.used;
+        if ((value & kMarkRootWrites) != 0) {
+            ++snapshot.writable;
+            continue;
+        }
+        if (looked == kOwnRoundLooks) {
+            if (resume == total) resume = at;
+            continue;
+        }
+        ++looked;
+        switch (OwnReadCandidate(title, now)) {
+        case kReadNow: wanted[age].push_back(title); break;
+        case kReadLater: ++snapshot.settling; break;
+        case kReadPinned: ++snapshot.pinned; break;
+        case kReadWritable: ++snapshot.writable; break;
+        default: break;
+        }
+    }
+    video.ownCursor = resume == total ? 0 : resume;
+    snapshot.lookedAt = looked;
+    std::vector<std::uint64_t> candidates;
+    for (const std::vector<std::uint64_t>& bucket : wanted) candidates.insert(candidates.end(), bucket.begin(), bucket.end());
+    const std::uint64_t roundPages = kReadRoundBytes / kTitlePageBytes;
+    if (candidates.size() > roundPages) {
+        snapshot.waiting = candidates.size() - roundPages;
+        candidates.resize(roundPages);
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const std::uint64_t roomPages = ReadOwnRoom() / kTitlePageBytes + video.freed.size() + video.freedBehindFence.size();
+    if (roomPages < candidates.size() && !video.readStopped) {
+        std::size_t evicted = 0;
+        for (const std::uint64_t title : unused) {
+            if (roomPages + evicted >= candidates.size()) break;
+            DropReadPage(title, PageReturn::Unused, title, 0);
+            ++evicted;
+        }
+    }
+    if (!candidates.empty()) everMoved_.store(true, std::memory_order_release);
+    std::vector<std::uint64_t> fresh;
+    for (const std::uint64_t title : candidates) {
+        auto range = ranges_.upper_bound(title);
+        if (range != ranges_.begin() && !std::prev(range)->second.used && std::find(fresh.begin(), fresh.end(), std::prev(range)->first) == fresh.end()) {
+            fresh.push_back(std::prev(range)->first);
+        }
+    }
+    if (!fresh.empty() && !UseOwnRangesLater(fresh)) ++video.report.readOwnUnusedRounds;
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        const std::uint64_t title = candidates[index];
+        auto range = ranges_.upper_bound(title);
+        if (range == ranges_.begin() || !std::prev(range)->second.used) continue;
+        if (ReadOwnRoom() < kTitlePageBytes) {
+            snapshot.waiting += candidates.size() - index;
+            break;
+        }
+        MoveOwnReadPage(title);
+    }
+    video.ownSnapshot = snapshot;
+    video.report.readOwnCopyNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+    return snapshot.waiting != 0 && ReadOwnRoom() >= kTitlePageBytes;
+}
+
 bool TitleAddressSpace::PumpVideoPages() {
     const bool more = PumpReadPages();
-    return PumpWritablePages() || more;
+    const bool moreOwn = PumpOwnReadPages();
+    return PumpWritablePages() || more || moreOwn;
 }
 
 bool TitleAddressSpace::PumpWritablePages() {
@@ -1940,6 +2521,7 @@ bool TitleAddressSpace::PumpWritablePages() {
         } else if (moved.extraCount != 0) {
             ++video.report.movedSharedPages;
         }
+        if (candidate.partial) ++video.report.movedPartialPages;
         ++movedByGroup[candidate.group];
     }
     video.report.copyNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waited).count());
@@ -1969,10 +2551,20 @@ VideoPageReport TitleAddressSpace::TakeVideoPageReport() {
     report.heldOwnBytes = video.heldOwnBytes;
     report.arenaBytes = video.arenaBytes;
     report.readCapBytes = video.setup.readCapBytes;
-    report.readHeldBytes = video.heldReadBytes;
+    report.readHeldBytes = video.heldReadBytes - video.heldOwnReadBytes;
     report.readKnownPages = video.gpuMapped.size();
     report.readWaitingPages = video.readWaiting;
     report.readStopped = video.readStopped;
+    report.readOwnCapBytes = video.setup.readOwnCapBytes;
+    report.readOwnHeldBytes = video.heldOwnReadBytes;
+    report.readOwnUsedPages = video.ownSnapshot.used;
+    report.readOwnUsedHeldPages = video.ownSnapshot.usedHeld;
+    report.readOwnRootWrittenPages = video.ownSnapshot.rootWritten;
+    report.readOwnLookedAt = video.ownSnapshot.lookedAt;
+    report.readOwnPinnedPages = video.ownSnapshot.pinned;
+    report.readOwnWritablePages = video.ownSnapshot.writable;
+    report.readOwnSettlingPages = video.ownSnapshot.settling;
+    report.readOwnWaitingPages = video.ownSnapshot.waiting;
     report.buffers = video.buffers.size();
     for (const auto& [address, buffer] : video.buffers) report.buffersHome += buffer.home ? 1 : 0;
     return report;
@@ -2026,7 +2618,7 @@ bool TitleAddressSpace::ReturnForSystemCall(std::uint64_t address, std::uint64_t
         const auto moved = found != video_->guardedViews.end() ? video_->moved.find(found->second) : video_->moved.end();
         if (moved != video_->moved.end()) {
             if (moved->second.readOnly && !write) continue;
-            ReturnForUse(moved->first, PageReturn::CpuAccess, at, code);
+            ReturnForUse(moved->first, PageReturn::SystemCall, at, code);
             ++handedBack;
         } else if (video_->everGuarded.count(view) != 0 && Reachable(at, write)) {
             ++handedBack;
